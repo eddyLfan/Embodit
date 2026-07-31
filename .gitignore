@@ -2,6 +2,14 @@
 .augment_jobs/
 .augment_previews/
 .augment_cache/
+
+# Local runtime state and secrets
+.env
+.env.*
+!.env.example
+*.log
+*.pid
+*.pid.lock
 service.pid
 service.url
 service.log
@@ -10,6 +18,18 @@ __pycache__/
 *.pyc
 .venv/
 config/token
+
+# User annotations and review sidecars
+*.review.json
+*.labels.jsonl
+labels.jsonl
+
+# Raw datasets should stay outside the source repository
+*.mcap
+*.h5
+*.hdf5
+*.parquet
+
 checkpoints/*.pt
 checkpoints/*.pth
 checkpoints/*.bin
