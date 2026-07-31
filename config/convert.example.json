@@ -1,0 +1,9 @@
+{
+  "fps": 30,
+  "robot_type": null,
+  "state_key": "observation.state",
+  "action_key": "action",
+  "state_topic": "/observation/state",
+  "action_topic": "/action",
+  "notes": "跨格式转换时按需覆盖字段/topic 映射；未映射特征会写入 conversion_report.known_losses"
+}

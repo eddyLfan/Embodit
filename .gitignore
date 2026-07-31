@@ -1,0 +1,11 @@
+.convert_jobs/
+.augment_jobs/
+.augment_previews/
+service.pid
+service.url
+service.log
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/
+tests/

@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="lerobot-token" content="__LEROBOT_TOKEN__">
+  <title>Embodit · Embodied Intelligence Toolkit</title>
+  <link rel="icon" href="/images/favicon.ico?v=2" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="/images/favicon-32.png?v=2">
+  <link rel="icon" type="image/png" sizes="48x48" href="/images/favicon-48.png?v=2">
+  <link rel="apple-touch-icon" sizes="180x180" href="/images/favicon-180.png?v=2">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="mode-browse">
+  <header class="app-header">
+    <a class="brand" href="/" title="Embodied Intelligence Toolkit">
+      <img class="brand-logo" src="/images/Embodit_logo.png" alt="" width="36" height="36">
+      <span class="brand-text">
+        <span class="brand-name">Embodit</span>
+        <span class="brand-sub">Embodied Intelligence Toolkit</span>
+      </span>
+    </a>
+    <div class="header-right">
+      <label class="lang-switch" data-i18n-title="language">
+        <span class="lang-switch-label" data-i18n="language">语言</span>
+        <select id="langSelect" aria-label="Language">
+          <option value="zh">中文</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+      <div class="server-status"><i></i><span data-i18n="serverConnected">开发机服务已连接</span></div>
+      <button id="headerToggle" class="header-toggle" data-i18n-title="collapseHeader" data-i18n-aria="collapseHeader" title="收起顶栏" aria-label="收起或展开顶栏"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 7.5 6 3.5 10 7.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    </div>
+  </header>
+
+  <main id="chooser" class="chooser">
+    <section class="chooser-card">
+      <div class="section-title"><div><h2 data-i18n="chooseTitle">选择数据集</h2><p data-i18n="chooseDesc">支持 LeRobot v2.1 / v3、HDF5、MCAP</p></div></div>
+      <div class="path-bar">
+        <button id="goParent" data-i18n-title="parentDir" title="上一级">↑</button>
+        <input id="pathInput" spellcheck="false" placeholder="/media/DATA/...">
+        <button id="browsePath" data-i18n="browseDir">浏览目录</button>
+        <button id="openPath" class="primary" data-i18n="openDataset">打开数据集</button>
+      </div>
+      <div id="folderInfo" class="folder-info"></div>
+      <div id="folderList" class="folder-list"><div class="loading" data-i18n="connectingRemote">正在连接远端目录…</div></div>
+    </section>
+  </main>
+
+  <main id="review" class="review hidden">
+    <section class="dataset-bar">
+      <button id="changeDataset" class="icon-button" data-i18n="changeDataset">← 更换数据集</button>
+      <div class="dataset-title"><h2 id="datasetName"></h2><p id="datasetPath"></p></div>
+      <nav id="workspaceTabs" class="workspace-tabs" aria-label="Workspace modes">
+        <button type="button" class="workspace-tab active" data-mode="browse" data-i18n="modeBrowse">浏览</button>
+        <button type="button" class="workspace-tab" data-mode="annotate" data-i18n="modeAnnotate">标注</button>
+        <button type="button" class="workspace-tab" data-mode="filter" data-i18n="modeFilter">筛选</button>
+        <button type="button" class="workspace-tab" data-mode="convert" data-i18n="modeConvert">转换</button>
+        <button type="button" class="workspace-tab" data-mode="augment" data-i18n="modeAugment">增强</button>
+      </nav>
+    </section>
+    <section id="summary" class="summary"></section>
+    <section class="mode-toolbar mode-only-filter">
+      <button id="loadProgress" data-i18n="loadProgress">载入进度</button>
+      <button id="saveProgress" data-i18n="saveProgress">保存进度</button>
+      <button id="createDataset" class="primary" data-i18n="exportDataset">导出数据集</button>
+      <span class="mode-toolbar-note" data-i18n="autoFilterReservedNote">自动筛选功能预留中</span>
+    </section>
+
+    <section class="review-workspace">
+      <aside class="episode-panel">
+        <div class="filters">
+          <input id="search" type="search" data-i18n-placeholder="searchPlaceholder" placeholder="搜索 episode、任务">
+          <div class="filter-row">
+            <select id="stateFilter">
+              <option value="all" data-i18n="filterAll">全部状态</option>
+              <option value="review" data-i18n="filterReview">待审</option>
+              <option value="pass" data-i18n="filterPass">通过</option>
+              <option value="quarantine" data-i18n="filterQuarantine">隔离</option>
+            </select>
+            <label><input id="interventionOnly" type="checkbox"> <span data-i18n="interventionOnly">仅干预</span></label>
+          </div>
+        </div>
+        <div class="bulk-actions mode-only-filter">
+          <button data-bulk="pass" data-i18n="bulkPass">全部通过</button>
+          <button data-bulk="review" data-i18n="bulkReview">全部待审</button>
+          <button data-bulk="quarantine" data-i18n="bulkQuarantine">全部隔离</button>
+        </div>
+        <div id="episodeList" class="episode-list"></div>
+      </aside>
+
+      <div id="splitSidebar" class="splitter splitter-col" role="separator" aria-orientation="vertical" tabindex="0" data-i18n-title="resizeSidebar" title="拖动调整列表宽度 · 双击复位"></div>
+
+      <section class="viewer">
+        <div id="episodeHeader" class="episode-header"></div>
+        <div class="strip-wrap">
+          <div id="videoStrip" class="video-strip"></div>
+          <div id="splitColumns" class="col-handle" role="separator" aria-orientation="vertical" tabindex="0" data-i18n-title="resizeHead" title="拖动调整主画面宽度 · 双击复位"></div>
+          <div id="decisionStamp" class="decision-stamp" aria-live="polite"></div>
+        </div>
+        <div id="splitStrip" class="splitter splitter-row" role="separator" aria-orientation="horizontal" tabindex="0" data-i18n-title="resizeStrip" title="拖动调整视频区高度 · 双击复位"></div>
+        <div class="transport">
+          <button id="playPause" class="play-button">▶</button>
+          <input id="timeline" type="range" min="0" max="1" value="0" step="0.001">
+          <span id="timeLabel">00:00.000 / 00:00.000</span>
+          <button id="previousEpisode" data-i18n="prevEpisode">← 上一个</button>
+          <button id="nextEpisode" data-i18n="nextEpisode">下一个 →</button>
+        </div>
+        <section id="signalPanel" class="signal-panel mode-only-browse-annotate">
+          <div class="signal-prompt">
+            <span class="signal-label" data-i18n="promptLabel">Prompt</span>
+            <strong id="episodePrompt" class="signal-prompt-text">—</strong>
+          </div>
+          <div class="signal-traj">
+            <div class="signal-traj-head">
+              <span class="signal-label" data-i18n="trajLabel">动作轨迹</span>
+              <span id="trajMeta" class="signal-meta muted"></span>
+            </div>
+            <div class="traj-toolbar">
+              <button type="button" id="trajSelectAll" data-i18n="trajSelectAll">全选</button>
+              <button type="button" id="trajSelectNone" data-i18n="trajSelectNone">全不选</button>
+              <button type="button" id="trajSelectFirst" data-i18n="trajSelectFirst">前 6 维</button>
+              <label class="traj-scale-opt"><input type="radio" name="trajScale" value="shared"> <span data-i18n="trajScaleShared">共用坐标</span></label>
+              <label class="traj-scale-opt"><input type="radio" name="trajScale" value="per" checked> <span data-i18n="trajScalePer">各维归一化</span></label>
+            </div>
+            <div id="trajDimToggles" class="traj-dim-toggles"></div>
+            <canvas id="trajCanvas" width="640" height="280" aria-label="action trajectory"></canvas>
+            <div id="trajReadout" class="traj-readout muted"></div>
+          </div>
+        </section>
+        <div class="decision-bar mode-only-filter">
+          <button class="decision keep" data-state="pass" data-i18n="decisionPass">✓ 通过 <kbd>K</kbd></button>
+          <button class="decision pending" data-state="review" data-i18n="decisionReview">? 待审 <kbd>U</kbd></button>
+          <button class="decision exclude" data-state="quarantine" data-i18n="decisionQuarantine">× 隔离 <kbd>X</kbd></button>
+        </div>
+        <aside id="labelPanel" class="label-panel mode-only-annotate">
+          <div class="label-title" data-i18n="labelPanelTitle">打分与标注</div>
+          <div class="label-row">
+            <label data-i18n="qualityScore">质量分
+              <select id="qualityScore">
+                <option value="" data-i18n="unscored">未评分</option>
+                <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option>
+              </select>
+            </label>
+            <label data-i18n="successLabel">成功
+              <select id="successFlag">
+                <option value="" data-i18n="unlabeled">未标注</option>
+                <option value="true" data-i18n="successTrue">成功</option>
+                <option value="false" data-i18n="successFalse">失败</option>
+              </select>
+            </label>
+          </div>
+          <div class="label-row">
+            <label class="grow" data-i18n="tagsLabel">标签（逗号分隔）<input id="labelTags" placeholder="adaptation_frame, collision"></label>
+          </div>
+          <div class="label-row">
+            <label class="grow" data-i18n="noteLabel">备注<input id="labelNote" data-i18n-placeholder="notePlaceholder" placeholder="可选备注"></label>
+          </div>
+          <div class="label-row">
+            <button id="saveEpisodeLabel" class="primary" data-i18n="saveEpisodeLabel">保存 episode 标注</button>
+          </div>
+          <div class="label-subtitle" data-i18n="intervalSectionTitle">区间标注（多断点）</div>
+          <div class="label-row interval-row">
+            <button id="intervalBreakpoint" type="button" data-i18n="intervalBreakpoint" data-i18n-title="intervalBreakpointTitle" title="按 B：在当前时间打一个断点">断点 <kbd>B</kbd></button>
+            <button id="undoBreakpoint" type="button" data-i18n="undoBreakpoint">撤销断点</button>
+            <button id="clearBreakpoints" type="button" data-i18n="clearBreakpoints">清空断点</button>
+          </div>
+          <p id="intervalMarkHint" class="interval-mark-hint" data-i18n="intervalMarkIdle">视频起止已作为断点；按 B 在中间继续打点，相邻断点形成区间，填标签后保存。</p>
+          <div id="breakpointChips" class="breakpoint-chips"></div>
+          <div id="draftIntervalList" class="draft-interval-list"></div>
+          <div class="label-row">
+            <button id="saveTaggedIntervals" class="primary" data-i18n="saveTaggedIntervals">保存有标签的区间</button>
+          </div>
+          <div class="label-subtitle" data-i18n="savedIntervalsTitle">已保存区间</div>
+          <div id="intervalList" class="label-list interval-list"></div>
+          <div class="label-subtitle" data-i18n="allLabelsTitle">本条其它标注</div>
+          <div id="labelList" class="label-list"></div>
+        </aside>
+        <div id="status" class="status" data-i18n="statusTimeline">多路画面共用同一条相对时间轴。</div>
+      </section>
+    </section>
+  </main>
+
+  <div id="busy" class="busy hidden"><div class="busy-card"><span class="spinner"></span><strong id="busyTitle" data-i18n="busyDefault">处理中…</strong><p id="busyText"></p></div></div>
+  <div id="toast" class="toast hidden"></div>
+
+  <div id="autoFilterDialog" class="modal hidden">
+    <section class="modal-card">
+      <div class="modal-title"><div><h2 data-i18n="autoFilterTitle">自动筛选（预留）</h2><p data-i18n="autoFilterDesc">筛选标准尚未确认，本期不实现规则引擎。</p></div><button id="closeAutoFilter" data-i18n="close">关闭</button></div>
+      <p class="muted-block" data-i18n="autoFilterBody">接入后将基于 UnifiedView 的 state/action（及可选视频）产出建议态与时间轴证据，经人工确认后再导出。参考实现仍在 <code>demo/backend/auto_filter.py</code>。</p>
+      <div class="modal-actions"><button id="closeAutoFilter2" class="primary" data-i18n="gotIt">知道了</button></div>
+    </section>
+  </div>
+
+  <div id="convertDialog" class="modal hidden">
+    <section class="modal-card">
+      <div class="modal-title"><div><h2 data-i18n="convertTitle">格式转换</h2><p data-i18n="convertDesc">针对整个数据集：源格式不变；结果写入新目录/文件，并生成转换报告。</p></div><button id="closeConvert" data-i18n="close">关闭</button></div>
+      <div class="auto-filter-fields">
+        <div class="field-block">
+          <span class="field-label" data-i18n="convertSourceLabel">源数据集</span>
+          <div id="convertSource" class="convert-source-path">—</div>
+        </div>
+        <label data-i18n="targetFormat">目标格式
+          <select id="convertTarget">
+            <option value="lerobot_v3">LeRobot v3</option>
+            <option value="lerobot_v21">LeRobot v2.1</option>
+            <option value="hdf5">HDF5</option>
+            <option value="mcap">MCAP</option>
+          </select>
+        </label>
+        <p id="convertFidelity" class="convert-bg-hint hidden"></p>
+        <label data-i18n="outputPath">输出路径<input id="convertOutput" spellcheck="false"></label>
+        <label data-i18n="mappingJson">映射 JSON（可选）<textarea id="convertMapping" rows="4" placeholder='{"fps": 30, "state_key": "observation.state", "action_key": "action"}'></textarea></label>
+      </div>
+      <div id="convertProgress" class="auto-filter-progress hidden"><div><i></i></div><span data-i18n="convertPreparing">准备中…</span></div>
+      <div class="modal-actions">
+        <button id="startConvert" class="primary" data-i18n="startConvert">开始后台转换</button>
+      </div>
+      <p class="convert-bg-hint" data-i18n="convertBgHint">任务在独立进程后台执行：关闭网页不会中断；关闭启动终端一般也不影响（start.sh 已 nohup）。可在页面底部查看进度。</p>
+    </section>
+  </div>
+
+  <div id="augmentDialog" class="modal hidden">
+    <section class="modal-card modal-card-wide">
+      <div class="modal-title">
+        <div>
+          <h2 data-i18n="augmentTitle">数据增强</h2>
+          <p data-i18n="augmentDesc">先配置并生成一条测试预览，确认效果后再批量写出新数据集。</p>
+        </div>
+        <button id="closeAugment" data-i18n="close">关闭</button>
+      </div>
+      <div class="auto-filter-fields">
+        <div class="field-block">
+          <span class="field-label" data-i18n="augmentSourceLabel">源数据集</span>
+          <div id="augmentSource" class="convert-source-path">—</div>
+        </div>
+        <label data-i18n="augmentType">增强类型
+          <select id="augmentType">
+            <option value="brightness" data-i18n="augmentTypeBrightness">亮度调节</option>
+            <option value="color" data-i18n="augmentTypeColor">颜色替换</option>
+          </select>
+        </label>
+        <div id="augmentBrightnessFields" class="augment-brightness-fields">
+          <label data-i18n="augmentBrightnessMode">亮度参数
+            <select id="augmentBrightnessMode">
+              <option value="auto" data-i18n="augmentBrightnessAuto">自动适配（默认）</option>
+              <option value="manual" data-i18n="augmentBrightnessManual">手动指定</option>
+            </select>
+          </label>
+          <p class="field-hint" data-i18n="augmentBrightnessHint">自动按多相机曝光估计 gain/gamma；手动可调参数后反复测试效果。</p>
+          <div id="augmentBrightnessManualRow" class="augment-brightness-manual hidden">
+            <label data-i18n="augmentBrightnessGain">Gain（曝光增益）
+              <input id="augmentBrightnessGain" type="number" min="0.4" max="2.0" step="0.01" value="1.00">
+            </label>
+            <label data-i18n="augmentBrightnessGamma">Gamma（对比曲线）
+              <input id="augmentBrightnessGamma" type="number" min="0.4" max="2.0" step="0.01" value="1.00">
+            </label>
+          </div>
+        </div>
+        <div id="augmentColorFields" class="augment-color-fields hidden">
+          <label data-i18n="augmentSamPrompts">SAM3 查询词（必填，逗号分隔）
+            <textarea id="augmentSamPrompts" rows="2" placeholder="clothes, cup, table"></textarea>
+          </label>
+          <p class="field-hint" data-i18n="augmentSamHint">用英文物体名描述要选中的目标；测试预览会显示掩码，可反复改词。</p>
+          <label data-i18n="augmentApplyMode">应用方式
+            <select id="augmentApplyMode">
+              <option value="object_recolor" data-i18n="augmentObjectRecolor">物体换色</option>
+              <option value="background_replace" data-i18n="augmentBackgroundReplace">背景替换（保留选中物体）</option>
+            </select>
+          </label>
+          <label data-i18n="augmentColorMode">目标色
+            <select id="augmentColorMode">
+              <option value="random" data-i18n="augmentColorRandom">随机（默认）</option>
+              <option value="fixed" data-i18n="augmentColorFixed">指定颜色</option>
+            </select>
+          </label>
+          <div id="augmentFixedColorRow" class="augment-fixed-color hidden">
+            <label data-i18n="augmentColorPreset">预设
+              <select id="augmentColorPreset"></select>
+            </label>
+            <label data-i18n="augmentColorCustom">自定义 RGB
+              <input id="augmentColorCustom" placeholder="220,40,40" spellcheck="false">
+            </label>
+          </div>
+          <label data-i18n="augmentGpuId">GPU ID
+            <input id="augmentGpuId" type="number" min="0" value="0">
+          </label>
+        </div>
+        <label data-i18n="augmentPreviewEpisode">测试 episode
+          <input id="augmentPreviewEpisode" type="number" min="0" step="1">
+        </label>
+        <label data-i18n="augmentBatchScope">批量范围
+          <select id="augmentBatchScope">
+            <option value="all" data-i18n="augmentScopeAll">全部 episodes</option>
+            <option value="random" data-i18n="augmentScopeRandom">随机抽样</option>
+            <option value="filtered" data-i18n="augmentScopeFiltered">当前列表</option>
+            <option value="pass" data-i18n="augmentScopePass">已通过</option>
+            <option value="current" data-i18n="augmentScopeCurrent">仅当前 episode</option>
+          </select>
+        </label>
+        <div id="augmentRandomCountRow" class="augment-random-count hidden">
+          <label data-i18n="augmentRandomCount">随机数量
+            <input id="augmentRandomCount" type="number" min="1" step="1" value="10">
+          </label>
+          <p class="field-hint" data-i18n="augmentRandomHint">从数据集中无放回随机抽取指定条数做增强。</p>
+        </div>
+        <label data-i18n="outputPath">输出路径<input id="augmentOutput" spellcheck="false"></label>
+      </div>
+      <div id="augmentProgress" class="auto-filter-progress hidden"><div><i></i></div><span data-i18n="augmentPreparing">准备中…</span></div>
+      <div id="augmentPreviewMeta" class="augment-preview-meta muted hidden"></div>
+      <div id="augmentPreviewGrid" class="augment-preview-grid"></div>
+      <div class="modal-actions">
+        <button id="runAugmentPreview" class="primary" data-i18n="augmentRunPreview">生成测试</button>
+        <button id="startAugmentBatch" disabled data-i18n="augmentStartBatch">确认并批量生成</button>
+      </div>
+      <p class="convert-bg-hint" data-i18n="augmentBgHint">批量任务在独立进程后台执行；关闭网页不会中断。可在页面底部查看进度。</p>
+    </section>
+  </div>
+
+  <aside id="convertJobDock" class="convert-job-dock hidden" aria-live="polite">
+    <div class="convert-job-dock-head">
+      <strong data-i18n="convertJobsTitle">转换任务</strong>
+      <button type="button" id="refreshConvertJobs" data-i18n="refresh">刷新</button>
+      <button type="button" id="toggleConvertJobs" data-i18n="collapse">收起</button>
+    </div>
+    <div id="convertJobList" class="convert-job-list"></div>
+  </aside>
+
+  <aside id="augmentJobDock" class="convert-job-dock augment-job-dock hidden" aria-live="polite">
+    <div class="convert-job-dock-head">
+      <strong data-i18n="augmentJobsTitle">增强任务</strong>
+      <button type="button" id="refreshAugmentJobs" data-i18n="refresh">刷新</button>
+      <button type="button" id="toggleAugmentJobs" data-i18n="collapse">收起</button>
+    </div>
+    <div id="augmentJobList" class="convert-job-list"></div>
+  </aside>
+
+  <!--I18N_INLINE-->
+  <script src="/utils.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
