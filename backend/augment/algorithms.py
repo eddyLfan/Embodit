@@ -22,7 +22,12 @@ def _ensure_ds_package() -> None:
         return
     pkg_dir = DATA_STRENGTHEN_ROOT / "augment"
     if not pkg_dir.is_dir():
-        raise FileNotFoundError(f"找不到 data_strengthen 算法目录：{pkg_dir}")
+        raise FileNotFoundError(
+            "Augment algorithms not found at "
+            f"{pkg_dir}. Set EMBODIT_AUGMENT_ROOT to a checkout that contains "
+            "an `augment/` package, or place it under third_party/data_strengthen/. "
+            "Browse / annotate / filter / convert work without it; only Augment needs it."
+        )
     init_file = pkg_dir / "__init__.py"
     spec = importlib.util.spec_from_file_location(
         _DS_PACKAGE,

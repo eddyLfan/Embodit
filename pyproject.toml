@@ -1,8 +1,10 @@
 [project]
-name = "embody-data-tool"
+name = "embodit"
 version = "0.1.0"
 description = "Embodit — Embodied Intelligence Toolkit"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
 dependencies = [
   "fastapi",
   "uvicorn",
@@ -12,10 +14,21 @@ dependencies = [
   "h5py",
   "mcap",
   "imageio-ffmpeg",
+  "av",
+  "opencv-python-headless",
+  "pillow",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/eddyLfan/Embodit"
+Repository = "https://github.com/eddyLfan/Embodit"
+
+# Application project: install deps only, do not package backend as a library.
+[tool.uv]
+package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

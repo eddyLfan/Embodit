@@ -8,4 +8,9 @@ service.log
 __pycache__/
 *.pyc
 .venv/
+config/token
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.bin
 tests/
+third_party/

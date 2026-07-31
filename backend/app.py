@@ -701,7 +701,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--browse-root", type=Path, default=Path("/media/DATA"))
+    parser.add_argument("--browse-root", type=Path, default=Path.cwd())
     parser.add_argument("--token", required=True)
     args = parser.parse_args()
     web_root = Path(__file__).resolve().parent.parent / "web"

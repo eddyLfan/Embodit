@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
+# Embodit launcher — requires: Python >= 3.10 and uv (https://github.com/astral-sh/uv)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_ROOT="${1:-${EMBODY_ROOT:-${LEROBOT_ROOT:-/media/DATA}}}"
+DATA_ROOT="${1:-${EMBODY_ROOT:-${LEROBOT_ROOT:-}}}"
 HOST="${EMBODY_HOST:-${LEROBOT_HOST:-127.0.0.1}}"
 PORT="${EMBODY_PORT:-${LEROBOT_PORT:-8765}}"
-PROXY="${EMBODY_PROXY:-${LEROBOT_PROXY:-http://192.168.32.28:18000}}"
+# Empty by default (open-source friendly). Set EMBODY_PROXY if you need a proxy.
+PROXY="${EMBODY_PROXY:-${LEROBOT_PROXY:-}}"
 PUBLIC_HOST="${EMBODY_PUBLIC_HOST:-${LEROBOT_PUBLIC_HOST:-localhost}}"
 PID_FILE="${SCRIPT_DIR}/service.pid"
 URL_FILE="${SCRIPT_DIR}/service.url"
@@ -20,6 +22,45 @@ fi
 info()  { printf '%s\n' "$*"; }
 ok()    { printf '%s\n' "${GREEN}$*${RESET}"; }
 fail()  { printf '%s\n' "${RED}$*${RESET}" >&2; }
+
+usage() {
+  cat <<EOF
+Usage: bash start.sh [DATA_ROOT]
+
+  DATA_ROOT   Directory the browser starts in (default: current directory)
+
+Examples:
+  bash start.sh ~/datasets
+  EMBODY_PORT=9000 bash start.sh /data/lerobot
+
+Optional env vars: EMBODY_HOST, EMBODY_PORT, EMBODY_PUBLIC_HOST,
+  EMBODY_TOKEN, EMBODY_PROXY, EMBODIT_SANDBOX, AUGMENT_SAM3_CHECKPOINT
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ -z "$DATA_ROOT" ]]; then
+  DATA_ROOT="$(pwd)"
+  info "${DIM}No data root given; browsing from current directory: ${DATA_ROOT}${RESET}"
+fi
+DATA_ROOT="$(cd "$DATA_ROOT" 2>/dev/null && pwd || echo "$DATA_ROOT")"
+
+# ---- prerequisites ----------------------------------------------------------
+if ! command -v uv >/dev/null 2>&1; then
+  fail "uv is not installed (required to manage the Python environment)."
+  fail "Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
+  fail "Docs:    https://docs.astral.sh/uv/getting-started/installation/"
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  fail "python3 is required on PATH."
+  exit 1
+fi
 
 # ---- already running? -------------------------------------------------------
 if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
@@ -79,21 +120,20 @@ info "  Data root : ${DATA_ROOT}"
 info "  Listen on : http://${HOST}:${PORT}"
 info "  Log file  : ${LOG_FILE}"
 info ""
-printf 'Starting server (first run may take a while to resolve dependencies) ... '
 
+# Sync project deps from pyproject.toml / uv.lock into .venv (fast when up to date).
+printf 'Syncing environment ... '
+if (cd "$SCRIPT_DIR" && uv sync --quiet); then
+  printf '%s\n' "${GREEN}done${RESET}"
+else
+  printf '%s\n' "${RED}failed${RESET}"
+  fail "uv sync failed. Check network / proxy (EMBODY_PROXY) and retry."
+  exit 1
+fi
+
+printf 'Starting server ... '
 START_TS=$SECONDS
-nohup uv run \
-  --with pyarrow \
-  --with numpy \
-  --with h5py \
-  --with mcap \
-  --with imageio-ffmpeg \
-  --with fastapi \
-  --with uvicorn \
-  --with pydantic \
-  --with av \
-  --with opencv-python-headless \
-  --with pillow \
+nohup uv run --project "$SCRIPT_DIR" \
   python "${SCRIPT_DIR}/backend/app.py" \
   --host "$HOST" \
   --port "$PORT" \

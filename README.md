@@ -1,45 +1,62 @@
-# Embodit
+<h1 align="center">Embodit</h1>
 
 <p align="center">
-  <img src="images/Embodit_logo.png" alt="Embodit" width="160" />
+  <img src="images/Embodit_logo.png" alt="Embodit Logo" width="160" />
 </p>
 
 <p align="center">
-  <b>Embodied Intelligence Toolkit</b><br/>
-  本地一键启动的具身智能数据工具：浏览 · 标注 · 筛选 · 转换 · 增强
+  <b>Embodied Intelligence Toolkit</b><br />
+  A local visual workspace for robotics and VLA datasets
 </p>
 
 <p align="center">
-  <a href="#功能"><img src="https://img.shields.io/badge/formats-LeRobot%20%7C%20HDF5%20%7C%20MCAP-0ea5e9" alt="formats" /></a>
-  <a href="#快速开始"><img src="https://img.shields.io/badge/python-%3E%3D3.10-blue" alt="python" /></a>
-  <a href="#快速开始"><img src="https://img.shields.io/badge/runtime-uv-green" alt="uv" /></a>
+  <a href="#features"><img src="https://img.shields.io/badge/formats-LeRobot%20%7C%20HDF5%20%7C%20MCAP-0ea5e9" alt="formats" /></a>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/python-%3E%3D3.10-blue" alt="python" /></a>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/runtime-uv-green" alt="uv" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="license" /></a>
 </p>
 
-Embodit 面向机器人 / VLA 数据采集与质检场景：在浏览器里打开本地数据集，完成人工审阅与标注，再按需导出、互转或做视觉增强。**源数据始终只读**——筛选决策、标签与导出结果都以旁路文件或新目录写出，不会改写原始样本。
+<p align="center">
+  <b>English</b> | <a href="README.zh-CN.md">中文</a>
+</p>
 
-## 功能
+Embodit opens local datasets directly in your browser for episode inspection, manual QA, annotation, filtering, format conversion, and visual augmentation. **Original sample content stays read-only**: reviews and labels are stored in sidecar files, while exports, conversions, and augmentations are written to new directories.
 
-| 模块 | 说明 |
+> Data stays on your machine by default. No third-party upload is required.
+
+**Documentation:** [Features](#features) · [Typical workflow](#typical-workflow) · [Supported formats](#supported-formats) · [Quick start](#quick-start) · [Configuration](#configuration) · [Data write policy](#data-write-policy) · [Updates](#updates)
+
+## Features
+
+| Module | Description |
 |---|---|
-| **浏览** | 自动识别格式，多路相机同步时间轴预览，按 episode / 任务搜索 |
-| **标注** | episode 质量分、成功/失败、标签与备注；区间多断点标注（快捷键 `B`） |
-| **筛选** | 人工决策 `pass` / `review` / `quarantine`，支持批量与导出时按状态过滤 |
-| **转换** | 四格式互转，后台任务不中断，产出 `conversion_report.json` 与保真级别提示 |
-| **增强** | 亮度自适应 / 手动调节；基于 SAM3 的物体换色与背景替换（先预览再批量写出） |
-| **导出** | 默认保持源格式子集导出（硬链/复制）；可选导出时一并转换 |
+| **Browse** | Auto-detect formats; multi-camera synced timeline preview; search by episode / task |
+| **Annotate** | Episode quality score, success/fail, tags and notes; multi-breakpoint interval labels (hotkey `B`) |
+| **Filter** | Manual decisions: `pass` / `review` / `quarantine`; bulk update and export-time filtering |
+| **Convert** | Convert among four formats in background jobs; emits `conversion_report.json` and fidelity hints |
+| **Augment** | Brightness auto/manual; SAM3-based object recolor and background replace (preview, then batch write) |
+| **Export** | Default same-format subset export (hardlink/copy); optional convert-on-export |
 
-自动筛选入口已预留，规则引擎待标准确认后接入。
+Auto-filter is reserved; the rule engine ships after the QC standard is finalized.
 
-## 支持格式
+## Typical workflow
 
-| 格式 | 典型布局 |
+1. **Open a dataset** — point Embodit at a local directory; it detects the format and episodes.
+2. **Inspect and review** — view synchronized cameras, states, and actions; record scores and notes.
+3. **Annotate and filter** — add interval labels and mark episodes as `pass`, `review`, or `quarantine`.
+4. **Export or convert** — export a filtered subset, optionally converting it to another format.
+5. **Augment (optional)** — preview brightness, recoloring, or background replacement, then write the result to a new directory.
+
+## Supported formats
+
+| Format | Typical layout |
 |---|---|
-| **LeRobot v2.1** | 目录型数据集（parquet + 视频 / 元数据） |
-| **LeRobot v3** | 目录型数据集 |
-| **HDF5** | 单文件或目录（RoboMimic 风格 `.hdf5` / `.h5`） |
-| **MCAP** | 单文件、顶层多文件，或一层分片子目录 |
+| **LeRobot v2.1** | Directory dataset (parquet + video / metadata) |
+| **LeRobot v3** | Directory dataset |
+| **HDF5** | Single file or directory (RoboMimic-style `.hdf5` / `.h5`) |
+| **MCAP** | Single file, top-level multi-file, or one nested shard level |
 
-转换能力矩阵（同格式为无损子集导出；跨格式有不同程度损失，界面会标注）：
+Conversion capability matrix (rows are source formats; columns are target formats):
 
 | → | LeRobot v2.1 | LeRobot v3 | HDF5 | MCAP |
 |---|:---:|:---:|:---:|:---:|
@@ -48,147 +65,172 @@ Embodit 面向机器人 / VLA 数据采集与质检场景：在浏览器里打�
 | **HDF5** | partial | partial | full | partial |
 | **MCAP** | partial | partial | partial | full |
 
-## 快速开始
+Fidelity levels: `full` means a lossless same-format subset export, `high` preserves the primary data, and `partial` may lose fields, calibration, or metadata. Exact losses are shown in the UI and recorded in `conversion_report.json`.
 
-### 依赖
+## Quick start
 
-- Python ≥ 3.10
-- [uv](https://github.com/astral-sh/uv)（`start.sh` 用它按需拉起依赖，无需手动 `pip install`）
-- 颜色增强需要 [SAM3](https://github.com/facebookresearch/sam3) 权重（见下方环境变量）
+### 1. Prerequisites
 
-### 启动
+You only need:
+
+- Python 3.10 or newer
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 ```bash
-git clone <repo-url> Embodit
-cd Embodit
+# Install uv if needed
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 将浏览根目录指向你的数据盘
+git clone https://github.com/eddyLfan/Embodit.git
+cd Embodit
+```
+
+### 2. Start
+
+```bash
 bash start.sh /path/to/your/data
 ```
 
-终端会打印带访问令牌的 URL，例如：
+On first run, Embodit creates `.venv` and installs the versions pinned by `pyproject.toml` and `uv.lock`. When the server is ready, the terminal prints a tokenized URL:
 
 ```text
 http://localhost:8765/?token=<random>
 ```
 
-首次打开后令牌会换成 HttpOnly Cookie，之后可直接访问 `http://localhost:8765/`。
+Open this URL in your browser. On first visit, the token is exchanged for an HttpOnly cookie; afterwards, `http://localhost:8765/` works without it.
 
-停止服务：
+### 3. Manage the service
 
 ```bash
-bash stop.sh
+bash stop.sh          # Stop the service
+tail -f service.log   # Follow logs
+bash start.sh --help  # Show launch options
 ```
 
-日志：`tail -f service.log`
+Browse / annotate / filter / convert work out of the box. **Augment** (brightness / SAM3 recolor) is optional — see [Optional: augment](#optional-augment) below.
 
-### 环境变量（可选）
+## Configuration
 
-| 变量 | 含义 | 默认 |
+### Dependency environments
+
+| Layer | What |
+|---|---|
+| **Core runtime** | Declared in `pyproject.toml`, locked in `uv.lock`. `start.sh` runs `uv sync` then `uv run`. |
+| **Dev extras** | `uv sync --extra dev` (optional tooling). |
+| **Augment (optional)** | External algorithm tree + optional Torch/CUDA env — not part of the core install. |
+
+### Environment variables
+
+| Variable | Meaning | Default |
 |---|---|---|
-| `EMBODY_ROOT` | 数据浏览根目录 | 启动参数；未传时为 `/media/DATA` |
-| `EMBODY_HOST` | 监听地址 | `127.0.0.1` |
-| `EMBODY_PORT` | 端口 | `8765` |
-| `EMBODY_PUBLIC_HOST` | 打印到终端的对外主机名 | `localhost` |
-| `EMBODY_TOKEN` | 访问令牌 | 持久化在 `config/token`；否则随机生成 |
-| `EMBODY_PROXY` | HTTP(S) 代理 | 内置占位 URL；**开源/外网环境请设为空字符串关闭** |
-| `EMBODIT_SANDBOX` | 限制路径不得越出浏览根 | 关闭；设 `1` 开启 |
-| `EMBODIT_HDF5_FPS` | HDF5 缺省帧率 | `20` |
-| `EMBODIT_MCAP_GAP_S` | MCAP 按时间间隙切 episode 的秒数 | `2` |
-| `AUGMENT_SAM3_CHECKPOINT` | SAM3 权重路径 | 需自行配置本地 `.pt` |
+| `EMBODY_ROOT` | Browse root | Launch arg, else current directory |
+| `EMBODY_HOST` | Bind address | `127.0.0.1` |
+| `EMBODY_PORT` | Port | `8765` |
+| `EMBODY_PUBLIC_HOST` | Hostname printed in the URL | `localhost` |
+| `EMBODY_TOKEN` | Access token | Persisted in `config/token`; else randomly generated |
+| `EMBODY_PROXY` | HTTP(S) proxy for `uv` downloads | Off (empty) |
+| `EMBODIT_SANDBOX` | Restrict paths to the browse root | Off; set `1` to enable |
+| `EMBODIT_HDF5_FPS` | Default HDF5 FPS | `20` |
+| `EMBODIT_MCAP_GAP_S` | Gap (seconds) used to split MCAP into episodes | `2` |
 
-兼容旧名：`LEROBOT_*` 与对应的 `EMBODY_*` 等价。
+Legacy aliases: `LEROBOT_*` mirrors the corresponding `EMBODY_*` variables.
 
-推荐的本地启动示例：
+The server binds to `127.0.0.1` by default. For LAN access, set `EMBODY_HOST=0.0.0.0`, use a strong fixed `EMBODY_TOKEN`, and restrict access with a firewall or reverse proxy:
 
 ```bash
-EMBODY_PROXY= EMBODY_PORT=8765 bash start.sh ~/datasets
+EMBODY_HOST=0.0.0.0 \
+EMBODY_PUBLIC_HOST=<server-ip> \
+EMBODY_TOKEN=<strong-random-token> \
+bash start.sh /path/to/your/data
 ```
 
-## 旁路文件约定
+### Optional: augment
 
-源目录旁路写入（不改原始 episode 内容）：
+Color / brightness augmentation loads algorithms from a separate package. See [`third_party/README.md`](third_party/README.md) for the expected layout:
+
+```bash
+export EMBODIT_AUGMENT_ROOT=/path/to/data_strengthen   # must contain augment/
+export AUGMENT_PYTHON=/path/to/torch-env/bin/python    # needed for SAM3 color
+export AUGMENT_SAM3_CHECKPOINT=/path/to/sam3.pt        # or place at checkpoints/sam3.pt
+bash start.sh /path/to/your/data
+```
+
+Without this setup, browsing, annotation, filtering, and conversion still work; only the Augment tab is unavailable.
+
+## Data write policy
+
+Embodit never rewrites episode payloads, but it does write review and annotation sidecars next to the source:
 
 ```text
 <source>/
-  <name>.review.json      # 人工筛选决策（目录数据集）
-  labels.jsonl            # 打分与标注
-  # 单文件 HDF5 / MCAP：
+  <name>.review.json      # manual review decisions (directory datasets)
+  labels.jsonl            # scores and annotations
+  # single-file HDF5 / MCAP:
   #   <file>.review.json
   #   <file>.labels.jsonl
 ```
 
-导出 / 转换 / 增强结果写入**新路径**，例如：
+Export / convert / augment results go to a **new path**, e.g.:
 
 ```text
 export_or_converted/
   selection_manifest.json
-  conversion_report.json   # 转换时：映射、已知损失等
+  conversion_report.json   # on convert: mappings, known losses, etc.
 ```
 
-跨格式映射可参考 [`config/convert.example.json`](config/convert.example.json)。
+For cross-format field and topic mapping, see [`config/convert.example.json`](config/convert.example.json). Keep output paths outside the source dataset to avoid mixing generated and original data.
 
-## 项目结构
+## Project layout
 
 ```text
 .
-├── start.sh / stop.sh     # 一键启停（nohup + uv）
-├── pyproject.toml         # 项目元数据与核心依赖
-├── web/                   # 浏览器 UI（中英切换）
+├── start.sh / stop.sh     # one-command start/stop (uv sync + uv run)
+├── pyproject.toml         # core dependencies
+├── uv.lock                # locked versions
+├── web/                   # browser UI (EN/ZH toggle)
 ├── backend/
-│   ├── app.py             # FastAPI 入口
-│   ├── settings.py        # 环境可覆盖配置
-│   ├── datasets/          # 格式探测、适配器、帧读取、导出
-│   ├── labels/            # 标注 schema 与 JSONL 存储
-│   ├── convert/           # 互转管线与后台任务
-│   ├── augment/           # 视觉增强（亮度 / SAM3 换色）
-│   └── qc/                # 自动筛选预留
-├── config/                # token、转换示例配置
-├── images/                # Logo / favicon
-└── tests/                 # pytest
+│   ├── app.py             # FastAPI entry
+│   ├── settings.py        # env-overridable settings
+│   ├── datasets/          # format detection, adapters, frames, export
+│   ├── labels/            # label schema and JSONL store
+│   ├── convert/           # conversion pipeline and background jobs
+│   ├── augment/           # visual augment (optional external algos)
+│   └── qc/                # auto-filter placeholder
+├── config/                # token (gitignored), convert example
+├── checkpoints/           # optional SAM3 weights
+├── third_party/           # optional augment algorithm checkout
+├── images/                # logo and documentation assets
+└── LICENSE
 ```
 
-## 开发与测试
+## Development
 
 ```bash
-# 安装开发依赖（可选）
-uv sync --extra dev
-
-# 跑测试
-uv run --extra dev pytest tests/ -q
-```
-
-也可临时注入依赖：
-
-```bash
-uv run --with pytest --with pyarrow --with numpy --with h5py --with mcap --with pydantic \
-  pytest tests/ -q
-```
-
-直接调试后端（需自行提供 token 与端口）：
-
-```bash
+uv sync
 uv run python backend/app.py --host 127.0.0.1 --port 8765 \
   --browse-root /path/to/data --token=dev-token
 ```
 
-## 设计原则
+## Design principles
 
-1. **源数据只读**：审阅与标注旁路落盘；转换 / 增强写出新数据集。
-2. **显式保真**：跨格式转换在 UI 中标明 `full` / `high` / `partial` 及已知损失，避免 silently wrong。
-3. **长任务可脱离浏览器**：转换与增强在独立进程后台跑，关页不中断。
-4. **轻量启动**：日常依赖由 `uv` 按需解析；颜色增强权重按需加载。
+1. **Source data is read-only** — review and labels land as sidecars; convert / augment write new datasets.
+2. **Explicit fidelity** — cross-format conversion surfaces `full` / `high` / `partial` and known losses in the UI.
+3. **Long jobs outlive the browser** — convert and augment run as detached processes; closing the tab does not cancel them.
+4. **Lightweight startup** — core deps come from `uv sync`; SAM3 / Torch load only when Augment is configured.
 
-## 路线图
+## Updates
 
-- [ ] 自动筛选规则引擎（标准确认后）
-- [ ] 更完整的跨格式特征 / 标定保留
-- [ ] 打包发布（PyPI / 容器镜像）与许可证定稿
+Current release: **v0.1.0** (first public open-source release).
 
-## 贡献
+| Version | Date | Highlights |
+|---|---|---|
+| **v0.1.0** | 2026-07 | Browse / annotate / filter / convert / export for LeRobot v2.1 & v3, HDF5, and MCAP; optional brightness and SAM3 visual augment; EN/ZH UI and docs; one-command startup via `uv` (`start.sh`) |
 
-Issue 与 Pull Request 欢迎。提交前请尽量保证 `pytest` 通过，并说明涉及的格式与复现路径。
+Later changes will be recorded in this section (and in GitHub Releases when available).
 
-## 许可证
+## Contributing
 
-开源许可证待定（计划在首次公开发布时补充 `LICENSE`）。若你 fork 使用，请暂时自行约定合规条款。
+Issues and pull requests are welcome. Please describe the formats and repro paths involved.
+
+## License
+
+Released under the [MIT License](LICENSE).

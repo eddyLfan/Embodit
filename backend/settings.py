@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
@@ -16,11 +18,17 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _default_sam3_checkpoint() -> Path:
+    """Prefer repo-local checkpoints/sam3.pt; no company path baked in."""
+    override = os.environ.get("AUGMENT_SAM3_CHECKPOINT", "").strip()
+    if override:
+        return Path(override).expanduser()
+    local = PROJECT_ROOT / "checkpoints" / "sam3.pt"
+    return local
+
+
 # SAM3 checkpoint for color augmentation (override: AUGMENT_SAM3_CHECKPOINT).
-SAM3_CHECKPOINT = Path(
-    os.environ.get("AUGMENT_SAM3_CHECKPOINT")
-    or "/media/vlm/vlm-model/asset_llm_ckpt/sam3/sam3.pt"
-)
+SAM3_CHECKPOINT = _default_sam3_checkpoint()
 
 # Fallback fps for HDF5 datasets whose env_args carry no control frequency
 # (override: EMBODIT_HDF5_FPS).
