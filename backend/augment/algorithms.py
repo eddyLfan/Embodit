@@ -25,7 +25,7 @@ def _ensure_ds_package() -> None:
         raise FileNotFoundError(
             "Augment algorithms not found at "
             f"{pkg_dir}. Set EMBODIT_AUGMENT_ROOT to a checkout that contains "
-            "an `augment/` package, or place it under third_party/data_strengthen/. "
+            "an `augment/` package, or point it at the external data_strengthen checkout. "
             "Browse / annotate / filter / convert work without it; only Augment needs it."
         )
     init_file = pkg_dir / "__init__.py"

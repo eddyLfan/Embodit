@@ -145,7 +145,7 @@ bash start.sh /path/to/your/data
 
 ### 可选：数据增强
 
-亮度 / 换色算法来自独立包，完整目录要求见 [`third_party/README.md`](third_party/README.md)：
+亮度 / 换色算法来自 `EMBODIT_AUGMENT_ROOT` 指向的外部包。
 
 ```bash
 export EMBODIT_AUGMENT_ROOT=/path/to/data_strengthen   # 内含 augment/
@@ -197,7 +197,6 @@ export_or_converted/
 │   └── qc/                # 自动筛选预留
 ├── config/                # token（已 gitignore）、转换示例配置
 ├── checkpoints/           # 可选 SAM3 权重
-├── third_party/           # 可选增强算法目录
 ├── images/                # Logo 等文档资源
 └── LICENSE
 ```

@@ -145,7 +145,7 @@ bash start.sh /path/to/your/data
 
 ### Optional: augment
 
-Color / brightness augmentation loads algorithms from a separate package. See [`third_party/README.md`](third_party/README.md) for the expected layout:
+Color / brightness augmentation loads algorithms from an external package rooted at `EMBODIT_AUGMENT_ROOT`.
 
 ```bash
 export EMBODIT_AUGMENT_ROOT=/path/to/data_strengthen   # must contain augment/
@@ -197,7 +197,6 @@ For cross-format field and topic mapping, see [`config/convert.example.json`](co
 │   └── qc/                # auto-filter placeholder
 ├── config/                # token (gitignored), convert example
 ├── checkpoints/           # optional SAM3 weights
-├── third_party/           # optional augment algorithm checkout
 ├── images/                # logo and documentation assets
 └── LICENSE
 ```
