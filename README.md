@@ -1,4 +1,4 @@
-<h1>Embodit</h1>
+<h1 align="center">Embodit</h1>
 
 <p align="center">
   <img src="images/Embodit_logo.png" alt="Embodit Logo" width="160" />
@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="#features"><img src="https://img.shields.io/badge/formats-LeRobot%20%7C%20HDF5%20%7C%20MCAP-0ea5e9" alt="formats" /></a>
+  <a href="#supported-formats"><img src="https://img.shields.io/badge/formats-LeRobot%20%7C%20HDF5%20%7C%20MCAP-0ea5e9" alt="formats" /></a>
   <a href="#quick-start"><img src="https://img.shields.io/badge/python-%3E%3D3.10-blue" alt="python" /></a>
   <a href="#quick-start"><img src="https://img.shields.io/badge/runtime-uv-green" alt="uv" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="license" /></a>
@@ -20,58 +20,46 @@
   <b>English</b> | <a href="README.zh-CN.md">中文</a>
 </p>
 
-Embodit opens local datasets directly in your browser for episode inspection, manual QA, annotation, filtering, format conversion, and visual augmentation. **Original sample content stays read-only**: reviews and labels are stored in sidecar files, while exports, conversions, and augmentations are written to new directories.
+Embodit opens local robotics datasets directly in the browser for episode inspection, manual QA, annotation, filtering, conversion, export, and visual augmentation. Data stays on the local machine by default; no third-party upload is required.
 
-> Data stays on your machine by default. No third-party upload is required.
+> Original sample payloads remain read-only. Reviews and labels use sidecar files; exports, conversions, and augmentations are written to new directories.
 
-**Documentation:** [Features](#features) · [Typical workflow](#typical-workflow) · [Supported formats](#supported-formats) · [Quick start](#quick-start) · [Configuration](#configuration) · [Data write policy](#data-write-policy) · [Updates](#updates)
+## Core capabilities
 
-## Features
-
-| Module | Description |
+| Module | Capabilities |
 |---|---|
-| **Browse** | Auto-detect formats; multi-camera synced timeline preview; search by episode / task |
-| **Annotate** | Episode quality score, success/fail, tags and notes; multi-breakpoint interval labels (hotkey `B`) |
-| **Filter** | Manual decisions: `pass` / `review` / `quarantine`; bulk update and export-time filtering |
-| **Convert** | Convert among four formats in background jobs; emits `conversion_report.json` and fidelity hints |
-| **Augment** | Brightness auto/manual; SAM3-based object recolor and background replace (preview, then batch write) |
-| **Export** | Default same-format subset export (hardlink/copy); optional convert-on-export |
+| **Browse** | Format auto-detection, synchronized multi-camera playback, episode and task search |
+| **Review & annotate** | Quality scores, success/failure, tags, notes, and interval labels (`B` hotkey) |
+| **Filter** | `pass` / `review` / `quarantine` decisions, bulk actions, and status-based export |
+| **Convert & export** | Four-format conversion, same-format subset export, background jobs, and fidelity reports |
+| **Visual augment** | Automatic/manual brightness, SAM3 object recoloring and background replacement, preview-gated batch output |
 
-Auto-filter is reserved; the rule engine ships after the QC standard is finalized.
+The automatic filtering interface is reserved; the rule engine is not yet available.
 
-## Typical workflow
+## Screenshots
 
-1. **Open a dataset** — point Embodit at a local directory; it detects the format and episodes.
-2. **Inspect and review** — view synchronized cameras, states, and actions; record scores and notes.
-3. **Annotate and filter** — add interval labels and mark episodes as `pass`, `review`, or `quarantine`.
-4. **Export or convert** — export a filtered subset, optionally converting it to another format.
-5. **Augment (optional)** — preview brightness, recoloring, or background replacement, then write the result to a new directory.
+### Dataset overview
 
-## Supported formats
+Inspect dataset metadata, episodes, synchronized camera streams, and state/action trajectories in one workspace.
 
-| Format | Typical layout |
-|---|---|
-| **LeRobot v2.1** | Directory dataset (parquet + video / metadata) |
-| **LeRobot v3** | Directory dataset |
-| **HDF5** | Single file or directory (RoboMimic-style `.hdf5` / `.h5`) |
-| **MCAP** | Single file, top-level multi-file, or one nested shard level |
+<p align="center">
+  <img src="images/overview.png" alt="Embodit dataset overview" width="100%" />
+</p>
 
-Conversion capability matrix (rows are source formats; columns are target formats):
-
-| → | LeRobot v2.1 | LeRobot v3 | HDF5 | MCAP |
-|---|:---:|:---:|:---:|:---:|
-| **LeRobot v2.1** | full | high | partial | partial |
-| **LeRobot v3** | high | full | partial | partial |
-| **HDF5** | partial | partial | full | partial |
-| **MCAP** | partial | partial | partial | full |
-
-Fidelity levels: `full` means a lossless same-format subset export, `high` preserves the primary data, and `partial` may lose fields, calibration, or metadata. Exact losses are shown in the UI and recorded in `conversion_report.json`.
+<table>
+  <tr>
+    <td width="50%"><img src="images/annotation.png" alt="Embodit annotation workspace" /></td>
+    <td width="50%"><img src="images/augmentation.png" alt="Embodit augmentation preview" /></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Review and annotation</b><br />Capture scores, tags, notes, and interval labels</td>
+    <td align="center"><b>Data augmentation</b><br />Compare source and transformed results before batch output</td>
+  </tr>
+</table>
 
 ## Quick start
 
-### 1. Prerequisites
-
-You only need:
+### Requirements
 
 - Python 3.10 or newer
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
@@ -84,21 +72,19 @@ git clone https://github.com/eddyLfan/Embodit.git
 cd Embodit
 ```
 
-### 2. Start
+### Start the service
 
 ```bash
 bash start.sh /path/to/your/data
 ```
 
-On first run, Embodit creates `.venv` and installs the versions pinned by `pyproject.toml` and `uv.lock`. When the server is ready, the terminal prints a tokenized URL:
+On first run, Embodit creates `.venv` and installs the versions pinned by `pyproject.toml` and `uv.lock`. When ready, it prints a tokenized URL:
 
 ```text
 http://localhost:8765/?token=<random>
 ```
 
-Open this URL in your browser. On first visit, the token is exchanged for an HttpOnly cookie; afterwards, `http://localhost:8765/` works without it.
-
-### 3. Manage the service
+The first request exchanges the token for an HttpOnly cookie. Subsequent visits can use `http://localhost:8765/` directly.
 
 ```bash
 bash stop.sh          # Stop the service
@@ -106,35 +92,61 @@ tail -f service.log   # Follow logs
 bash start.sh --help  # Show launch options
 ```
 
-Browse / annotate / filter / convert work out of the box. **Augment** (brightness / SAM3 recolor) is optional — see [Optional: augment](#optional-augment) below.
+## Workflow
+
+1. Select a data path; Embodit detects the format and episodes.
+2. Inspect synchronized cameras, state, and action; add scores, tags, and notes.
+3. Mark episodes as `pass`, `review`, or `quarantine`.
+4. Export the filtered subset or convert it to another format.
+5. Optionally preview a visual transform and write an augmented dataset.
+
+## Supported formats
+
+| Format | Typical supported layout |
+|---|---|
+| **LeRobot v2.1** | Directory with parquet, video, and metadata |
+| **LeRobot v3** | LeRobot v3 directory dataset |
+| **HDF5** | RoboMimic-style `.hdf5` / `.h5` file or directory |
+| **MCAP** | Single file, top-level files, or one shard-directory level |
+
+Conversion matrix (rows: source; columns: target):
+
+| → | LeRobot v2.1 | LeRobot v3 | HDF5 | MCAP |
+|---|:---:|:---:|:---:|:---:|
+| **LeRobot v2.1** | full | high | partial | partial |
+| **LeRobot v3** | high | full | partial | partial |
+| **HDF5** | partial | partial | full | partial |
+| **MCAP** | partial | partial | partial | full |
+
+- `full`: lossless same-format subset export
+- `high`: primary data is preserved; layout or metadata may change
+- `partial`: fields, calibration, or format-specific metadata may be lost
+
+The UI shows known losses and records them in `conversion_report.json`. See [`config/convert.example.json`](config/convert.example.json) for field and topic mappings.
 
 ## Configuration
 
-### Dependency environments
-
-| Layer | What |
-|---|---|
-| **Core runtime** | Declared in `pyproject.toml`, locked in `uv.lock`. `start.sh` runs `uv sync` then `uv run`. |
-| **Dev extras** | `uv sync --extra dev` (optional tooling). |
-| **Augment** | Built-in brightness and mask effects; SAM3 color augment uses a separate optional Torch/CUDA environment. |
-
 ### Environment variables
 
-| Variable | Meaning | Default |
+| Variable | Purpose | Default |
 |---|---|---|
-| `EMBODY_ROOT` | Browse root | Launch arg, else current directory |
+| `EMBODY_ROOT` | Data browse root | Launch argument or current directory |
 | `EMBODY_HOST` | Bind address | `127.0.0.1` |
-| `EMBODY_PORT` | Port | `8765` |
-| `EMBODY_PUBLIC_HOST` | Hostname printed in the URL | `localhost` |
-| `EMBODY_TOKEN` | Access token | Persisted in `config/token`; else randomly generated |
-| `EMBODY_PROXY` | HTTP(S) proxy for `uv` downloads | Off (empty) |
-| `EMBODIT_SANDBOX` | Restrict paths to the browse root | Off; set `1` to enable |
-| `EMBODIT_HDF5_FPS` | Default HDF5 FPS | `20` |
-| `EMBODIT_MCAP_GAP_S` | Gap (seconds) used to split MCAP into episodes | `2` |
+| `EMBODY_PORT` | Service port | `8765` |
+| `EMBODY_PUBLIC_HOST` | Hostname printed in the terminal URL | `localhost` |
+| `EMBODY_TOKEN` | Access token | `config/token` or randomly generated |
+| `EMBODY_PROXY` | HTTP(S) proxy used by `uv` | Empty |
+| `EMBODIT_SANDBOX` | Restrict accessible paths to the browse root | Off; set to `1` |
+| `EMBODIT_HDF5_FPS` | Fallback FPS for HDF5 | `20` |
+| `EMBODIT_MCAP_GAP_S` | Time gap used to split MCAP episodes, in seconds | `2` |
+| `AUGMENT_PYTHON` | Python interpreter for the SAM3 worker | Current interpreter |
+| `AUGMENT_SAM3_CHECKPOINT` | SAM3 checkpoint path | `checkpoints/sam3.pt` |
 
-Legacy aliases: `LEROBOT_*` mirrors the corresponding `EMBODY_*` variables.
+Legacy `LEROBOT_*` variables remain aliases for their `EMBODY_*` equivalents.
 
-The server binds to `127.0.0.1` by default. For LAN access, set `EMBODY_HOST=0.0.0.0`, use a strong fixed `EMBODY_TOKEN`, and restrict access with a firewall or reverse proxy:
+### LAN access
+
+The service binds to localhost by default. For LAN access, use a strong fixed token and restrict the endpoint with a firewall or reverse proxy:
 
 ```bash
 EMBODY_HOST=0.0.0.0 \
@@ -143,12 +155,12 @@ EMBODY_TOKEN=<strong-random-token> \
 bash start.sh /path/to/your/data
 ```
 
-### Optional: augment
+## Data augmentation
 
-Brightness and the post-mask recolor/background effects are built into Embodit, so brightness works from a clean clone. Color augmentation additionally requires Meta SAM3 and a checkpoint for which you have access. SAM3 is not distributed with Embodit and remains under its own license.
+Brightness, mask recoloring, and solid-background effects are built in. Brightness works out of the box. Color augmentation additionally requires Meta SAM3, a compatible PyTorch/CUDA environment, and an authorized checkpoint.
 
 ```bash
-# In a separate Python 3.12 environment, install PyTorch for your CUDA version, then:
+# In a separate Python 3.12 environment, install PyTorch for the host CUDA version, then:
 git clone https://github.com/facebookresearch/sam3.git ../sam3
 python -m pip install -r config/augment-worker-requirements.txt
 python -m pip install -e ../sam3
@@ -158,87 +170,85 @@ export AUGMENT_SAM3_CHECKPOINT=/path/to/sam3.pt
 bash start.sh /path/to/your/data
 ```
 
-SAM3 requirements and checkpoint access can change; follow [`facebookresearch/sam3`](https://github.com/facebookresearch/sam3) and see [`third_party/README.md`](third_party/README.md) for licensing notes. Without SAM3, brightness remains available and the UI disables color augmentation with a concrete readiness reason.
+Follow [`facebookresearch/sam3`](https://github.com/facebookresearch/sam3) for current requirements and checkpoint access. See [`third_party/README.md`](third_party/README.md) for licensing notes. If SAM3 is unavailable, Embodit disables color augmentation and reports the missing dependency without affecting other features.
 
-A successful preview is required before batching. The server binds the batch request to the exact transform settings used by that preview; changing brightness, prompts, color, apply mode, or GPU requires a new preview.
+Every batch augmentation must reference a successful preview with identical transform settings. Changing brightness, prompts, color, apply mode, or GPU invalidates the preview.
 
-## Data write policy
+### Augment output fidelity
 
-Embodit never rewrites episode payloads, but it does write review and annotation sidecars next to the source:
+Augmentation writes LeRobot v2.1 or v3 and preserves:
+
+- camera videos
+- `observation.state`, when available
+- `action`, when available
+- episode tasks
+
+Custom tabular fields, calibration, source statistics, and format-specific metadata are not copied. Videos are re-encoded as H.264. Augment output therefore has `partial` fidelity, documented in `meta/augmentation_report.json`.
+
+## Data writes and security
+
+Embodit does not modify original episode payloads, but review and annotation sidecars are written next to the source:
 
 ```text
 <source>/
-  <name>.review.json      # manual review decisions (directory datasets)
+  <name>.review.json      # manual decisions for directory datasets
   labels.jsonl            # scores and annotations
+
   # single-file HDF5 / MCAP:
-  #   <file>.review.json
-  #   <file>.labels.jsonl
+  <file>.review.json
+  <file>.labels.jsonl
 ```
 
-Export / convert / augment results go to a **new path**, e.g.:
+Exports, conversions, and augmentations must use a new path outside the source dataset:
 
 ```text
-export_or_converted/
+<output>/
   selection_manifest.json
-  conversion_report.json   # on convert: mappings, known losses, etc.
-  meta/augmentation_report.json  # on augment: preserved fields and known losses
+  conversion_report.json          # conversion fidelity and known losses
+  meta/augmentation_report.json   # augmentation fidelity and known losses
 ```
 
-Visual augmentation currently writes LeRobot v2.1 or v3 and reconstructs camera videos, `observation.state`, `action`, and episode tasks. Custom tabular fields, calibration, source statistics, and format-specific metadata are not copied, and video is re-encoded as H.264. Augment output therefore has `partial` fidelity; `augmentation_report.json` records the exact contract. The output path must not equal or sit inside the source dataset.
+The output path must not equal or reside inside the source dataset.
 
-For cross-format field and topic mapping, see [`config/convert.example.json`](config/convert.example.json). Keep output paths outside the source dataset to avoid mixing generated and original data.
+## Development and testing
+
+```bash
+uv sync --extra dev
+uv run pytest -q
+
+uv run python backend/app.py \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --browse-root /path/to/data \
+  --token dev-token
+```
 
 ## Project layout
 
 ```text
 .
-├── start.sh / stop.sh     # one-command start/stop (uv sync + uv run)
-├── pyproject.toml         # core dependencies
-├── uv.lock                # locked versions
-├── web/                   # browser UI (EN/ZH toggle)
 ├── backend/
-│   ├── app.py             # FastAPI entry
-│   ├── settings.py        # env-overridable settings
-│   ├── datasets/          # format detection, adapters, frames, export
-│   ├── labels/            # label schema and JSONL store
-│   ├── convert/           # conversion pipeline and background jobs
-│   ├── augment/           # visual augment (optional external algos)
-│   └── qc/                # auto-filter placeholder
-├── config/                # token (gitignored), convert example
-├── checkpoints/           # optional SAM3 weights
-├── images/                # logo and documentation assets
-└── LICENSE
+│   ├── app.py          # FastAPI entry point
+│   ├── datasets/       # detection, adapters, frame access, and export
+│   ├── labels/         # annotation schema and storage
+│   ├── convert/        # conversion pipeline and background jobs
+│   ├── augment/        # built-in effects and SAM3 adapter
+│   └── qc/             # reserved automatic filtering module
+├── web/                # browser UI and EN/ZH strings
+├── tests/              # automated tests
+├── config/             # example mappings and worker requirements
+├── checkpoints/        # optional SAM3 weights (not tracked by Git)
+├── start.sh / stop.sh  # service lifecycle
+├── pyproject.toml
+└── uv.lock
 ```
 
-## Development
+## Version and contributing
 
-```bash
-uv sync
-uv run python backend/app.py --host 127.0.0.1 --port 8765 \
-  --browse-root /path/to/data --token=dev-token
-```
+Current version: **v0.1.0**.
 
-## Design principles
-
-1. **Source data is read-only** — review and labels land as sidecars; convert / augment write new datasets.
-2. **Explicit fidelity** — cross-format conversion surfaces `full` / `high` / `partial` and known losses in the UI.
-3. **Long jobs outlive the browser** — convert and augment run as detached processes; closing the tab does not cancel them.
-4. **Lightweight startup** — brightness and mask effects use core dependencies; SAM3 / Torch load only in color workers.
-
-## Updates
-
-Current release: **v0.1.0** (first public open-source release).
-
-| Version | Date | Highlights |
-|---|---|---|
-| **v0.1.0** | 2026-07 | Browse / annotate / filter / convert / export for LeRobot v2.1 & v3, HDF5, and MCAP; optional brightness and SAM3 visual augment; EN/ZH UI and docs; one-command startup via `uv` (`start.sh`) |
-
-Later changes will be recorded in this section (and in GitHub Releases when available).
-
-## Contributing
-
-Issues and pull requests are welcome. Please describe the formats and repro paths involved.
+Issues and pull requests are welcome. Include the affected data format, reproduction steps, and expected behavior.
 
 ## License
 
-Released under the [MIT License](LICENSE).
+Embodit is released under the [MIT License](LICENSE). SAM3 and other third-party components remain subject to their respective licenses.

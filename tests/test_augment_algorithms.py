@@ -8,6 +8,7 @@ import pytest
 from augment.algorithms import apply_brightness_videos, apply_color_videos
 from augment.capabilities import config_fingerprint
 from augment.effects import recolor_frames, replace_background_frames
+from augment.pipeline import _align_timeseries
 
 
 def _video(value: int = 80) -> np.ndarray:
@@ -29,6 +30,17 @@ def test_brightness_is_built_in_and_preserves_shape():
     assert result["cam"].dtype == np.uint8
     assert meta["mode"] == "manual"
     assert not np.array_equal(result["cam"], source)
+
+
+def test_auto_brightness_reports_cross_camera_difference_without_failing():
+    result, meta = apply_brightness_videos(
+        {"dark": _video(25), "bright": _video(220)},
+        mode="auto",
+    )
+    assert set(result) == {"dark", "bright"}
+    qa = meta["cameras"]["_qa"]
+    assert qa["status"] == "warning"
+    assert any("cross-camera" in warning for warning in qa["warnings"])
 
 
 def test_mask_effects_change_only_the_intended_region():
@@ -88,3 +100,15 @@ def test_config_fingerprint_binds_transform_but_not_batch_scope():
     batch = {**base, "mode": "batch", "output": "/data/out", "episodes": [1, 2]}
     assert config_fingerprint(preview) == config_fingerprint(batch)
     assert config_fingerprint(base) != config_fingerprint({**base, "brightnessGain": 1.3})
+
+
+def test_timeseries_alignment_matches_video_length_and_reports_change():
+    source = np.arange(6, dtype=np.float32).reshape(3, 2)
+    aligned, meta = _align_timeseries(source, 5)
+    assert aligned.shape == (5, 2)
+    assert np.array_equal(aligned[[0, -1]], source[[0, -1]])
+    assert meta == {"sourceLength": 3, "targetLength": 5}
+
+    unchanged, unchanged_meta = _align_timeseries(source, 3)
+    assert unchanged is source
+    assert unchanged_meta is None

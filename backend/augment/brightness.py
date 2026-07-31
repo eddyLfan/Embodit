@@ -97,6 +97,7 @@ def apply_brightness(
     resolved: dict[str, Any] = params or estimate_brightness_params(videos)
     out: dict[str, np.ndarray] = {}
     medians: list[float] = []
+    warnings: list[str] = []
     for key, frames in videos.items():
         camera_params = resolved[key]
         out[key] = apply_luma_curve(frames, camera_params["gain"], camera_params["gamma"])
@@ -106,9 +107,15 @@ def apply_brightness(
             camera_params["result"]["dark_clip_ratio"] > 0.02
             or camera_params["result"]["bright_clip_ratio"] > 0.02
         ):
-            raise RuntimeError(f"{key}: excessive clipping after brightness adaptation")
+            warnings.append(f"{key}: excessive clipping after brightness adaptation")
     spread = float(max(medians) - min(medians))
     if spread > 32.0:
-        raise RuntimeError(f"cross-camera median brightness spread too large: {spread:.1f}")
-    resolved["_qa"] = {"camera_p50_spread": spread}
+        # Head/wrist/left/right cameras can legitimately have very different
+        # exposure. This is useful QA information, not an augmentation failure.
+        warnings.append(f"cross-camera median brightness spread is high: {spread:.1f}")
+    resolved["_qa"] = {
+        "camera_p50_spread": spread,
+        "status": "warning" if warnings else "ok",
+        "warnings": warnings,
+    }
     return out, resolved

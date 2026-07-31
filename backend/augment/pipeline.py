@@ -18,7 +18,12 @@ from augment.algorithms import (
 )
 from augment.colors import resolve_color
 from augment.output_writer import AugmentDatasetWriter
-from augment.paths import DEFAULT_PREVIEW_DIR, PREVIEW_FRAME_LIMIT
+from augment.paths import (
+    BRIGHTNESS_SAMPLE_MAX_SIDE,
+    DEFAULT_PREVIEW_DIR,
+    PREVIEW_FRAME_LIMIT,
+    PREVIEW_MAX_SIDE,
+)
 from augment.preview import write_preview
 from datasets.registry import open_dataset
 from datasets.view import DatasetView
@@ -65,6 +70,7 @@ def _load_episode_videos(
     view: DatasetView,
     episode_index: int,
     max_frames: int | None = None,
+    max_side: int | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     ep = next((item for item in view.episodes if item.episode_index == episode_index), None)
     if ep is None:
@@ -81,19 +87,11 @@ def _load_episode_videos(
         for idx, frame in enumerate(source.iter_rgb()):
             if max_frames is not None and idx >= max_frames:
                 break
-            frames.append(frame)
+            frames.append(_resize_frame(frame, max_side))
         if frames:
             videos[cam_key] = np.stack(frames, axis=0)
     if not videos:
         raise RuntimeError(f"episode {episode_index} 没有可解码的相机帧源")
-
-    state, action, ts_error = _load_timeseries(adapter, episode_index)
-    if max_frames is not None:
-        n = min(len(next(iter(videos.values()))), max_frames)
-        if state is not None:
-            state = state[:n]
-        if action is not None:
-            action = action[:n]
 
     length = int(ep.length or 0)
     if videos:
@@ -102,11 +100,21 @@ def _load_episode_videos(
         "episode_index": episode_index,
         "length": length,
         "tasks": list(ep.tasks or []),
-        "state": state,
-        "action": action,
-        "timeseriesError": ts_error,
     }
     return videos, meta
+
+
+def _resize_frame(frame: np.ndarray, max_side: int | None) -> np.ndarray:
+    """Bound preview/analysis memory without changing batch output resolution."""
+    frame = np.asarray(frame)
+    if not max_side or max(frame.shape[:2]) <= max_side:
+        return frame
+    import cv2
+
+    height, width = frame.shape[:2]
+    scale = float(max_side) / max(height, width)
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
 
 
 def _load_timeseries(adapter, episode_index: int) -> tuple[np.ndarray | None, np.ndarray | None, str | None]:
@@ -124,6 +132,26 @@ def _load_timeseries(adapter, episode_index: int) -> tuple[np.ndarray | None, np
     if "observation.state" in series:
         state = np.asarray(series["observation.state"])
     return state, action, error
+
+
+def _align_timeseries(
+    values: np.ndarray | None,
+    target_length: int,
+) -> tuple[np.ndarray | None, dict[str, int] | None]:
+    """Align an untimestamped series to video frames with nearest samples."""
+    if values is None:
+        return None, None
+    values = np.asarray(values)
+    source_length = len(values)
+    if source_length == target_length:
+        return values, None
+    if source_length <= 0:
+        return None, {"sourceLength": 0, "targetLength": int(target_length)}
+    indices = np.rint(np.linspace(0, source_length - 1, target_length)).astype(np.int64)
+    return values[indices], {
+        "sourceLength": int(source_length),
+        "targetLength": int(target_length),
+    }
 
 
 def _run_augment_on_videos(
@@ -177,18 +205,14 @@ def run_augment_job(
     _check_cancelled(jobs_dir=jobs_dir, job_id=job_id, cancel_flag=cancel_flag)
     _emit(progress_callback, progress=0.02, current=0, total=0, message="打开源数据集…")
     adapter = open_dataset(dataset)
-    view: DatasetView = adapter.inspect()
-    fps = float(view.fps or 30.0)
-    target_format = str(job.get("targetFormat") or view.format_id or "lerobot_v3")
-    if target_format not in {"lerobot_v3", "lerobot_v21"}:
-        target_format = "lerobot_v3"
-
-    if mode == "preview":
-        return _run_preview(job, adapter, view, fps, progress_callback)
-
     episodes = job.get("episodes")
-    if episodes is None:
-        indices = [ep.episode_index for ep in view.episodes]
+    if mode == "preview":
+        indices = [int(job.get("previewEpisode") or 0)]
+    elif episodes is None:
+        index_loader = getattr(adapter, "augmentation_episode_indices", None)
+        indices = index_loader() if index_loader is not None else [
+            ep.episode_index for ep in adapter.inspect().episodes
+        ]
         sample_count = job.get("sampleCount")
         if sample_count is not None:
             try:
@@ -204,6 +228,18 @@ def run_augment_job(
         indices = [int(x) for x in episodes]
     if not indices:
         raise ValueError("没有可增强的 episode")
+
+    augmentation_inspector = getattr(adapter, "inspect_for_augmentation", None)
+    view: DatasetView = (
+        augmentation_inspector(indices) if augmentation_inspector is not None else adapter.inspect()
+    )
+    fps = float(view.fps or 30.0)
+    target_format = str(job.get("targetFormat") or view.format_id or "lerobot_v3")
+    if target_format not in {"lerobot_v3", "lerobot_v21"}:
+        target_format = "lerobot_v3"
+
+    if mode == "preview":
+        return _run_preview(job, adapter, view, fps, progress_callback)
 
     output = Path(job["output"]).expanduser().resolve()
     writer = AugmentDatasetWriter(
@@ -324,7 +360,7 @@ def _augment_episode_streaming(
             for frame_index, frame in enumerate(source.iter_rgb()):
                 if frame_index >= PREVIEW_FRAME_LIMIT:
                     break
-                sample_frames.append(frame)
+                sample_frames.append(_resize_frame(frame, BRIGHTNESS_SAMPLE_MAX_SIDE))
             if not sample_frames:
                 raise RuntimeError(f"{cam_key}: 无法读取亮度估计样本")
             samples[cam_key] = np.stack(sample_frames, axis=0)
@@ -360,7 +396,9 @@ def _augment_episode_streaming(
                         metrics = brightness_algorithm.result_metrics(aug)
                         params["result"] = metrics
                         if metrics["dark_clip_ratio"] > 0.02 or metrics["bright_clip_ratio"] > 0.02:
-                            raise RuntimeError(f"{cam_key}: excessive clipping after brightness adaptation")
+                            episode_meta.setdefault("qualityWarnings", []).append(
+                                f"{cam_key}: excessive clipping after brightness adaptation"
+                            )
                         brightness_medians.append(metrics["p50"])
                         meta = {
                             "mode": "auto",
@@ -402,7 +440,27 @@ def _augment_episode_streaming(
             del frames, aug
 
         if brightness_medians and max(brightness_medians) - min(brightness_medians) > 32.0:
-            raise RuntimeError("cross-camera median brightness spread too large after augmentation")
+            spread = max(brightness_medians) - min(brightness_medians)
+            episode_meta.setdefault("qualityWarnings", []).append(
+                f"cross-camera median brightness spread is high: {spread:.1f}"
+            )
+
+        target_length = int(ctx["length"])
+        state, state_alignment = _align_timeseries(state, target_length)
+        action, action_alignment = _align_timeseries(action, target_length)
+        alignment = {
+            key: value
+            for key, value in (
+                ("observation.state", state_alignment),
+                ("action", action_alignment),
+            )
+            if value is not None
+        }
+        if alignment:
+            episode_meta["timeseriesAlignment"] = {
+                "method": "nearest",
+                "series": alignment,
+            }
 
         writer.commit_episode(ctx, state=state, action=action, sidecar=episode_meta)
         return ctx
@@ -431,6 +489,7 @@ def _run_preview(
         view,
         ep_idx,
         max_frames=PREVIEW_FRAME_LIMIT,
+        max_side=PREVIEW_MAX_SIDE,
     )
     _emit(progress_callback, progress=0.35, current=0, total=1, message="正在生成增强效果…")
     aug, masks, aug_meta = _run_augment_on_videos(

@@ -1828,6 +1828,12 @@
         gamma: result.brightnessGamma != null ? Number(result.brightnessGamma).toFixed(3) : '—',
       }));
     }
+    const brightnessQa = result.meta?.brightness?.cameras?._qa;
+    if (brightnessQa?.status === 'warning' && brightnessQa.camera_p50_spread != null) {
+      notes.push(t('augmentBrightnessQaWarning', {
+        spread: Number(brightnessQa.camera_p50_spread).toFixed(1),
+      }));
+    }
     if (notes.length) {
       meta?.classList.remove('hidden');
       if (meta) meta.textContent = notes.join(' · ');

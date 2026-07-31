@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import shutil
 import struct
@@ -277,6 +278,8 @@ class McapAdapter(DatasetAdapter):
         super().__init__(path)
         self._view_cache: DatasetView | None = None
         self._episode_files_cache: list[Path] | None = None
+        self._augmentation_episode_cache: dict[int, EpisodeView] = {}
+        self._augmentation_joint_topics: list[str] = []
 
     @classmethod
     def detect(cls, path: Path) -> bool:
@@ -298,6 +301,116 @@ class McapAdapter(DatasetAdapter):
 
     def _is_multifile(self) -> bool:
         return len(self._episode_files()) > 1
+
+    def augmentation_episode_indices(self) -> list[int]:
+        """Return source episode ids without opening every multifile MCAP."""
+        if self._is_multifile():
+            return list(range(len(self._episode_files())))
+        return [episode.episode_index for episode in self.inspect().episodes]
+
+    def inspect_for_augmentation(self, episode_indices: list[int]) -> DatasetView:
+        """Build a worker view while probing only selected MCAP files."""
+        if not self._is_multifile():
+            view = self.inspect()
+            wanted = set(episode_indices)
+            selected_episodes = [ep for ep in view.episodes if ep.episode_index in wanted]
+            return DatasetView(
+                format_id=view.format_id,
+                path=view.path,
+                name=view.name,
+                fps=view.fps,
+                robot_type=view.robot_type,
+                features=view.features,
+                episodes=selected_episodes,
+                total_frames=sum(ep.length for ep in selected_episodes),
+                total_tasks=view.total_tasks,
+                extras=view.extras,
+            )
+
+        files = self._episode_files()
+        selected = list(dict.fromkeys(int(index) for index in episode_indices))
+        if not selected:
+            raise ValueError("没有可增强的 MCAP episode")
+        for index in selected:
+            if index < 0 or index >= len(files):
+                raise IndexError(index)
+
+        # A bounded sample provides camera taxonomy and a representative FPS.
+        probe_indices = selected if len(selected) <= 8 else [
+            selected[round(i * (len(selected) - 1) / 7)] for i in range(8)
+        ]
+        metas = {index: _quick_file_meta(files[index]) for index in probe_indices}
+        first_meta = metas[probe_indices[0]]
+        image_topics = [
+            topic
+            for topic, info in first_meta["topics"].items()
+            if _is_image_topic(topic, info.get("schema"))
+        ]
+        joint_topics = [
+            topic
+            for topic, info in first_meta["topics"].items()
+            if _is_joint_topic(topic, info.get("schema"))
+        ]
+        if not image_topics:
+            raise ValueError(f"MCAP episode 无图像话题：{files[selected[0]]}")
+
+        fps_samples: list[float] = []
+        for meta in metas.values():
+            start_ns = int(meta.get("start_ns") or 0)
+            end_ns = int(meta.get("end_ns") or 0)
+            duration = (end_ns - start_ns) / 1e9 if end_ns > start_ns else 0.0
+            length = max(
+                (int(meta["topics"].get(topic, {}).get("count") or 0) for topic in image_topics),
+                default=0,
+            )
+            if duration > 0 and length > 1:
+                fps_samples.append((length - 1) / duration)
+        fps = float(np.median(fps_samples)) if fps_samples else 30.0
+        task = _infer_task_name(self.path)
+        cameras = {
+            _topic_key(topic): CameraRef(key=_topic_key(topic), kind="topic", topic=topic)
+            for topic in image_topics
+        }
+        episodes = [
+            EpisodeView(
+                episode_index=index,
+                # Direct streaming determines the authoritative frame count.
+                length=0,
+                duration=0.0,
+                tasks=[task],
+                cameras=dict(cameras),
+                extras={"mcapFile": str(files[index]), "prompt": task},
+            )
+            for index in selected
+        ]
+        self._augmentation_episode_cache = {ep.episode_index: ep for ep in episodes}
+        self._augmentation_joint_topics = joint_topics
+        features = {
+            topic: {
+                "dtype": "topic",
+                "schema": info.get("schema"),
+                "count": info.get("count", 0),
+            }
+            for topic, info in first_meta["topics"].items()
+        }
+        return DatasetView(
+            format_id=FORMAT_MCAP,
+            path=str(self.path),
+            name=self.path.name,
+            fps=fps,
+            robot_type=None,
+            features=features,
+            episodes=episodes,
+            total_frames=0,
+            total_tasks=1,
+            extras={
+                "imageTopics": image_topics,
+                "jointTopics": joint_topics,
+                "layout": "multifile",
+                "prompt": task,
+                "augmentationView": True,
+            },
+        )
 
     def _summary_scan(self, file_path: Path) -> dict[str, Any]:
         """Topic taxonomy + anchor-topic timestamps for the gap-split mode.
@@ -531,6 +644,11 @@ class McapAdapter(DatasetAdapter):
         )
 
     def _episode_mcap(self, episode_index: int) -> tuple[Path, EpisodeView]:
+        cached = self._augmentation_episode_cache.get(episode_index)
+        if cached is not None:
+            file_path = Path(cached.extras.get("mcapFile") or "")
+            if file_path.is_file():
+                return file_path, cached
         view = self.inspect()
         if episode_index < 0 or episode_index >= len(view.episodes):
             raise IndexError(episode_index)
@@ -543,8 +661,11 @@ class McapAdapter(DatasetAdapter):
         make_reader = _require_mcap()
         file_path, ep = self._episode_mcap(episode_index)
         start_ns, end_ns = _episode_window(ep)
-        view = self.inspect()
-        joint_topics = list(view.extras.get("jointTopics") or [])
+        if episode_index in self._augmentation_episode_cache:
+            joint_topics = list(self._augmentation_joint_topics)
+        else:
+            view = self.inspect()
+            joint_topics = list(view.extras.get("jointTopics") or [])
         if not joint_topics:
             # Fallback: discover pose-like topics from this file
             meta = _quick_file_meta(file_path)
@@ -601,6 +722,60 @@ class McapAdapter(DatasetAdapter):
         if keys is not None:
             result = {k: v for k, v in result.items() if k in keys or any(k.startswith(prefix) for prefix in ("eef.",))}
         return result
+
+    def iter_topic_frames(self, episode: EpisodeView, topic: str):
+        """Yield RGB frames directly from one MCAP image topic."""
+        make_reader = _require_mcap()
+        file_path = Path(episode.extras.get("mcapFile") or "")
+        if not file_path.is_file():
+            file_path, episode = self._episode_mcap(episode.episode_index)
+        start_ns, end_ns = _episode_window(episode)
+        codec = None
+        decoded_count = 0
+
+        def decode_image(payload: bytes, fmt: str):
+            if fmt in {"jpeg", "jpg", "png"}:
+                from PIL import Image
+
+                with Image.open(io.BytesIO(payload)) as image:
+                    return np.asarray(image.convert("RGB"), dtype=np.uint8)
+            return None
+
+        with file_path.open("rb") as handle:
+            reader = make_reader(handle)
+            for _schema, channel, message in reader.iter_messages(topics=[topic]):
+                if channel.topic != topic or _outside_window(message.log_time, start_ns, end_ns):
+                    continue
+                decoded = _decode_compressed_image(message.data)
+                if not decoded:
+                    continue
+                payload, fmt = decoded
+                image = decode_image(payload, fmt)
+                if image is not None:
+                    decoded_count += 1
+                    yield image
+                    continue
+                if fmt not in {"h264", "avc", "video/h264"}:
+                    raise ValueError(f"暂不支持的图像编码：{fmt}")
+                if codec is None:
+                    import av
+
+                    codec = av.CodecContext.create("h264", "r")
+                    codec.thread_type = "AUTO"
+                for packet in codec.parse(payload):
+                    for frame in codec.decode(packet):
+                        decoded_count += 1
+                        yield frame.to_ndarray(format="rgb24")
+            if codec is not None:
+                for packet in codec.parse(b""):
+                    for frame in codec.decode(packet):
+                        decoded_count += 1
+                        yield frame.to_ndarray(format="rgb24")
+                for frame in codec.decode(None):
+                    decoded_count += 1
+                    yield frame.to_ndarray(format="rgb24")
+        if decoded_count == 0:
+            raise ValueError(f"话题无可解码图像帧：{topic}")
 
     def materialize_topic_video(self, episode_index: int, topic: str) -> Path:
         """Extract CompressedImage payloads and remux to a cached MP4 for browser playback."""

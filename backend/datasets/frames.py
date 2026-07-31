@@ -111,6 +111,20 @@ class AdapterFrameSource(FrameSource):
         yield from self.adapter.get_frames(self.episode_index, self.camera_key)
 
 
+class TopicFrameSource(FrameSource):
+    """Stream a camera topic directly from an MCAP episode."""
+
+    kind = "topic"
+
+    def __init__(self, adapter: Any, episode: EpisodeView, topic: str) -> None:
+        self.adapter = adapter
+        self.episode = episode
+        self.topic = topic
+
+    def iter_rgb(self) -> Iterator[np.ndarray]:
+        yield from self.adapter.iter_topic_frames(self.episode, self.topic)
+
+
 class ImageDirFrameSource(FrameSource):
     kind = "image_dir"
 
@@ -169,7 +183,11 @@ def episode_frame_source(
             return None
 
     if cam.kind == "topic":
-        # MCAP topics: materialize once into a cached MP4, then treat as video.
+        # Augmentation/conversion only needs frames, so avoid a full temporary
+        # MP4 transcode before a short preview can begin.
+        stream = getattr(adapter, "iter_topic_frames", None)
+        if stream is not None and cam.topic:
+            return TopicFrameSource(adapter, ep, cam.topic)
         materialize = getattr(adapter, "materialize_topic_video", None)
         if materialize is None or not cam.topic:
             return None

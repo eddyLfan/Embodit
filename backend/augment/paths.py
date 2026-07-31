@@ -33,3 +33,5 @@ BG_COLORS = {
 EXAMPLE_PROMPTS = ["clothes", "cup", "table", "robot arm", "box"]
 
 PREVIEW_FRAME_LIMIT = 90
+PREVIEW_MAX_SIDE = 640
+BRIGHTNESS_SAMPLE_MAX_SIDE = 320
