@@ -32,11 +32,13 @@ class AugmentDatasetWriter:
         fps: float,
         robot_type: str | None = None,
         job_id: str | None = None,
+        source_format: str | None = None,
     ) -> None:
         self.output = Path(output).expanduser().resolve()
         self.target_format = target_format
         self.fps = float(fps or 30.0)
         self.robot_type = robot_type
+        self.source_format = source_format
         # Job-scoped staging dir: two jobs writing to the same output name can
         # no longer delete each other's staging area.
         suffix = f".augment-building-{job_id}" if job_id else ".augment-building"
@@ -76,7 +78,8 @@ class AugmentDatasetWriter:
 
     def _video_path(self, new_index: int, camera: str) -> Path:
         if self.target_format == "lerobot_v21":
-            return self.staging / "videos" / "chunk-000" / _safe_cam(camera) / f"episode_{new_index:06d}.mp4"
+            chunk = new_index // 1000
+            return self.staging / "videos" / f"chunk-{chunk:03d}" / _safe_cam(camera) / f"episode_{new_index:06d}.mp4"
         chunk = new_index // 1000
         file_idx = new_index % 1000
         return self.staging / "videos" / _safe_cam(camera) / f"chunk-{chunk:03d}" / f"file-{file_idx:03d}.mp4"
@@ -144,7 +147,8 @@ class AugmentDatasetWriter:
             action=action,
         )
         if self.target_format == "lerobot_v21":
-            data_path = self.staging / "data" / "chunk-000" / f"episode_{new_index:06d}.parquet"
+            chunk = new_index // 1000
+            data_path = self.staging / "data" / f"chunk-{chunk:03d}" / f"episode_{new_index:06d}.parquet"
         else:
             chunk = new_index // 1000
             file_idx = new_index % 1000
@@ -293,6 +297,32 @@ class AugmentDatasetWriter:
         (meta_dir / "info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (meta_dir / "stats.json").write_text(
             json.dumps(self.stats.to_stats_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        tasks = sorted({task for row in self.episode_rows for task in (row.get("tasks") or [])})
+        with (meta_dir / "tasks.jsonl").open("w", encoding="utf-8") as handle:
+            for index, task in enumerate(tasks):
+                handle.write(json.dumps({"task_index": index, "task": task}, ensure_ascii=False) + "\n")
+        report = {
+            "operation": "visual_augmentation",
+            "sourceFormat": self.source_format,
+            "targetFormat": self.target_format,
+            "fidelity": "partial",
+            "preserved": [
+                "camera videos",
+                "observation.state (when available)",
+                "action (when available)",
+                "episode tasks",
+            ],
+            "knownLosses": [
+                "Only the standard state/action/video fields are reconstructed.",
+                "Custom tabular features, calibration, source statistics and format-specific metadata are not copied.",
+                "Video streams are decoded and re-encoded with H.264.",
+            ],
+            "manifest": "meta/augment_manifest.jsonl",
+        }
+        (meta_dir / "augmentation_report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
         )
         os.replace(self.staging, self.output)
         return {

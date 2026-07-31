@@ -22,7 +22,7 @@ def _default_sam3_checkpoint() -> Path:
     """Prefer repo-local checkpoints/sam3.pt; no company path baked in."""
     override = os.environ.get("AUGMENT_SAM3_CHECKPOINT", "").strip()
     if override:
-        return Path(override).expanduser()
+        return Path(override).expanduser().resolve()
     local = PROJECT_ROOT / "checkpoints" / "sam3.pt"
     return local
 

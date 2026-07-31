@@ -1,8 +1,8 @@
 """Persistent augment job store and detached worker launcher.
 
 Storage / liveness / cancel mechanics live in ``jobs_common``; this module
-only adds the augment-specific job payload and worker launch (GPU env,
-data_strengthen venv selection).
+only adds the augment-specific job payload and worker launch (GPU selection
+and an optional SAM3 interpreter).
 """
 
 from __future__ import annotations
@@ -17,7 +17,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from augment.paths import DATA_STRENGTHEN_ROOT, DEFAULT_JOBS_DIR, DEFAULT_PREVIEW_DIR, SAM3_CHECKPOINT
+from augment.capabilities import config_fingerprint
+from augment.paths import DEFAULT_JOBS_DIR, DEFAULT_PREVIEW_DIR, SAM3_CHECKPOINT
 from jobs_common import (  # noqa: F401  (re-exported for callers)
     ensure_jobs_dir,
     job_path,
@@ -136,6 +137,8 @@ def create_job(*, config: dict[str, Any], jobs_dir: Path | None = None) -> dict[
         "previewDir": config.get("previewDir"),
         "targetFormat": config.get("targetFormat") or "lerobot_v3",
         "cameraPolicy": config.get("cameraPolicy") or "strict",
+        "configFingerprint": config_fingerprint(config),
+        "previewJobId": config.get("previewJobId"),
         "status": "queued",
         "message": "等待后台 worker 启动",
         "progress": 0.0,
@@ -153,16 +156,10 @@ def create_job(*, config: dict[str, Any], jobs_dir: Path | None = None) -> dict[
 
 
 def resolve_worker_python(aug_type: str) -> str:
-    """Prefer data_strengthen venv for color (torch/SAM); else current interpreter."""
+    """Use an optional SAM3 Python for color; otherwise the core interpreter."""
     override = os.environ.get("AUGMENT_PYTHON", "").strip()
-    if override and Path(override).is_file():
-        return override
-    ds_python = DATA_STRENGTHEN_ROOT / ".venv" / "bin" / "python"
-    if aug_type == "color" and ds_python.is_file():
-        return str(ds_python)
-    if ds_python.is_file() and aug_type == "brightness":
-        # brightness also works in ds venv (opencv)
-        return str(ds_python)
+    if aug_type == "color" and override and Path(override).is_file():
+        return str(Path(override).expanduser().absolute())
     return sys.executable
 
 
@@ -179,11 +176,7 @@ def launch_detached_worker(job_id: str, jobs_dir: Path | None = None) -> dict[st
 
     python_bin = resolve_worker_python(str(job.get("augType") or "brightness"))
     env = os.environ.copy()
-    path_parts = [
-        str(backend_root),
-        str(DATA_STRENGTHEN_ROOT),
-        str(DATA_STRENGTHEN_ROOT / "sam3"),
-    ]
+    path_parts = [str(backend_root)]
     env["PYTHONPATH"] = os.pathsep.join(path_parts + [env.get("PYTHONPATH", "")])
     env["AUGMENT_SAM3_CHECKPOINT"] = os.environ.get("AUGMENT_SAM3_CHECKPOINT", str(SAM3_CHECKPOINT))
     env["CUDA_VISIBLE_DEVICES"] = str(int(job.get("gpuId") or 0))

@@ -1,0 +1,10 @@
+# Core packages imported by the detached color worker.
+# Install PyTorch separately for the CUDA version on the host, then install
+# SAM3 from https://github.com/facebookresearch/sam3.
+numpy>=1.26,<2
+pyarrow
+h5py
+mcap
+av
+opencv-python-headless
+pillow

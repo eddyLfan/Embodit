@@ -1,6 +1,7 @@
 .convert_jobs/
 .augment_jobs/
 .augment_previews/
+.augment_cache/
 service.pid
 service.url
 service.log
@@ -12,5 +13,3 @@ config/token
 checkpoints/*.pt
 checkpoints/*.pth
 checkpoints/*.bin
-tests/
-third_party/

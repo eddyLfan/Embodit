@@ -47,15 +47,54 @@ class FrameSource:
 class Mp4FrameSource(FrameSource):
     kind = "video"
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        from_timestamp: float | None = None,
+        fps: float | None = None,
+        expected_frames: int | None = None,
+    ) -> None:
         self.video_path = Path(path)
+        self.from_timestamp = float(from_timestamp or 0.0)
+        self.fps = float(fps or 0.0)
+        self.expected_frames = int(expected_frames or 0)
         if not self.video_path.is_file():
             raise FileNotFoundError(f"视频文件不存在：{self.video_path}")
 
     def iter_rgb(self) -> Iterator[np.ndarray]:
-        from . import media
+        import av
 
-        yield from media.decode_mp4_frames(self.video_path)
+        container = av.open(str(self.video_path))
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        fps = self.fps or (float(stream.average_rate) if stream.average_rate else 0.0)
+        if self.from_timestamp > 0 and stream.time_base:
+            seek_time = max(0.0, self.from_timestamp - 1.0)
+            container.seek(int(seek_time / stream.time_base), any_frame=False, stream=stream)
+        yielded = 0
+        try:
+            for frame in container.decode(stream):
+                if frame.pts is not None and fps > 0:
+                    timestamp = float(frame.pts * stream.time_base)
+                    frame_index = int(round((timestamp - self.from_timestamp) * fps))
+                    if frame_index < 0:
+                        continue
+                    if self.expected_frames and frame_index >= self.expected_frames:
+                        break
+                    # Skip duplicate timestamps produced by some containers.
+                    if frame_index < yielded:
+                        continue
+                if self.expected_frames and yielded >= self.expected_frames:
+                    break
+                yield frame.to_ndarray(format="rgb24")
+                yielded += 1
+        finally:
+            container.close()
+        if self.expected_frames and yielded != self.expected_frames:
+            raise RuntimeError(
+                f"{self.video_path}: episode expected {self.expected_frames} frames, decoded {yielded}"
+            )
 
 
 class AdapterFrameSource(FrameSource):
@@ -112,7 +151,12 @@ def episode_frame_source(
     if cam.kind == "video" and cam.path:
         abs_path = Path(view.path) / cam.path
         if abs_path.is_file():
-            return Mp4FrameSource(abs_path)
+            return Mp4FrameSource(
+                abs_path,
+                from_timestamp=cam.from_timestamp,
+                fps=view.fps,
+                expected_frames=ep.length,
+            )
         if abs_path.is_dir():
             return ImageDirFrameSource(abs_path)
         return None
@@ -130,6 +174,6 @@ def episode_frame_source(
         if materialize is None or not cam.topic:
             return None
         path = materialize(ep.episode_index, cam.topic)
-        return Mp4FrameSource(Path(path))
+        return Mp4FrameSource(Path(path), fps=view.fps, expected_frames=ep.length)
 
     return None

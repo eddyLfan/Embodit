@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from augment import brightness as brightness_algorithm
 from augment.algorithms import (
     apply_brightness_videos,
     apply_color_video,
@@ -19,7 +20,6 @@ from augment.colors import resolve_color
 from augment.output_writer import AugmentDatasetWriter
 from augment.paths import DEFAULT_PREVIEW_DIR, PREVIEW_FRAME_LIMIT
 from augment.preview import write_preview
-from augment.video_io import decode_video_rgb
 from datasets.registry import open_dataset
 from datasets.view import DatasetView
 
@@ -77,16 +77,13 @@ def _load_episode_videos(
         source = episode_frame_source(adapter, view, ep, cam_key)
         if source is None:
             continue
-        if source.video_path is not None:
-            videos[cam_key] = decode_video_rgb(source.video_path, max_frames=max_frames)
-        else:
-            frames = []
-            for idx, frame in enumerate(source.iter_rgb()):
-                if max_frames is not None and idx >= max_frames:
-                    break
-                frames.append(frame)
-            if frames:
-                videos[cam_key] = np.stack(frames, axis=0)
+        frames = []
+        for idx, frame in enumerate(source.iter_rgb()):
+            if max_frames is not None and idx >= max_frames:
+                break
+            frames.append(frame)
+        if frames:
+            videos[cam_key] = np.stack(frames, axis=0)
     if not videos:
         raise RuntimeError(f"episode {episode_index} 没有可解码的相机帧源")
 
@@ -162,6 +159,7 @@ def _run_augment_on_videos(
         apply_mode=apply_mode,
         color_rgb=color["colorRgb"],
         gpu_id=int(job.get("gpuId") or 0),
+        camera_policy=str(job.get("cameraPolicy") or "strict"),
     )
     meta = {**meta, "augType": "color", **color}
     return out, masks, meta
@@ -214,6 +212,7 @@ def run_augment_job(
         fps=fps,
         robot_type=view.robot_type,
         job_id=str(job.get("jobId") or "") or None,
+        source_format=view.format_id,
     )
     aug_type = str(job.get("augType") or "brightness")
     camera_policy = str(job.get("cameraPolicy") or "strict")
@@ -317,6 +316,27 @@ def _augment_episode_streaming(
         )
         episode_meta.update({"applyMode": apply_mode, "prompts": prompts, **color})
 
+    brightness_params: dict[str, dict[str, Any]] | None = None
+    if aug_type == "brightness" and str(job.get("brightnessMode") or "auto") == "auto":
+        samples: dict[str, np.ndarray] = {}
+        for cam_key, source in cam_sources.items():
+            sample_frames = []
+            for frame_index, frame in enumerate(source.iter_rgb()):
+                if frame_index >= PREVIEW_FRAME_LIMIT:
+                    break
+                sample_frames.append(frame)
+            if not sample_frames:
+                raise RuntimeError(f"{cam_key}: 无法读取亮度估计样本")
+            samples[cam_key] = np.stack(sample_frames, axis=0)
+        brightness_params = brightness_algorithm.estimate_brightness_params(samples)
+        episode_meta.update(
+            {
+                "mode": "auto",
+                "gain": float(np.median([item["gain"] for item in brightness_params.values()])),
+                "gamma": float(np.median([item["gamma"] for item in brightness_params.values()])),
+            }
+        )
+
     state, action, ts_error = _load_timeseries(adapter, ep_idx)
     if ts_error:
         episode_meta["timeseriesError"] = ts_error
@@ -327,21 +347,35 @@ def _augment_episode_streaming(
         tasks=list(ep.tasks or []),
     )
     try:
+        brightness_medians: list[float] = []
         for cam_key, source in cam_sources.items():
-            # Prefer the threaded PyAV decoder for mp4-backed sources.
-            if source.video_path is not None:
-                frames = decode_video_rgb(source.video_path)
-            else:
-                frames = source.load_rgb()
+            frames = source.load_rgb()
             try:
                 if aug_type == "brightness":
-                    out, meta = apply_brightness_videos(
-                        {cam_key: frames},
-                        mode=str(job.get("brightnessMode") or "auto"),
-                        gain=job.get("brightnessGain"),
-                        gamma=job.get("brightnessGamma"),
-                    )
-                    aug = out[cam_key]
+                    if brightness_params is not None:
+                        params = dict(brightness_params[cam_key])
+                        aug = brightness_algorithm.apply_luma_curve(
+                            frames, params["gain"], params["gamma"]
+                        )
+                        metrics = brightness_algorithm.result_metrics(aug)
+                        params["result"] = metrics
+                        if metrics["dark_clip_ratio"] > 0.02 or metrics["bright_clip_ratio"] > 0.02:
+                            raise RuntimeError(f"{cam_key}: excessive clipping after brightness adaptation")
+                        brightness_medians.append(metrics["p50"])
+                        meta = {
+                            "mode": "auto",
+                            "gain": params["gain"],
+                            "gamma": params["gamma"],
+                            "cameras": {cam_key: params},
+                        }
+                    else:
+                        out, meta = apply_brightness_videos(
+                            {cam_key: frames},
+                            mode="manual",
+                            gain=job.get("brightnessGain"),
+                            gamma=job.get("brightnessGamma"),
+                        )
+                        aug = out[cam_key]
                     cam_meta: dict[str, Any] = {"brightness": meta}
                     episode_meta.setdefault("mode", meta.get("mode"))
                     episode_meta.setdefault("gain", meta.get("gain"))
@@ -366,6 +400,9 @@ def _augment_episode_streaming(
             writer.add_camera_video(ctx, cam_key, aug)
             episode_meta["cameras"][cam_key] = cam_meta
             del frames, aug
+
+        if brightness_medians and max(brightness_medians) - min(brightness_medians) > 32.0:
+            raise RuntimeError("cross-camera median brightness spread too large after augmentation")
 
         writer.commit_episode(ctx, state=state, action=action, sidecar=episode_meta)
         return ctx

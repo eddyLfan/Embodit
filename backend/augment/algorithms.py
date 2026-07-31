@@ -1,49 +1,17 @@
-"""Thin wrappers around data_strengthen algorithms (isolated package name)."""
+"""Public augmentation API backed by Embodit's built-in algorithms."""
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from augment.paths import DATA_STRENGTHEN_ROOT, SAM3_CHECKPOINT
-
-_DS_PACKAGE = "ds_augment"
-
-
-def _ensure_ds_package() -> None:
-    """Load data_strengthen/augment as `ds_augment` to avoid clashing with Embodit `augment`."""
-    if _DS_PACKAGE in sys.modules and hasattr(sys.modules[_DS_PACKAGE], "__path__"):
-        return
-    pkg_dir = DATA_STRENGTHEN_ROOT / "augment"
-    if not pkg_dir.is_dir():
-        raise FileNotFoundError(
-            "Augment algorithms not found at "
-            f"{pkg_dir}. Set EMBODIT_AUGMENT_ROOT to a checkout that contains "
-            "an `augment/` package, or point it at the external data_strengthen checkout. "
-            "Browse / annotate / filter / convert work without it; only Augment needs it."
-        )
-    init_file = pkg_dir / "__init__.py"
-    spec = importlib.util.spec_from_file_location(
-        _DS_PACKAGE,
-        init_file if init_file.is_file() else None,
-        submodule_search_locations=[str(pkg_dir)],
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("无法加载 ds_augment 包")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[_DS_PACKAGE] = module
-    spec.loader.exec_module(module)
-
-    # Ensure nested sam3 package is importable.
-    sam3_root = str(DATA_STRENGTHEN_ROOT / "sam3")
-    if sam3_root not in sys.path:
-        sys.path.insert(0, sam3_root)
+from augment import brightness
+from augment.effects import recolor_frames, replace_background_frames
+from augment.paths import SAM3_CHECKPOINT
+from augment.sam3_adapter import Sam3Segmenter, write_frames_to_jpg_dir
 
 
 def parse_prompts(raw: str | list[str] | None) -> list[str]:
@@ -65,8 +33,6 @@ def apply_brightness_videos(
     gamma: float | None = None,
 ) -> tuple[dict[str, np.ndarray], dict]:
     """Apply brightness. mode=auto estimates per-camera curves; manual uses shared gain/gamma."""
-    _ensure_ds_package()
-    brightness = importlib.import_module(f"{_DS_PACKAGE}.brightness")
     mode = (mode or "auto").lower()
     if mode == "manual":
         g = float(1.0 if gain is None else gain)
@@ -76,11 +42,11 @@ def apply_brightness_videos(
         out: dict[str, np.ndarray] = {}
         params: dict[str, Any] = {}
         for key, frames in videos.items():
-            out[key] = brightness._apply_luma_curve(frames, g, gm)
+            out[key] = brightness.apply_luma_curve(frames, g, gm)
             params[key] = {
                 "gain": g,
                 "gamma": gm,
-                "result": brightness._result_metrics(out[key]),
+                "result": brightness.result_metrics(out[key]),
             }
         params["_qa"] = {"mode": "manual", "shared_gain": g, "shared_gamma": gm}
         return out, {"mode": "manual", "gain": g, "gamma": gm, "cameras": params}
@@ -106,8 +72,6 @@ def get_segmenter(checkpoint: Path | None = None) -> Any:
     The track cache is enabled so repeated previews / retries of the same
     episode reuse previous segmentation results.
     """
-    _ensure_ds_package()
-    sam_mod = importlib.import_module(f"{_DS_PACKAGE}.sam3_segment")
     ckpt = Path(checkpoint or os.environ.get("AUGMENT_SAM3_CHECKPOINT") or SAM3_CHECKPOINT)
     if not ckpt.is_file():
         raise FileNotFoundError(f"SAM3 权重不存在：{ckpt}")
@@ -116,7 +80,7 @@ def get_segmenter(checkpoint: Path | None = None) -> Any:
     if segmenter is None:
         # ``device_id`` is fixed at 0: the worker maps the requested GPU via
         # CUDA_VISIBLE_DEVICES, so device 0 is always the selected card.
-        segmenter = sam_mod.Sam3Segmenter(checkpoint=ckpt, device_id=0, cache_enabled=True)
+        segmenter = Sam3Segmenter(checkpoint=ckpt, device_id=0, cache_enabled=True)
         _SEGMENTER_CACHE[key] = segmenter
     return segmenter
 
@@ -128,13 +92,11 @@ def segment_by_prompts(frames: np.ndarray, prompts: list[str], segmenter: Any) -
 
     if not prompts:
         raise ValueError("颜色增强需要至少一个 SAM3 查询词")
-    _ensure_ds_package()
-    dataset_io = importlib.import_module(f"{_DS_PACKAGE}.dataset_io")
     union = np.zeros(frames.shape[:3], dtype=bool)
     per_prompt: dict[str, Any] = {}
     frame_dir = Path(tempfile.mkdtemp(prefix="sam3_frames_"))
     try:
-        dataset_io.write_frames_to_jpg_dir(frames, frame_dir)
+        write_frames_to_jpg_dir(frames, frame_dir)
         for prompt in prompts:
             masks = segmenter.segment_single_prompt_video(frames, prompt, frame_dir=frame_dir)
             ratio = float(masks.mean()) if masks.size else 0.0
@@ -156,15 +118,11 @@ def apply_color_video(
     segmenter: Any,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Color-augment a single camera. Returns (augmented, masks, meta)."""
-    _ensure_ds_package()
-    recolor_mod = importlib.import_module(f"{_DS_PACKAGE}.recolor_cloth")
-    bg_mod = importlib.import_module(f"{_DS_PACKAGE}.replace_background")
-
     masks, seg_meta = segment_by_prompts(frames, prompts, segmenter)
     if apply_mode == "background_replace":
-        aug, qa = bg_mod.replace_background_frames(frames, masks, color_rgb)
+        aug, qa = replace_background_frames(frames, masks, color_rgb)
     else:
-        aug, qa = recolor_mod.recolor_frames(frames, masks, color_rgb)
+        aug, qa = recolor_frames(frames, masks, color_rgb)
     return aug, masks, {**seg_meta, "qa": qa}
 
 
@@ -177,6 +135,7 @@ def apply_color_videos(
     gpu_id: int = 0,
     checkpoint: Path | None = None,
     segmenter: Any | None = None,
+    camera_policy: str = "strict",
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict]:
     """Return (augmented_videos, masks_by_camera, meta)."""
     if segmenter is None:
@@ -203,6 +162,8 @@ def apply_color_videos(
 
     if not out:
         raise RuntimeError("所有相机颜色增强均失败：" + " | ".join(failures))
+    if failures and camera_policy != "partial":
+        raise RuntimeError("部分相机颜色增强失败（strict 策略）：" + " | ".join(failures))
     meta = {
         "applyMode": apply_mode,
         "colorRgb": list(color_rgb),

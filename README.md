@@ -1,4 +1,4 @@
-<h1 align="center">Embodit</h1>
+<h1>Embodit</h1>
 
 <p align="center">
   <img src="images/Embodit_logo.png" alt="Embodit Logo" width="160" />
@@ -116,7 +116,7 @@ Browse / annotate / filter / convert work out of the box. **Augment** (brightnes
 |---|---|
 | **Core runtime** | Declared in `pyproject.toml`, locked in `uv.lock`. `start.sh` runs `uv sync` then `uv run`. |
 | **Dev extras** | `uv sync --extra dev` (optional tooling). |
-| **Augment (optional)** | External algorithm tree + optional Torch/CUDA env — not part of the core install. |
+| **Augment** | Built-in brightness and mask effects; SAM3 color augment uses a separate optional Torch/CUDA environment. |
 
 ### Environment variables
 
@@ -145,16 +145,22 @@ bash start.sh /path/to/your/data
 
 ### Optional: augment
 
-Color / brightness augmentation loads algorithms from an external package rooted at `EMBODIT_AUGMENT_ROOT`.
+Brightness and the post-mask recolor/background effects are built into Embodit, so brightness works from a clean clone. Color augmentation additionally requires Meta SAM3 and a checkpoint for which you have access. SAM3 is not distributed with Embodit and remains under its own license.
 
 ```bash
-export EMBODIT_AUGMENT_ROOT=/path/to/data_strengthen   # must contain augment/
-export AUGMENT_PYTHON=/path/to/torch-env/bin/python    # needed for SAM3 color
-export AUGMENT_SAM3_CHECKPOINT=/path/to/sam3.pt        # or place at checkpoints/sam3.pt
+# In a separate Python 3.12 environment, install PyTorch for your CUDA version, then:
+git clone https://github.com/facebookresearch/sam3.git ../sam3
+python -m pip install -r config/augment-worker-requirements.txt
+python -m pip install -e ../sam3
+
+export AUGMENT_PYTHON=/path/to/sam3-env/bin/python
+export AUGMENT_SAM3_CHECKPOINT=/path/to/sam3.pt
 bash start.sh /path/to/your/data
 ```
 
-Without this setup, browsing, annotation, filtering, and conversion still work; only the Augment tab is unavailable.
+SAM3 requirements and checkpoint access can change; follow [`facebookresearch/sam3`](https://github.com/facebookresearch/sam3) and see [`third_party/README.md`](third_party/README.md) for licensing notes. Without SAM3, brightness remains available and the UI disables color augmentation with a concrete readiness reason.
+
+A successful preview is required before batching. The server binds the batch request to the exact transform settings used by that preview; changing brightness, prompts, color, apply mode, or GPU requires a new preview.
 
 ## Data write policy
 
@@ -175,7 +181,10 @@ Export / convert / augment results go to a **new path**, e.g.:
 export_or_converted/
   selection_manifest.json
   conversion_report.json   # on convert: mappings, known losses, etc.
+  meta/augmentation_report.json  # on augment: preserved fields and known losses
 ```
+
+Visual augmentation currently writes LeRobot v2.1 or v3 and reconstructs camera videos, `observation.state`, `action`, and episode tasks. Custom tabular fields, calibration, source statistics, and format-specific metadata are not copied, and video is re-encoded as H.264. Augment output therefore has `partial` fidelity; `augmentation_report.json` records the exact contract. The output path must not equal or sit inside the source dataset.
 
 For cross-format field and topic mapping, see [`config/convert.example.json`](config/convert.example.json). Keep output paths outside the source dataset to avoid mixing generated and original data.
 
@@ -214,7 +223,7 @@ uv run python backend/app.py --host 127.0.0.1 --port 8765 \
 1. **Source data is read-only** — review and labels land as sidecars; convert / augment write new datasets.
 2. **Explicit fidelity** — cross-format conversion surfaces `full` / `high` / `partial` and known losses in the UI.
 3. **Long jobs outlive the browser** — convert and augment run as detached processes; closing the tab does not cancel them.
-4. **Lightweight startup** — core deps come from `uv sync`; SAM3 / Torch load only when Augment is configured.
+4. **Lightweight startup** — brightness and mask effects use core dependencies; SAM3 / Torch load only in color workers.
 
 ## Updates
 

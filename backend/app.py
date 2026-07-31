@@ -34,6 +34,7 @@ from convert.jobs import (  # noqa: E402
     write_job as write_convert_job,
 )
 from augment.algorithms import parse_prompts  # noqa: E402
+from augment.capabilities import capabilities_payload, config_fingerprint  # noqa: E402
 from augment.colors import options_payload as augment_options_payload  # noqa: E402
 from augment.jobs import (  # noqa: E402
     cancel_job as cancel_augment_job,
@@ -121,6 +122,7 @@ class AugmentRequest(BaseModel):
     previewEpisode: int | None = None
     targetFormat: str | None = None
     cameraPolicy: str = "strict"
+    previewJobId: str | None = None
 
 
 class LabelsLoadRequest(BaseModel):
@@ -499,13 +501,19 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
 
     @app.get("/api/augment/options", dependencies=[Depends(authorize)])
     def augment_options() -> dict[str, Any]:
-        return augment_options_payload()
+        return {**augment_options_payload(), "capabilities": capabilities_payload()}
 
     def _start_augment_job(request: AugmentRequest, mode: str) -> dict[str, Any]:
         dataset = sandboxed(request.dataset, what="数据集路径")
         if not dataset.exists():
             raise HTTPException(status_code=404, detail=f"源路径不存在：{dataset}")
         aug_type = request.augType if request.augType in {"brightness", "color"} else "brightness"
+        capabilities = capabilities_payload() if aug_type == "color" else None
+        if capabilities is not None and not capabilities[aug_type]["available"]:
+            raise HTTPException(
+                status_code=400,
+                detail=capabilities[aug_type].get("reason") or f"{aug_type} 增强不可用",
+            )
         prompts = parse_prompts(request.samPrompts)
         if aug_type == "color" and not prompts:
             raise HTTPException(status_code=400, detail="颜色增强需要填写 SAM3 查询词")
@@ -515,9 +523,26 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             else "object_recolor"
         )
         color_mode = request.colorMode if request.colorMode in {"random", "fixed"} else "random"
+        if color_mode == "fixed" and request.colorRgb is not None:
+            if len(request.colorRgb) != 3 or any(value < 0 or value > 255 for value in request.colorRgb):
+                raise HTTPException(status_code=400, detail="colorRgb 必须是 0–255 范围内的三个整数")
+        if request.gpuId < 0:
+            raise HTTPException(status_code=400, detail="gpuId 不能为负数")
+        if capabilities is not None and request.gpuId >= capabilities["color"].get("gpuCount", 0):
+            raise HTTPException(status_code=400, detail=f"GPU ID 超出范围：{request.gpuId}")
+        if request.sampleCount is not None and request.sampleCount < 1:
+            raise HTTPException(status_code=400, detail="sampleCount 必须是正整数")
+        if request.episodes is not None and not request.episodes:
+            raise HTTPException(status_code=400, detail="episodes 不能为空列表")
         if mode == "batch" and not request.output:
             raise HTTPException(status_code=400, detail="批量增强需要输出路径")
-        output = str(sandboxed(request.output, what="输出路径")) if request.output else None
+        output_path = sandboxed(request.output, what="输出路径") if request.output else None
+        if output_path is not None:
+            if output_path.exists():
+                raise HTTPException(status_code=400, detail=f"输出路径已经存在：{output_path}")
+            if output_path == dataset or (dataset.is_dir() and is_inside(dataset, output_path)):
+                raise HTTPException(status_code=400, detail="输出路径不能等于或位于源数据集内部")
+        output = str(output_path) if output_path else None
         try:
             config = {
                 "dataset": str(dataset),
@@ -542,7 +567,18 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
                 "previewEpisode": request.previewEpisode,
                 "targetFormat": request.targetFormat,
                 "cameraPolicy": request.cameraPolicy if request.cameraPolicy in {"strict", "partial"} else "strict",
+                "previewJobId": request.previewJobId,
             }
+            if mode == "batch":
+                if not request.previewJobId:
+                    raise HTTPException(status_code=400, detail="批量增强必须引用一次成功的预览任务")
+                preview_job = read_augment_job(augment_jobs_dir, request.previewJobId)
+                if not preview_job or preview_job.get("mode") != "preview":
+                    raise HTTPException(status_code=400, detail="预览任务不存在")
+                if preview_job.get("status") != "completed":
+                    raise HTTPException(status_code=400, detail="预览任务尚未成功完成")
+                if preview_job.get("configFingerprint") != config_fingerprint(config):
+                    raise HTTPException(status_code=400, detail="增强参数已在预览后改变，请重新生成预览")
             job = create_augment_job(config=config, jobs_dir=augment_jobs_dir)
             if mode == "preview":
                 preview_dir = DEFAULT_PREVIEW_DIR / job["jobId"]

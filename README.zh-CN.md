@@ -1,4 +1,4 @@
-<h1 align="center">Embodit</h1>
+<h1>Embodit</h1>
 
 <p align="center">
   <img src="images/Embodit_logo.png" alt="Embodit Logo" width="160" />
@@ -116,7 +116,7 @@ bash start.sh --help  # 查看启动参数
 |---|---|
 | **核心运行时** | 写在 `pyproject.toml`，锁定在 `uv.lock`。`start.sh` 执行 `uv sync` 再 `uv run`。 |
 | **开发依赖** | `uv sync --extra dev`（可选）。 |
-| **增强（可选）** | 外部算法目录 + 可选 Torch/CUDA 环境，不进核心安装。 |
+| **增强** | 亮度与掩码效果算法内置；SAM3 颜色增强使用独立的可选 Torch/CUDA 环境。 |
 
 ### 环境变量
 
@@ -145,16 +145,22 @@ bash start.sh /path/to/your/data
 
 ### 可选：数据增强
 
-亮度 / 换色算法来自 `EMBODIT_AUGMENT_ROOT` 指向的外部包。
+亮度增强以及掩码后的换色/背景替换算法已内置，干净 clone 后即可使用亮度增强。颜色增强还需要安装 Meta SAM3，并自行准备获得授权的 checkpoint；SAM3 不随 Embodit 分发，使用时须遵守其独立许可证。
 
 ```bash
-export EMBODIT_AUGMENT_ROOT=/path/to/data_strengthen   # 内含 augment/
-export AUGMENT_PYTHON=/path/to/torch-env/bin/python    # SAM3 换色需要
-export AUGMENT_SAM3_CHECKPOINT=/path/to/sam3.pt        # 或放到 checkpoints/sam3.pt
+# 在独立 Python 3.12 环境中，先按显卡/CUDA 版本安装 PyTorch，随后：
+git clone https://github.com/facebookresearch/sam3.git ../sam3
+python -m pip install -r config/augment-worker-requirements.txt
+python -m pip install -e ../sam3
+
+export AUGMENT_PYTHON=/path/to/sam3-env/bin/python
+export AUGMENT_SAM3_CHECKPOINT=/path/to/sam3.pt
 bash start.sh /path/to/your/data
 ```
 
-未配置时，浏览、标注、筛选和转换仍可正常使用，仅「增强」页不可用。
+SAM3 当前要求和 checkpoint 获取方式可能随上游更新，请以 [`facebookresearch/sam3`](https://github.com/facebookresearch/sam3) 为准；第三方许可说明见 [`third_party/README.md`](third_party/README.md)。未配置 SAM3 时增强页仍可使用亮度增强，颜色增强选项会显示具体缺失项并被禁用。
+
+增强必须先成功生成预览；批量任务会校验增强参数与该预览完全一致。预览后修改亮度、prompt、颜色、应用方式或 GPU 会要求重新预览。
 
 ## 数据写入约定
 
@@ -175,7 +181,10 @@ Embodit 不改写原始 episode 内容，但会在源目录旁写入审阅和标
 export_or_converted/
   selection_manifest.json
   conversion_report.json   # 转换时：映射、已知损失等
+  meta/augmentation_report.json  # 增强时：保留字段与已知损失
 ```
+
+视觉增强当前输出 LeRobot v2.1 或 v3，并重建相机视频、`observation.state`、`action` 与 episode 任务。自定义表格字段、标定、源统计和格式专属元数据不会复制，视频会重新编码为 H.264；因此增强输出的保真等级为 `partial`，详情同时写入 `augmentation_report.json`。输出路径不得等于或位于源数据集内部。
 
 跨格式字段与 topic 映射可参考 [`config/convert.example.json`](config/convert.example.json)。建议将输出路径设在源数据集之外，避免与原始数据混淆。
 
@@ -214,7 +223,7 @@ uv run python backend/app.py --host 127.0.0.1 --port 8765 \
 1. **源数据只读**：审阅与标注旁路落盘；转换 / 增强写出新数据集。
 2. **显式保真**：跨格式转换在 UI 中标明 `full` / `high` / `partial` 及已知损失，避免静默产生错误结果。
 3. **长任务可脱离浏览器**：转换与增强在独立进程后台跑，关页不中断。
-4. **轻量启动**：核心依赖由 `uv sync` 安装；SAM3 / Torch 仅在配置增强时加载。
+4. **轻量启动**：亮度和掩码效果随核心依赖安装；SAM3 / Torch 仅在颜色增强 worker 中加载。
 
 ## 更新情况
 

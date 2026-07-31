@@ -236,11 +236,16 @@
     $('#closeAugment')?.addEventListener('click', closeAugmentDialog);
     $('#runAugmentPreview')?.addEventListener('click', runAugmentPreview);
     $('#startAugmentBatch')?.addEventListener('click', startAugmentBatch);
-    $('#augmentType')?.addEventListener('change', syncAugmentFormVisibility);
-    $('#augmentBrightnessMode')?.addEventListener('change', syncAugmentFormVisibility);
+    $('#augmentType')?.addEventListener('change', () => { syncAugmentFormVisibility(); invalidateAugmentPreview(); });
+    $('#augmentBrightnessMode')?.addEventListener('change', () => { syncAugmentFormVisibility(); invalidateAugmentPreview(); });
     $('#augmentBatchScope')?.addEventListener('change', syncAugmentFormVisibility);
-    $('#augmentColorMode')?.addEventListener('change', syncAugmentFormVisibility);
-    $('#augmentApplyMode')?.addEventListener('change', () => fillAugmentColorPresets());
+    $('#augmentColorMode')?.addEventListener('change', () => { syncAugmentFormVisibility(); invalidateAugmentPreview(); });
+    $('#augmentApplyMode')?.addEventListener('change', () => { fillAugmentColorPresets(); invalidateAugmentPreview(); });
+    ['augmentBrightnessGain', 'augmentBrightnessGamma', 'augmentSamPrompts', 'augmentColorPreset',
+      'augmentColorCustom', 'augmentGpuId'].forEach((id) => {
+      $(`#${id}`)?.addEventListener('input', invalidateAugmentPreview);
+      $(`#${id}`)?.addEventListener('change', invalidateAugmentPreview);
+    });
     $('#refreshAugmentJobs')?.addEventListener('click', () => refreshAugmentJobs().catch(() => {}));
     $('#toggleAugmentJobs')?.addEventListener('click', () => {
       $('#augmentJobDock')?.classList.toggle('collapsed');
@@ -1558,7 +1563,6 @@
   }
 
   async function ensureAugmentOptions() {
-    if (state.augmentOptions) return state.augmentOptions;
     state.augmentOptions = await api('/api/augment/options');
     return state.augmentOptions;
   }
@@ -1609,6 +1613,15 @@
     }
 
     state.augmentContext = { path, format: format || state.augmentContext?.format || null };
+    const colorCapability = state.augmentOptions?.capabilities?.color;
+    const colorOption = $('#augmentType')?.querySelector('option[value="color"]');
+    if (colorOption) colorOption.disabled = !colorCapability?.available;
+    const availability = $('#augmentAvailability');
+    if (availability) {
+      availability.textContent = colorCapability?.available
+        ? t('augmentColorReady')
+        : t('augmentColorUnavailable', { reason: colorCapability?.reason || t('augmentDependencyMissing') });
+    }
     state.augmentPreviewOk = false;
     state.lastAugmentPreviewJobId = null;
     $('#augmentSource').textContent = path;
@@ -1637,6 +1650,15 @@
 
   function closeAugmentDialog() {
     $('#augmentDialog')?.classList.add('hidden');
+  }
+
+  function invalidateAugmentPreview() {
+    if (!state.augmentPreviewOk) return;
+    state.augmentPreviewOk = false;
+    state.lastAugmentPreviewJobId = null;
+    const button = $('#startAugmentBatch');
+    if (button) button.disabled = true;
+    showToast(t('augmentPreviewInvalidated'));
   }
 
   function collectAugmentPayload(mode) {
@@ -1695,6 +1717,7 @@
       const scope = resolveAugmentEpisodeScope();
       payload.episodes = scope.episodes;
       payload.sampleCount = scope.sampleCount;
+      payload.previewJobId = state.lastAugmentPreviewJobId;
     }
     return payload;
   }
