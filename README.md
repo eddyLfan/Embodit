@@ -22,7 +22,7 @@
 
 Embodit opens local robotics datasets directly in the browser for episode inspection, manual QA, annotation, filtering, conversion, export, and visual augmentation. Data stays on the local machine by default; no third-party upload is required.
 
-> Original sample payloads remain read-only. Reviews and labels use sidecar files; exports, conversions, and augmentations are written to new directories.
+<!-- > Original sample payloads remain read-only. Reviews and labels use sidecar files; exports, conversions, and augmentations are written to new directories. -->
 
 ## Core capabilities
 
