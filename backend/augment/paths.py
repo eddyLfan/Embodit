@@ -6,11 +6,16 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-from settings import SAM3_CHECKPOINT  # noqa: E402,F401  (central config)
+from settings import (  # noqa: E402,F401  (central config)
+    AUGMENT_JOBS_DIR,
+    AUGMENT_PREVIEW_DIR,
+    CACHE_DIR,
+    SAM3_CHECKPOINT,
+)
 
-DEFAULT_JOBS_DIR = PROJECT_ROOT / ".augment_jobs"
-DEFAULT_PREVIEW_DIR = PROJECT_ROOT / ".augment_previews"
-DEFAULT_CACHE_DIR = PROJECT_ROOT / ".augment_cache"
+DEFAULT_JOBS_DIR = AUGMENT_JOBS_DIR
+DEFAULT_PREVIEW_DIR = AUGMENT_PREVIEW_DIR
+DEFAULT_CACHE_DIR = CACHE_DIR / "reusable"
 
 CLOTH_COLORS = {
     "red": (220, 40, 40),

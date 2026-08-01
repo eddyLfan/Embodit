@@ -123,6 +123,87 @@ def _write_hdf5_with_images(path: Path, episodes: int = 2, frames: int = 6) -> P
     return path
 
 
+def _write_astribot_hdf5(path: Path, frames: int = 4) -> Path:
+    h5py = pytest.importorskip("h5py")
+    cv2 = pytest.importorskip("cv2")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    action = np.arange(frames * 35, dtype=np.float64).reshape(frames, 35)
+    state = np.arange(frames * 37, dtype=np.float64).reshape(frames, 37)
+    with h5py.File(path, "w") as handle:
+        handle.attrs["created_at"] = "2026_04_20_14_10_05"
+        commands = handle.create_group("command_poses_dict")
+        commands.create_dataset("command", data=action)
+        commands.create_dataset("timestamp", data=1000.0 + np.arange(frames) / 30.0)
+        poses = handle.create_group("poses_dict")
+        poses.create_dataset("merge_pose", data=state)
+        poses.create_dataset("astribot_arm_left", data=state[:, :7])
+        poses.create_dataset("astribot_arm_right", data=state[:, 7:14])
+        handle.create_dataset("time", data=1000.0 + np.arange(frames) / 30.0)
+
+        images = handle.create_group("images_dict")
+        for camera, rgb_value in (("head", (200, 40, 10)), ("left", (20, 160, 60))):
+            encoded_frames = []
+            for index in range(frames):
+                rgb = np.full((24, 32, 3), rgb_value, dtype=np.uint8)
+                rgb[index % 24, :, :] = (index * 20, 10, 220)
+                ok, encoded = cv2.imencode(
+                    ".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                )
+                assert ok
+                encoded_frames.append(np.asarray(encoded, dtype=np.uint8))
+            camera_group = images.create_group(camera)
+            camera_group.create_dataset("rgb", data=np.concatenate(encoded_frames))
+            camera_group.create_dataset(
+                "rgb_size",
+                data=np.asarray([len(item) for item in encoded_frames], dtype=np.float64),
+            )
+            camera_group.create_dataset(
+                "rgb_timestamp", data=1000.0 + np.arange(frames) / 30.0
+            )
+    return path
+
+
+def test_astribot_hdf5_inspect_timeseries_and_frames(tmp_path: Path):
+    src = _write_astribot_hdf5(
+        tmp_path / "hdf5_output_pick_cube" / "pick_cube_episode_1.hdf5"
+    )
+    adapter = open_dataset(src)
+    view = adapter.inspect()
+
+    assert view.extras["dialect"] == "astribot"
+    assert view.robot_type == "Astribot"
+    assert view.fps == pytest.approx(30.0, rel=1e-5)
+    assert view.episodes[0].length == 4
+    assert view.episodes[0].tasks == ["pick_cube"]
+    assert sorted(view.episodes[0].cameras) == ["head", "left"]
+    assert view.features["head"]["shape"] == [24, 32, 3]
+    assert view.features["action"]["shape"] == [35]
+    assert view.features["observation.state"]["shape"] == [37]
+
+    series = adapter.get_timeseries(0)
+    assert series["action"].shape == (4, 35)
+    assert series["observation.state"].shape == (4, 37)
+    assert series["eef.astribot_arm_left"].shape == (4, 7)
+
+    decoded = list(adapter.get_frames(0, "head", chunk=2))
+    assert len(decoded) == 4
+    assert decoded[0].shape == (24, 32, 3)
+    assert decoded[0].dtype == np.uint8
+    assert int(decoded[0][10, 10, 0]) > int(decoded[0][10, 10, 1])
+    assert int(decoded[0][10, 10, 1]) > int(decoded[0][10, 10, 2])
+
+
+def test_astribot_hdf5_materializes_browser_video(tmp_path: Path):
+    pytest.importorskip("imageio_ffmpeg")
+    src = _write_astribot_hdf5(
+        tmp_path / "hdf5_output_pick_cube" / "pick_cube_episode_1.hdf5"
+    )
+    adapter = open_dataset(src)
+    video = adapter.materialize_camera_video(0, "head")
+    assert video.is_file()
+    assert video.stat().st_size > 0
+
+
 def test_hdf5_images_to_v3_per_episode_videos(tmp_path: Path):
     pytest.importorskip("imageio_ffmpeg")
     src = _write_hdf5_with_images(tmp_path / "src.hdf5")

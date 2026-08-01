@@ -7,13 +7,14 @@ import argparse
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 import uvicorn
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent
@@ -67,6 +68,30 @@ from labels.store import (  # noqa: E402
     save_labels,
     upsert_label,
 )
+from qc.jobs import (  # noqa: E402
+    cancel_job as cancel_qc_job,
+    create_job as create_qc_job,
+    default_jobs_dir as default_qc_jobs_dir,
+    delete_job as delete_qc_job,
+    launch_detached_worker as launch_qc_worker,
+    list_jobs as list_qc_jobs,
+    pause_job as pause_qc_job,
+    read_job as read_qc_job,
+    refresh_job_liveness as refresh_qc_liveness,
+    resume_job as resume_qc_job,
+    write_job as write_qc_job,
+)
+from qc.paths import find_report as find_qc_report  # noqa: E402
+from qc.store import (  # noqa: E402
+    episode_detail as qc_episode_detail,
+    query_episodes as query_qc_episodes,
+    report_csv as qc_report_csv,
+    review_episode as review_qc_episode,
+    review_finding as review_qc_finding,
+    selected_episode_indices as qc_selected_episode_indices,
+    summary as qc_summary,
+)
+
 
 
 class InspectRequest(BaseModel):
@@ -77,6 +102,7 @@ class ProgressRequest(BaseModel):
     path: str
     dataset: str
     states: dict[str, str] = Field(default_factory=dict)
+    quarantineReasons: dict[str, str] = Field(default_factory=dict)
 
 
 class ProgressLoadRequest(BaseModel):
@@ -142,12 +168,36 @@ class LabelUpsertRequest(BaseModel):
     label: dict[str, Any]
 
 
+class QCScanRequest(BaseModel):
+    dataset: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    useCache: bool = True
+
+
+class QCQueryRequest(BaseModel):
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
+class QCFindingReviewRequest(BaseModel):
+    reviewStatus: str = "unreviewed"
+    startS: float | None = None
+    endS: float | None = None
+    severity: str | None = None
+    issueCode: str | None = None
+    note: str = ""
+
+
+class QCEpisodeReviewRequest(BaseModel):
+    decision: str | None = None
+    note: str = ""
+
 def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     app = FastAPI(title="Embodit · Embodied Intelligence Toolkit", docs_url=None, redoc_url=None)
     browse_root = existing_root(browse_root)
     images_root = web_root.parent / "images"
     jobs_dir = default_convert_jobs_dir()
     augment_jobs_dir = default_augment_jobs_dir()
+    qc_jobs_dir = default_qc_jobs_dir()
 
     def authorize(
         query_token: str | None = Query(default=None, alias="token"),
@@ -228,7 +278,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             "browseRoot": str(browse_root),
             "supportedFormats": list(SUPPORTED_FORMATS),
             "formatLabels": FORMAT_LABELS,
-            "autoFilter": {"enabled": False, "status": "reserved"},
+            "autoFilter": {"enabled": True, "status": "ready"},
         }
 
     @app.get("/api/list", dependencies=[Depends(authorize)])
@@ -356,17 +406,23 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         target = sandboxed(request.path, what="进度文件路径")
         target.parent.mkdir(parents=True, exist_ok=True)
         normalized = {key: normalize_decision(value) for key, value in request.states.items()}
+        quarantine_reasons = {
+            key: str(value).strip()
+            for key, value in request.quarantineReasons.items()
+            if normalized.get(key) == "quarantine" and str(value).strip()
+        }
         document = {
-            "version": 2,
+            "version": 3,
             "dataset": request.dataset,
             "updatedAt": now_iso(),
             "updatedBy": os.environ.get("USER", "unknown"),
             "states": normalized,
+            "quarantineReasons": quarantine_reasons,
         }
         temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
         temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, target)
-        return {"path": str(target), "states": normalized}
+        return {"path": str(target), "states": normalized, "quarantineReasons": quarantine_reasons}
 
     @app.post("/api/progress/load", dependencies=[Depends(authorize)])
     def load_progress(request: ProgressLoadRequest) -> dict[str, Any]:
@@ -376,6 +432,12 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         document = json.loads(target.read_text(encoding="utf-8"))
         states = document.get("states") or {}
         document["states"] = {key: normalize_decision(value) for key, value in states.items()}
+        reasons = document.get("quarantineReasons") or {}
+        document["quarantineReasons"] = {
+            key: str(value).strip()
+            for key, value in reasons.items()
+            if document["states"].get(key) == "quarantine" and str(value).strip()
+        }
         return document
 
     @app.post("/api/create", dependencies=[Depends(authorize)])
@@ -701,12 +763,165 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         return {"path": str(path), "labels": labels}
 
     @app.get("/api/auto-filter/status", dependencies=[Depends(authorize)])
-    def auto_filter_reserved() -> dict[str, Any]:
+    def auto_filter_status() -> dict[str, Any]:
         return {
-            "enabled": False,
-            "status": "reserved",
-            "message": "自动筛选标准尚未确认，功能预留中。可参考 demo/backend/auto_filter.py。",
+            "enabled": True,
+            "status": "ready",
+            "message": "自动质检可用：完整性、动作、视频与夹爪规则已启用。",
         }
+
+    def resolve_qc_report(scan_id: str) -> Path:
+        job = read_qc_job(qc_jobs_dir, scan_id)
+        raw = job.get("reportPath") if job else None
+        path = Path(raw).expanduser().resolve() if raw else find_qc_report(scan_id)
+        if path is None or not path.is_file():
+            raise HTTPException(status_code=404, detail="QC 报告不存在或尚未生成")
+        if not is_inside(settings.QC_CACHE_DIR.resolve(), path):
+            raise HTTPException(status_code=403, detail="QC 报告路径非法")
+        return path
+
+    @app.post("/api/qc/scans", dependencies=[Depends(authorize)])
+    def qc_start(request: QCScanRequest) -> dict[str, Any]:
+        dataset = sandboxed(request.dataset, what="数据集路径")
+        try:
+            job = create_qc_job(
+                dataset=dataset,
+                config=request.config,
+                use_cache=request.useCache,
+                jobs_dir=qc_jobs_dir,
+            )
+            return launch_qc_worker(job["jobId"], jobs_dir=qc_jobs_dir)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/qc/scans", dependencies=[Depends(authorize)])
+    def qc_scans(dataset: str | None = None) -> dict[str, Any]:
+        target = str(sandboxed(dataset, what="数据集路径")) if dataset else None
+        rows = []
+        for job in list_qc_jobs(qc_jobs_dir, limit=100):
+            patched = refresh_qc_liveness(job)
+            if patched != job:
+                write_qc_job(qc_jobs_dir, patched)
+            if target is None or patched.get("dataset") == target:
+                rows.append(patched)
+        return {"jobs": rows}
+
+    @app.get("/api/qc/scans/{scan_id}/status", dependencies=[Depends(authorize)])
+    def qc_scan_status(scan_id: str) -> dict[str, Any]:
+        job = read_qc_job(qc_jobs_dir, scan_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="QC 任务不存在")
+        patched = refresh_qc_liveness(job)
+        if patched != job:
+            write_qc_job(qc_jobs_dir, patched)
+        return patched
+
+    @app.post("/api/qc/scans/{scan_id}/pause", dependencies=[Depends(authorize)])
+    def qc_pause(scan_id: str) -> dict[str, Any]:
+        try:
+            return pause_qc_job(qc_jobs_dir, scan_id)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post("/api/qc/scans/{scan_id}/resume", dependencies=[Depends(authorize)])
+    def qc_resume(scan_id: str) -> dict[str, Any]:
+        try:
+            return resume_qc_job(qc_jobs_dir, scan_id)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post("/api/qc/scans/{scan_id}/cancel", dependencies=[Depends(authorize)])
+    def qc_cancel(scan_id: str) -> dict[str, Any]:
+        try:
+            return cancel_qc_job(qc_jobs_dir, scan_id)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post("/api/qc/scans/{scan_id}/dismiss", dependencies=[Depends(authorize)])
+    def qc_dismiss(scan_id: str) -> dict[str, Any]:
+        return {"deleted": delete_qc_job(qc_jobs_dir, scan_id), "jobId": scan_id}
+
+    @app.get("/api/qc/scans/{scan_id}/summary", dependencies=[Depends(authorize)])
+    def qc_report_summary(scan_id: str) -> dict[str, Any]:
+        return qc_summary(resolve_qc_report(scan_id))
+
+    @app.post("/api/qc/scans/{scan_id}/episodes/query", dependencies=[Depends(authorize)])
+    def qc_report_episodes(scan_id: str, request: QCQueryRequest) -> dict[str, Any]:
+        try:
+            return query_qc_episodes(resolve_qc_report(scan_id), request.filters)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get(
+        "/api/qc/scans/{scan_id}/episodes/{episode_index}",
+        dependencies=[Depends(authorize)],
+    )
+    def qc_report_episode(scan_id: str, episode_index: int) -> dict[str, Any]:
+        try:
+            return qc_episode_detail(resolve_qc_report(scan_id), episode_index)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=f"Episode 不存在：{episode_index}") from error
+
+    @app.post(
+        "/api/qc/scans/{scan_id}/findings/{finding_id}/review",
+        dependencies=[Depends(authorize)],
+    )
+    def qc_finding_review(
+        scan_id: str,
+        finding_id: str,
+        request: QCFindingReviewRequest,
+    ) -> dict[str, Any]:
+        try:
+            return review_qc_finding(
+                resolve_qc_report(scan_id),
+                finding_id,
+                request.model_dump(),
+                os.environ.get("USER", "user"),
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Finding 不存在") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/qc/scans/{scan_id}/episodes/{episode_index}/review",
+        dependencies=[Depends(authorize)],
+    )
+    def qc_episode_review(
+        scan_id: str,
+        episode_index: int,
+        request: QCEpisodeReviewRequest,
+    ) -> dict[str, Any]:
+        try:
+            return review_qc_episode(
+                resolve_qc_report(scan_id),
+                episode_index,
+                request.decision,
+                request.note,
+                os.environ.get("USER", "user"),
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Episode 不存在") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/qc/scans/{scan_id}/selection/preview",
+        dependencies=[Depends(authorize)],
+    )
+    def qc_selection_preview(scan_id: str, request: QCQueryRequest) -> dict[str, Any]:
+        return qc_selected_episode_indices(resolve_qc_report(scan_id), request.filters)
+
+    @app.get("/api/qc/scans/{scan_id}/export-report", dependencies=[Depends(authorize)])
+    def qc_export_report(scan_id: str, kind: str = "episodes") -> Response:
+        if kind not in {"episodes", "findings"}:
+            raise HTTPException(status_code=400, detail="kind 只能是 episodes 或 findings")
+        content = qc_report_csv(resolve_qc_report(scan_id), kind)
+        return Response(
+            content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="qc-{scan_id[:8]}-{kind}.csv"'},
+        )
 
     return app
 
@@ -740,6 +955,47 @@ def main() -> None:
     parser.add_argument("--browse-root", type=Path, default=Path.cwd())
     parser.add_argument("--token", required=True)
     args = parser.parse_args()
+    # Migrate old cache folders and apply bounded retention once per service
+    # start. Maintenance failures should not make datasets unavailable.
+    try:
+        from cache_manager import cleanup as cleanup_cache
+        from cache_manager import maintain
+
+        maintenance = maintain()
+        if maintenance.get("removed") or (maintenance.get("migration") or {}).get("moved"):
+            print(
+                "cache maintenance:",
+                f"removed={maintenance.get('removed', 0)}",
+                f"bytes={maintenance.get('reclaimedBytes', 0)}",
+                file=sys.stderr,
+            )
+
+        try:
+            maintenance_hours = float(os.environ.get("EMBODIT_MAINTENANCE_INTERVAL_HOURS", "24"))
+        except ValueError:
+            maintenance_hours = 24.0
+        if maintenance_hours > 0:
+            interval_seconds = max(3600.0, maintenance_hours * 3600.0)
+
+            def _periodic_cache_maintenance() -> None:
+                while True:
+                    threading.Event().wait(interval_seconds)
+                    try:
+                        cleanup_cache("auto")
+                    except Exception as periodic_error:  # noqa: BLE001
+                        print(
+                            "cache maintenance warning:",
+                            f"{type(periodic_error).__name__}: {periodic_error}",
+                            file=sys.stderr,
+                        )
+
+            threading.Thread(
+                target=_periodic_cache_maintenance,
+                name="embodit-cache-maintenance",
+                daemon=True,
+            ).start()
+    except Exception as error:  # noqa: BLE001
+        print(f"cache maintenance warning: {type(error).__name__}: {error}", file=sys.stderr)
     web_root = Path(__file__).resolve().parent.parent / "web"
     app = build_app(args.token, args.browse_root, web_root)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning", access_log=False)

@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from augment.paths import DEFAULT_CACHE_DIR
+from settings import SAM_TRACK_CACHE_DIR
 
 CACHE_VERSION = "embodit-sam3-v1"
 
@@ -41,7 +41,7 @@ class Sam3Segmenter:
         if not torch.cuda.is_available():
             raise RuntimeError("SAM3 颜色增强需要可用的 CUDA GPU")
         self.cache_enabled = cache_enabled
-        self.cache_dir = DEFAULT_CACHE_DIR / "sam_tracks"
+        self.cache_dir = SAM_TRACK_CACHE_DIR
         if cache_enabled:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         torch.cuda.set_device(device_id)

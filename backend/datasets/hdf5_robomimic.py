@@ -77,6 +77,18 @@ def _episode_length(group) -> int:
             dset = obs[name]
             if getattr(dset, "ndim", 0) >= 1:
                 return int(dset.shape[0])
+    # Astribot stores one episode per file. Commands and camera frames live
+    # in root-level dictionaries instead of RoboMimic's ``obs`` group.
+    if "command_poses_dict" in group and "command" in group["command_poses_dict"]:
+        return int(group["command_poses_dict"]["command"].shape[0])
+    if "poses_dict" in group and "merge_pose" in group["poses_dict"]:
+        return int(group["poses_dict"]["merge_pose"].shape[0])
+    if "images_dict" in group:
+        for camera in group["images_dict"].values():
+            if "rgb_size" in camera:
+                return int(camera["rgb_size"].shape[0])
+    if "time" in group:
+        return int(group["time"].shape[0])
     return 0
 
 
@@ -103,14 +115,66 @@ def _infer_fps(env_args: Any) -> float | None:
 
 
 def _camera_names(group) -> list[str]:
-    if "obs" not in group:
-        return []
     names = []
-    for name in group["obs"].keys():
-        dset = group["obs"][name]
-        if getattr(dset, "ndim", 0) >= 3:
-            names.append(name)
+    if "obs" in group:
+        for name in group["obs"].keys():
+            dset = group["obs"][name]
+            if getattr(dset, "ndim", 0) >= 3:
+                names.append(name)
+    if "images_dict" in group:
+        for name, camera in group["images_dict"].items():
+            if "rgb" in camera and "rgb_size" in camera:
+                names.append(name)
     return names
+
+
+def _is_astribot(group) -> bool:
+    return "images_dict" in group and (
+        "command_poses_dict" in group or "poses_dict" in group
+    )
+
+
+def _astribot_task_name(path: Path) -> str:
+    name = _infer_task_name(path)
+    return name.removeprefix("hdf5_output_").strip() or name
+
+
+def _astribot_fps(group) -> float | None:
+    """Infer capture frequency from Astribot's epoch timestamp arrays."""
+    timestamp = group.get("time")
+    if timestamp is None and "command_poses_dict" in group:
+        timestamp = group["command_poses_dict"].get("timestamp")
+    if timestamp is None or getattr(timestamp, "ndim", 0) != 1 or len(timestamp) < 2:
+        return None
+    values = np.asarray(timestamp[()], dtype=np.float64)
+    diffs = np.diff(values)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if not diffs.size:
+        return None
+    fps = 1.0 / float(np.median(diffs))
+    return fps if np.isfinite(fps) and fps > 0 else None
+
+
+def _decode_compressed_frame(payload: np.ndarray, *, camera_key: str) -> np.ndarray:
+    try:
+        import cv2
+    except ImportError as error:  # pragma: no cover - project dependency
+        raise ImportError("读取 Astribot HDF5 压缩图像需要 opencv-python-headless") from error
+    encoded = np.asarray(payload, dtype=np.uint8)
+    frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError(f"Astribot 相机 {camera_key} 包含无法解码的压缩帧")
+    return np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+
+def _astribot_camera_shape(group, camera_key: str) -> list[int]:
+    camera = group["images_dict"][camera_key]
+    sizes = np.asarray(camera["rgb_size"][:1], dtype=np.float64)
+    if not sizes.size or not np.isfinite(sizes[0]) or sizes[0] <= 0:
+        return []
+    size = int(round(float(sizes[0])))
+    frame = _decode_compressed_frame(camera["rgb"][:size], camera_key=camera_key)
+    return list(frame.shape)
 
 
 class Hdf5Adapter(DatasetAdapter):
@@ -147,6 +211,7 @@ class Hdf5Adapter(DatasetAdapter):
     def _inspect_uncached(self) -> DatasetView:
         files = self._files()
         task = _infer_task_name(self.path)
+        task_names: set[str] = set()
         from settings import HDF5_DEFAULT_FPS
 
         fps = HDF5_DEFAULT_FPS
@@ -179,6 +244,16 @@ class Hdf5Adapter(DatasetAdapter):
                         group = _group_for(handle, demo_key)
                     else:
                         group = handle["data"] if "data" in handle else handle
+                    is_astribot = _is_astribot(group)
+                    episode_task = _astribot_task_name(file_path) if is_astribot else task
+                    task_names.add(episode_task)
+                    if is_astribot:
+                        dialect = "astribot"
+                        if fps_assumed:
+                            inferred = _astribot_fps(group)
+                            if inferred:
+                                fps = inferred
+                                fps_assumed = False
                     length = _episode_length(group)
                     cameras: dict[str, CameraRef] = {}
                     for name in _camera_names(group):
@@ -189,12 +264,27 @@ class Hdf5Adapter(DatasetAdapter):
                             from_timestamp=0.0,
                             to_timestamp=(length / fps) if fps else 0.0,
                         )
-                        dset = group["obs"][name]
-                        features[name] = {"dtype": "image", "shape": list(dset.shape[1:])}
+                        if name not in features:
+                            if is_astribot:
+                                shape = _astribot_camera_shape(group, name)
+                            else:
+                                shape = list(group["obs"][name].shape[1:])
+                            features[name] = {"dtype": "image", "shape": shape}
                     if "actions" in group:
                         features["action"] = {
                             "dtype": "float32",
                             "shape": list(group["actions"].shape[1:]),
+                        }
+                    elif (
+                        is_astribot
+                        and "command_poses_dict" in group
+                        and "command" in group["command_poses_dict"]
+                    ):
+                        src = group["command_poses_dict"]["command"]
+                        features["action"] = {
+                            "dtype": str(src.dtype),
+                            "shape": list(src.shape[1:]),
+                            "names": [f"command.{index}" for index in range(int(src.shape[1]))],
                         }
                     if "states" in group or ("obs" in group and "states" in group["obs"]):
                         src = group["states"] if "states" in group else group["obs"]["states"]
@@ -202,18 +292,25 @@ class Hdf5Adapter(DatasetAdapter):
                             "dtype": "float32",
                             "shape": list(src.shape[1:]),
                         }
+                    elif is_astribot and "poses_dict" in group and "merge_pose" in group["poses_dict"]:
+                        src = group["poses_dict"]["merge_pose"]
+                        features["observation.state"] = {
+                            "dtype": str(src.dtype),
+                            "shape": list(src.shape[1:]),
+                            "names": [f"merge_pose.{index}" for index in range(int(src.shape[1]))],
+                        }
                     episodes.append(
                         EpisodeView(
                             episode_index=len(episodes),
                             length=length,
                             duration=length / fps if fps else 0.0,
-                            tasks=[task],
+                            tasks=[episode_task],
                             cameras=cameras,
                             extras={
                                 "demoKey": demo_key or None,
                                 "hdf5File": str(file_path),
                                 "hdf5Name": file_path.name,
-                                "prompt": task,
+                                "prompt": episode_task,
                             },
                         )
                     )
@@ -226,15 +323,19 @@ class Hdf5Adapter(DatasetAdapter):
             path=path_str,
             name=name,
             fps=fps,
-            robot_type=env_args.get("env_name") if isinstance(env_args, dict) else None,
+            robot_type=(
+                "Astribot"
+                if dialect == "astribot"
+                else (env_args.get("env_name") if isinstance(env_args, dict) else None)
+            ),
             features=features,
             episodes=episodes,
             total_frames=sum(ep.length for ep in episodes),
-            total_tasks=1 if task else 0,
+            total_tasks=len(task_names),
             extras={
                 "dialect": dialect,
                 "layout": "multifile" if len(files) > 1 else "single",
-                "prompt": task,
+                "prompt": next(iter(task_names)) if len(task_names) == 1 else None,
                 "fileCount": len(files),
                 "fpsAssumed": fps_assumed,
             },
@@ -266,6 +367,29 @@ class Hdf5Adapter(DatasetAdapter):
                 for name in ("robot0_eef_pos", "robot1_eef_pos", "ee_pos", "eef_pos"):
                     if name in group["obs"]:
                         result[f"eef.{name}"] = np.asarray(group["obs"][name][()], dtype=np.float64)
+            if _is_astribot(group):
+                commands = group.get("command_poses_dict")
+                if (
+                    commands is not None
+                    and "command" in commands
+                    and (keys is None or "action" in keys or "command" in keys)
+                ):
+                    result["action"] = np.asarray(commands["command"][()], dtype=np.float64)
+                poses = group.get("poses_dict")
+                if (
+                    poses is not None
+                    and "merge_pose" in poses
+                    and (keys is None or "observation.state" in keys or "merge_pose" in keys)
+                ):
+                    result["observation.state"] = np.asarray(
+                        poses["merge_pose"][()], dtype=np.float64
+                    )
+                if poses is not None:
+                    for name in ("astribot_arm_left", "astribot_arm_right"):
+                        if name in poses:
+                            result[f"eef.{name}"] = np.asarray(
+                                poses[name][()], dtype=np.float64
+                            )
         return result
 
     def get_frames(self, episode_index: int, camera_key: str, chunk: int = 64):
@@ -273,6 +397,37 @@ class Hdf5Adapter(DatasetAdapter):
         file_path, demo_key, _ep = self._episode_ref(episode_index)
         with _open_h5(file_path) as handle:
             group = _group_for(handle, demo_key) if demo_key else (handle["data"] if "data" in handle else handle)
+            if "images_dict" in group and camera_key in group["images_dict"]:
+                camera = group["images_dict"][camera_key]
+                sizes_raw = np.asarray(camera["rgb_size"][()], dtype=np.float64)
+                if (
+                    sizes_raw.ndim != 1
+                    or not np.all(np.isfinite(sizes_raw))
+                    or np.any(sizes_raw <= 0)
+                ):
+                    raise ValueError(f"Astribot 相机 {camera_key} 的 rgb_size 无效")
+                sizes = np.rint(sizes_raw).astype(np.int64)
+                if not np.allclose(sizes_raw, sizes):
+                    raise ValueError(f"Astribot 相机 {camera_key} 的 rgb_size 不是整数")
+                offsets = np.concatenate(([0], np.cumsum(sizes, dtype=np.int64)))
+                rgb = camera["rgb"]
+                if int(offsets[-1]) != int(rgb.shape[0]):
+                    raise ValueError(
+                        f"Astribot 相机 {camera_key} 压缩字节数与 rgb_size 不一致"
+                    )
+                batch = max(1, int(chunk))
+                for start in range(0, len(sizes), batch):
+                    stop = min(start + batch, len(sizes))
+                    byte_start = int(offsets[start])
+                    byte_stop = int(offsets[stop])
+                    block = np.asarray(rgb[byte_start:byte_stop], dtype=np.uint8)
+                    for index in range(start, stop):
+                        left = int(offsets[index] - byte_start)
+                        right = int(offsets[index + 1] - byte_start)
+                        yield _decode_compressed_frame(
+                            block[left:right], camera_key=camera_key
+                        )
+                return
             if "obs" not in group or camera_key not in group["obs"]:
                 raise ValueError(f"相机不存在：{camera_key}")
             dset = group["obs"][camera_key]
@@ -287,7 +442,9 @@ class Hdf5Adapter(DatasetAdapter):
         file_path, demo_key, ep = self._episode_ref(episode_index)
         stamp = f"{file_path.stat().st_mtime_ns}:{file_path.stat().st_size}:{episode_index}:{demo_key}:{camera_key}"
         digest = hashlib.sha1(stamp.encode("utf-8")).hexdigest()[:16]
-        cache_dir = Path(tempfile.gettempdir()) / "embody-hdf5-video"
+        from settings import HDF5_VIDEO_CACHE_DIR
+
+        cache_dir = HDF5_VIDEO_CACHE_DIR
         cache_dir.mkdir(parents=True, exist_ok=True)
         out = cache_dir / f"{digest}.mp4"
         if out.is_file() and out.stat().st_size > 0:
@@ -300,7 +457,20 @@ class Hdf5Adapter(DatasetAdapter):
                 return out
             from settings import HDF5_DEFAULT_FPS
 
-            fps = float(self.inspect().fps or HDF5_DEFAULT_FPS)
+            view = self.inspect()
+            fps = float(view.fps or HDF5_DEFAULT_FPS)
+            if view.extras.get("dialect") == "astribot":
+                with tempfile.TemporaryDirectory(prefix="embody-hdf5-") as tmp:
+                    tmp_out = Path(tmp) / "out.mp4"
+                    media.encode_frames_to_mp4(
+                        self.get_frames(episode_index, camera_key), tmp_out, fps
+                    )
+                    tmp_partial = out.with_name(out.name + ".part")
+                    shutil.move(str(tmp_out), tmp_partial)
+                    tmp_partial.replace(out)
+                if camera_key in ep.cameras:
+                    ep.cameras[camera_key].to_timestamp = ep.length / fps if fps else 0.0
+                return out
             with _open_h5(file_path) as handle:
                 group = _group_for(handle, demo_key) if demo_key else (handle["data"] if "data" in handle else handle)
                 if "obs" not in group or camera_key not in group["obs"]:

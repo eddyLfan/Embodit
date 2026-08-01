@@ -32,6 +32,18 @@ def test_mp4_frame_source_slices_shared_shard(tmp_path: Path):
     assert np.allclose(means, [40, 60, 80], atol=5)
 
 
+def test_mp4_sampled_decode_counts_every_frame_but_materializes_stride(tmp_path: Path):
+    frames = np.stack(
+        [np.full((24, 24, 3), index * 30, dtype=np.uint8) for index in range(6)],
+        axis=0,
+    )
+    path = tmp_path / "sampled.mp4"
+    encode_video_mp4(frames, path, fps=6.0)
+    events = list(Mp4FrameSource(path, fps=6.0, expected_frames=6).iter_rgb_samples(3))
+    assert [index for index, _frame in events] == list(range(6))
+    assert [index for index, frame in events if frame is not None] == [0, 3]
+
+
 def test_mcap_topic_uses_direct_stream_instead_of_materialized_mp4(tmp_path: Path):
     class Adapter:
         def iter_topic_frames(self, episode, topic):

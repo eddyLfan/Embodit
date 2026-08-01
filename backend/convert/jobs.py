@@ -28,8 +28,9 @@ from jobs_common import delete_job as _delete_job
 
 
 def default_jobs_dir() -> Path:
-    # project/ root (sibling of backend/)
-    return Path(__file__).resolve().parents[2] / ".convert_jobs"
+    from settings import CONVERT_JOBS_DIR
+
+    return CONVERT_JOBS_DIR
 
 
 def create_job(

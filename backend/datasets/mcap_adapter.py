@@ -783,7 +783,9 @@ class McapAdapter(DatasetAdapter):
         start_ns, end_ns = _episode_window(ep)
         stamp = f"{file_path.stat().st_mtime_ns}:{file_path.stat().st_size}:{episode_index}:{topic}:{start_ns}:{end_ns}"
         digest = hashlib.sha1(stamp.encode("utf-8")).hexdigest()[:16]
-        cache_dir = Path(tempfile.gettempdir()) / "embody-mcap-video"
+        from settings import MCAP_VIDEO_CACHE_DIR
+
+        cache_dir = MCAP_VIDEO_CACHE_DIR
         cache_dir.mkdir(parents=True, exist_ok=True)
         out = cache_dir / f"{digest}.mp4"
         if out.is_file() and out.stat().st_size > 0:

@@ -1,0 +1,44 @@
+{
+  "profile": "standard",
+  "requirements": {
+    "action": true,
+    "state": false,
+    "minimumCameras": 1,
+    "requiredCameraKeys": [],
+    "requiredCameraPatterns": []
+  },
+  "detectors": {
+    "signalIntegrity": {"enabled": true},
+    "videoIntegrity": {
+      "enabled": true,
+      "minimumDecodedRatio": 0.9,
+      "freezePixelDelta": 0.75,
+      "freezeMinimumSeconds": 2.0,
+      "freezeSampleFps": 5.0,
+      "resizeWidth": 160
+    },
+    "motion": {
+      "enabled": true,
+      "jitterSignalKeys": ["action"],
+      "accelerationRobustZ": 8.0,
+      "jerkRobustZ": 8.0,
+      "minimumDimensionRange": 0.001,
+      "minimumAccelerationRangeRatio": 0.15,
+      "minimumJerkRangeRatio": 0.3,
+      "derivativeAlignmentFrames": 1,
+      "stationaryMinimumSeconds": 3.0
+    },
+    "visualQuality": {"enabled": true, "sampleFps": 4.0, "resizeWidth": 320},
+    "cameraShake": {"enabled": true, "staticCameraKeys": []},
+    "gripper": {"enabled": true, "allowMultipleGrasps": false}
+  },
+  "scoring": {
+    "passQualityScore": 80,
+    "passUsableRatio": 90,
+    "minimumCoverage": 80
+  },
+  "runtime": {
+    "episodeWorkers": 2,
+    "cameraWorkers": 2
+  }
+}

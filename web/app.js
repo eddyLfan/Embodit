@@ -11,11 +11,24 @@
   }
   const state = {
     browseRoot: '', currentFolder: '', parentFolder: null,
-    dataset: null, episodeByIndex: new Map(), states: {}, filtered: [], currentEpisode: null,
+    dataset: null, episodeByIndex: new Map(), states: {}, quarantineReasons: {}, filtered: [], currentEpisode: null,
     playing: false, animationFrame: null, progressPath: '',
     timelineDragging: false, resumeAfterSeek: false, seekSequence: 0,
     previewSeekTimer: null, pendingSeekSeconds: 0,
     autoFilterPollTimer: null, autoFilterJobId: null,
+    qcJobs: [],
+    qcSummary: null,
+    qcPage: null,
+    qcOffset: 0,
+    qcSelectedEpisode: null,
+    qcOverviewByEpisode: new Map(),
+    qcDetailByEpisode: new Map(),
+    qcActiveFindingId: null,
+    qcPlaybackEnd: null,
+    qcPlaybackToken: 0,
+    qcStartedJobId: null,
+    qcCurrentJob: null,
+    qcLoadedScanId: null,
     episodeReady: false, requiredBufferSeconds: 2,
     pendingAutoPlay: false,
     trajectory: null, trajectoryEpisode: null,
@@ -31,6 +44,7 @@
     trajVisible: null, // boolean[] aligned to action dims
     trajScaleMode: 'per', // shared | per
     workspaceMode: 'browse',
+    exportContext: null,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -146,6 +160,7 @@
       if (Number.isInteger(state.currentEpisode)) {
         renderEpisodeHeader();
         renderLabelPanel();
+        renderQcInlineEvidence();
         drawTrajectory(state.trajectory, Number($('#timeline').value) || 0);
         const prompt = episodePrompt(currentEpisode()) || '—';
         const promptEl = $('#episodePrompt');
@@ -163,6 +178,14 @@
     try { renderConvertJobDock(); } catch {}
     try { renderAugmentJobDock(); } catch {}
     try { renderConvertFidelity(); } catch {}
+    try { if (!$('#exportDialog')?.classList.contains('hidden')) renderExportDialog(); } catch {}
+    try {
+      if (state.qcSummary) {
+        renderQcSummary();
+        renderQcEpisodeTable();
+        renderQcPagination();
+      }
+    } catch {}
     try { fillAugmentColorPresets(); syncAugmentFormVisibility(); } catch {}
   }
 
@@ -197,11 +220,64 @@
     $('#timeline').addEventListener('pointercancel', endTimelineSeek);
     $('#previousEpisode').addEventListener('click', () => moveEpisode(-1));
     $('#nextEpisode').addEventListener('click', () => moveEpisode(1));
+    $('#quarantineReason')?.addEventListener('change', updateCurrentQuarantineReason);
     $('#saveProgress').addEventListener('click', saveProgress);
     $('#loadProgress').addEventListener('click', loadProgress);
     $('#createDataset').addEventListener('click', createDataset);
+    $('#closeExport')?.addEventListener('click', closeExportDialog);
+    $('#cancelExport')?.addEventListener('click', closeExportDialog);
+    $('#startExport')?.addEventListener('click', startExport);
+    $('#exportTarget')?.addEventListener('change', () => {
+      if (state.exportContext && !state.exportContext.outputTouched) {
+        $('#exportOutput').value = suggestedExportPath($('#exportTarget').value);
+      }
+      renderExportDialog();
+    });
+    $('#exportMediaMode')?.addEventListener('change', renderExportDialog);
+    $('#exportCopyLabels')?.addEventListener('change', renderExportDialog);
+    $('#exportIncludeReview')?.addEventListener('change', renderExportDialog);
+    $('#exportOutput')?.addEventListener('input', () => {
+      if (state.exportContext) {
+        state.exportContext.outputTouched = true;
+        state.exportContext.chosenDirectory = null;
+      }
+      renderExportDialog();
+    });
+    $('#browseExportOutput')?.addEventListener('click', openExportPathBrowser);
+    $('#exportBrowserParent')?.addEventListener('click', () => {
+      const parent = state.exportContext?.browserParent;
+      if (parent) browseExportDirectory(parent);
+    });
+    $('#useExportDirectory')?.addEventListener('click', useCurrentExportDirectory);
+    $('#exportBrowserList')?.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-export-directory]');
+      if (button) browseExportDirectory(button.dataset.exportDirectory);
+    });
     $('#closeAutoFilter')?.addEventListener('click', closeAutoFilterDialog);
     $('#closeAutoFilter2')?.addEventListener('click', closeAutoFilterDialog);
+    $('#openAutoFilter')?.addEventListener('click', openAutoFilterDialog);
+    $('#startQcScan')?.addEventListener('click', startQcScan);
+    $('#refreshQcJobs')?.addEventListener('click', refreshQcJobs);
+    $('#pauseQcScan')?.addEventListener('click', () => controlQcScan('pause'));
+    $('#resumeQcScan')?.addEventListener('click', () => controlQcScan('resume'));
+    $('#cancelQcScan')?.addEventListener('click', () => controlQcScan('cancel'));
+    $('#qcHistory')?.addEventListener('change', () => {
+      const id = $('#qcHistory').value;
+      if (id) selectQcJob(id);
+    });
+    $('#applyQcFilters')?.addEventListener('click', () => queryQcEpisodes(0));
+    $('#qcSearch')?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') queryQcEpisodes(0);
+    });
+    $('#qcIssueFilters')?.addEventListener('change', () => queryQcEpisodes(0));
+    $('#qcEpisodeTable')?.addEventListener('click', onQcEpisodeTableClick);
+    $('#qcEpisodeDetail')?.addEventListener('click', onQcDetailClick);
+    $('#qcEvidencePanel')?.addEventListener('click', onQcInlineClick);
+    $('#qcTimelineOverlay')?.addEventListener('click', onQcInlineClick);
+    $('#qcPagination')?.addEventListener('click', onQcPaginationClick);
+    $('#exportQcSelection')?.addEventListener('click', exportQcSelection);
+    $('#downloadQcEpisodes')?.addEventListener('click', () => downloadQcReport('episodes'));
+    $('#downloadQcFindings')?.addEventListener('click', () => downloadQcReport('findings'));
     $('#closeConvert')?.addEventListener('click', closeConvertDialog);
     $('#startConvert')?.addEventListener('click', startConvert);
     $('#convertTarget')?.addEventListener('change', renderConvertFidelity);
@@ -371,6 +447,7 @@
         drawTrajectory(state.trajectory, Number($('#timeline').value) || 0);
       });
     }
+    if (next === 'filter') renderQcInlineEvidence();
     try { localStorage.setItem('embody-workspace-mode', next); } catch {}
   }
 
@@ -447,9 +524,11 @@
   async function openDataset(path) {
     setBusy(true, t('readingMeta'), path);
     try {
+      resetQcVisualization();
       state.dataset = await api('/api/inspect', { method: 'POST', body: JSON.stringify({ dataset: path }) });
       state.episodeByIndex = new Map(state.dataset.episodes.map((episode) => [episode.episodeIndex, episode]));
       state.states = normalizeStates(loadLocalStates(state.dataset.path));
+      state.quarantineReasons = normalizeQuarantineReasons(loadLocalQuarantineReasons(state.dataset.path));
       state.filtered = state.dataset.episodes;
       state.labels = [];
       state.labelPresets = [];
@@ -473,6 +552,7 @@
       renderSummary();
       renderEpisodeList();
       selectEpisode(state.dataset.episodes[0]?.episodeIndex);
+      loadLatestQcVisualization().catch(() => {});
     } catch (error) {
       showToast(error.message, true);
     } finally {
@@ -604,11 +684,21 @@
       const labelLine = labelInfo
         ? `<span class="episode-labels ${labelInfo.success === false ? 'bad' : ''}" data-tip="${escapeAttr([labelInfo.text, ...labelInfo.tags].join('\n'))}">${escapeHtml(labelInfo.text)}${labelInfo.tags.length ? ` · ${escapeHtml(labelInfo.tags.slice(0, 3).join(', '))}${labelInfo.tags.length > 3 ? '…' : ''}` : ''}</span>`
         : '';
+      const qc = state.qcOverviewByEpisode.get(episode.episodeIndex);
+      const qcLine = qc
+        ? `<span class="episode-qc ${escapeAttr(qc.integrityStatus || '')}">${escapeHtml(t('qcInlineTitle'))} · ${Number(qc.usableRatio || 0).toFixed(0)}% · ${Number(qc.findingCount || 0)} ${escapeHtml(t('qcFindings'))}</span>`
+        : '';
+      const quarantineReason = decision === 'quarantine' ? getQuarantineReason(episode.episodeIndex) : '';
+      const quarantineReasonLine = quarantineReason
+        ? `<span class="episode-quarantine-reason">${escapeHtml(t('quarantineReasonPrefix', { reason: quarantineReasonLabel(quarantineReason) }))}</span>`
+        : '';
       return `<button class="episode ${cssDecision}${selected}" data-episode="${episode.episodeIndex}">
         <span class="episode-row"><strong>Episode ${episode.episodeIndex}</strong><i class="state-dot"></i></span>
         <span class="episode-task" data-tip="${escapeAttr(task)}">${escapeHtml(task.replace(/\n/g, ', '))}</span>
         <span class="episode-meta">${episode.length} ${escapeHtml(t('framesUnit'))} · ${formatTime(episode.duration)}${episode.hasIntervention ? ` · <b>${escapeHtml(t('humanIntervention'))}</b>` : ''}</span>
         ${labelLine}
+        ${qcLine}
+        ${quarantineReasonLine}
       </button>`;
     }).join('') || `<div class="empty">${escapeHtml(t('noMatchingEpisode'))}</div>`;
   }
@@ -623,11 +713,15 @@
     state.breakpoints = [];
     state.draftIntervalMeta = {};
     state.trajVisible = null;
+    state.qcActiveFindingId = null;
+    state.qcPlaybackEnd = null;
+    state.qcPlaybackToken += 1;
     const episode = currentEpisode();
     updateEpisodeSelection(previousIndex, index);
     renderEpisodeHeader();
     renderVideosOptimized(episode);
     loadEpisodeSignals(episode);
+    loadQcInlineEvidence(index).catch(() => {});
     try { renderLabelPanel(); } catch (error) { console.error(error); }
   }
 
@@ -662,6 +756,14 @@
     const labelFacts = labelInfo
       ? `<span class="label-fact ${labelInfo.success === false ? 'warning' : ''}" data-tip="${escapeAttr([labelInfo.text, ...labelInfo.tags].join('\n'))}">${escapeHtml(labelInfo.text)}</span>${labelInfo.tags.slice(0, 4).map((tag) => `<span class="label-fact-tag">${escapeHtml(tag)}</span>`).join('')}${labelInfo.tags.length > 4 ? `<span class="label-fact-tag" data-tip="${escapeAttr(labelInfo.tags.slice(4).join('\n'))}">+${labelInfo.tags.length - 4}</span>` : ''}`
       : '';
+    const qc = state.qcOverviewByEpisode.get(episode.episodeIndex);
+    const qcFact = qc
+      ? `<span class="label-fact ${qc.integrityStatus === 'invalid' ? 'warning' : ''}">${escapeHtml(t('qcInlineTitle'))} ${Number(qc.usableRatio || 0).toFixed(0)}% · ${Number(qc.findingCount || 0)} ${escapeHtml(t('qcFindings'))}</span>`
+      : '';
+    const quarantineReason = decision === 'quarantine' ? getQuarantineReason(episode.episodeIndex) : '';
+    const quarantineReasonFact = quarantineReason
+      ? `<span class="label-fact warning">${escapeHtml(t('quarantineReasonPrefix', { reason: quarantineReasonLabel(quarantineReason) }))}</span>`
+      : '';
     $('#episodeHeader').innerHTML = `
       <div>
         <h3>Episode ${episode.episodeIndex}</h3>
@@ -672,6 +774,8 @@
         <span>${escapeHtml(t('platformId'))} ${escapeHtml(episode.platformEpisodeId || episode.extras?.mcapName || '-')}</span>
         ${episode.hasIntervention ? `<span class="warning">${escapeHtml(t('humanIntervention'))}</span>` : ''}
         ${labelFacts}
+        ${qcFact}
+        ${quarantineReasonFact}
         <span class="decision-tag ${decision === 'pass' ? 'keep' : decision === 'quarantine' ? 'exclude' : 'pending'}">${stateLabel(decision)}</span>
       </div>`;
     const promptEl = $('#episodePrompt');
@@ -1093,6 +1197,12 @@
     $$('.decision-bar .decision').forEach((button) => {
       button.classList.toggle('active', button.dataset.state === decision);
     });
+    const reasonSelect = $('#quarantineReason');
+    if (reasonSelect) {
+      const reason = decision === 'quarantine' ? getQuarantineReason(state.currentEpisode) : '';
+      reasonSelect.value = Array.from(reasonSelect.options).some((option) => option.value === reason) ? reason : '';
+      reasonSelect.closest('.quarantine-reason-field')?.classList.toggle('active', decision === 'quarantine');
+    }
   }
 
   function renderVideosOptimized(episode) {
@@ -1238,11 +1348,29 @@
     if (!Number.isInteger(state.currentEpisode)) return;
     const normalized = normalizeDecision(decision);
     state.states[state.currentEpisode] = normalized;
+    if (normalized === 'quarantine') {
+      const reason = normalizeQuarantineReason($('#quarantineReason')?.value);
+      if (reason) state.quarantineReasons[state.currentEpisode] = reason;
+      else delete state.quarantineReasons[state.currentEpisode];
+    } else {
+      delete state.quarantineReasons[state.currentEpisode];
+    }
     saveLocalStates();
     renderSummary();
     renderEpisodeHeader();
     applyFilters();
     flashDecision(normalized);
+  }
+
+  function updateCurrentQuarantineReason() {
+    if (state.workspaceMode !== 'filter' || !Number.isInteger(state.currentEpisode)) return;
+    if (getState(state.currentEpisode) !== 'quarantine') return;
+    const reason = normalizeQuarantineReason($('#quarantineReason')?.value);
+    if (reason) state.quarantineReasons[state.currentEpisode] = reason;
+    else delete state.quarantineReasons[state.currentEpisode];
+    saveLocalStates();
+    renderEpisodeHeader();
+    applyFilters();
   }
 
   let stampTimer = null;
@@ -1270,7 +1398,10 @@
   function bulkSet(decision) {
     if (state.workspaceMode !== 'filter') return;
     const normalized = normalizeDecision(decision);
-    state.filtered.forEach((episode) => { state.states[episode.episodeIndex] = normalized; });
+    state.filtered.forEach((episode) => {
+      state.states[episode.episodeIndex] = normalized;
+      if (normalized !== 'quarantine') delete state.quarantineReasons[episode.episodeIndex];
+    });
     saveLocalStates();
     renderSummary();
     renderEpisodeHeader();
@@ -1284,7 +1415,12 @@
     if (!target) return;
     try {
       const result = await api('/api/progress/save', {
-        method: 'POST', body: JSON.stringify({ path: target, dataset: state.dataset.path, states: state.states })
+        method: 'POST', body: JSON.stringify({
+          path: target,
+          dataset: state.dataset.path,
+          states: state.states,
+          quarantineReasons: state.quarantineReasons,
+        })
       });
       state.progressPath = result.path;
       showToast(t('progressSaved', { path: result.path }));
@@ -1298,6 +1434,7 @@
       const result = await api('/api/progress/load', { method: 'POST', body: JSON.stringify({ path: target }) });
       if (result.dataset && result.dataset !== state.dataset.path && !confirm(t('progressOtherDataset'))) return;
       state.states = normalizeStates(result.states || {});
+      state.quarantineReasons = normalizeQuarantineReasons(result.quarantineReasons || {});
       state.progressPath = target;
       saveLocalStates();
       renderSummary();
@@ -1307,12 +1444,937 @@
     } catch (error) { showToast(error.message, true); }
   }
 
-  function openAutoFilterDialog() {
+  function resetQcVisualization() {
+    if (state.autoFilterPollTimer) clearTimeout(state.autoFilterPollTimer);
+    state.autoFilterPollTimer = null;
+    state.autoFilterJobId = null;
+    state.qcJobs = [];
+    state.qcSummary = null;
+    state.qcPage = null;
+    state.qcSelectedEpisode = null;
+    state.qcOverviewByEpisode = new Map();
+    state.qcDetailByEpisode = new Map();
+    state.qcActiveFindingId = null;
+    state.qcPlaybackEnd = null;
+    state.qcPlaybackToken += 1;
+    state.qcCurrentJob = null;
+    state.qcLoadedScanId = null;
+    $('#qcTimelineOverlay') && ($('#qcTimelineOverlay').innerHTML = '');
+    renderQcInlineEvidence();
+  }
+
+  async function loadLatestQcVisualization() {
+    if (!state.dataset) return;
+    const datasetPath = state.dataset.path;
+    const result = await api(`/api/qc/scans?dataset=${encodeURIComponent(datasetPath)}`);
+    if (state.dataset?.path !== datasetPath) return;
+    state.qcJobs = result.jobs || [];
+    const latest = state.qcJobs.find((job) => job.status === 'completed');
+    if (!latest) {
+      renderQcInlineEvidence();
+      return;
+    }
+    await loadQcReport(latest.jobId);
+  }
+
+  async function loadQcEpisodeOverview(scanId) {
+    const overview = new Map();
+    let offset = 0;
+    let total = 0;
+    do {
+      const page = await api(`/api/qc/scans/${encodeURIComponent(scanId)}/episodes/query`, {
+        method: 'POST', body: JSON.stringify({ filters: { limit: 500, offset } }),
+      });
+      if (state.autoFilterJobId !== scanId) return;
+      (page.episodes || []).forEach((episode) => overview.set(Number(episode.episodeIndex), episode));
+      offset += (page.episodes || []).length;
+      total = Number(page.total || 0);
+      if (!(page.episodes || []).length) break;
+    } while (offset < total);
+    state.qcOverviewByEpisode = overview;
+    renderEpisodeList();
+    renderEpisodeHeader();
+  }
+
+  async function loadQcInlineEvidence(episodeIndex = state.currentEpisode, { force = false } = {}) {
+    if (!state.autoFilterJobId || !state.qcSummary || !Number.isInteger(episodeIndex)) {
+      renderQcInlineEvidence();
+      return;
+    }
+    if (!force && state.qcDetailByEpisode.has(episodeIndex)) {
+      if (state.currentEpisode === episodeIndex) renderQcInlineEvidence();
+      return;
+    }
+    const scanId = state.autoFilterJobId;
+    if (state.currentEpisode === episodeIndex) renderQcInlineEvidence(null, true);
+    try {
+      const detail = await api(`/api/qc/scans/${encodeURIComponent(scanId)}/episodes/${episodeIndex}`);
+      if (state.autoFilterJobId !== scanId) return;
+      state.qcDetailByEpisode.set(episodeIndex, detail);
+      if (state.currentEpisode === episodeIndex) renderQcInlineEvidence(detail);
+    } catch (error) {
+      if (state.currentEpisode === episodeIndex) renderQcInlineEvidence({ error: error.message });
+    }
+  }
+
+  function qcFindingBounds(finding) {
+    const start = finding?.adjustedStartS ?? finding?.startS;
+    const end = finding?.adjustedEndS ?? finding?.endS ?? start;
+    return {
+      start: start == null ? null : Number(start),
+      end: end == null ? null : Number(end),
+    };
+  }
+
+  function qcFindingCode(finding) {
+    return finding?.adjustedIssueCode || finding?.issueCode || 'QC';
+  }
+
+  function qcFindingSeverity(finding) {
+    return finding?.adjustedSeverity || finding?.severity || 'warning';
+  }
+
+  function qcFindingReviewLabel(status) {
+    if (status === 'confirmed') return t('qcReviewConfirmed');
+    if (status === 'rejected') return t('qcReviewRejected');
+    if (status === 'modified') return t('qcReviewModified');
+    return t('qcUnreviewed');
+  }
+
+  async function saveQcFindingReview(findingId, reviewStatus) {
+    if (!findingId || !['confirmed', 'rejected'].includes(reviewStatus)) return;
+    const changed = [];
+    state.qcDetailByEpisode.forEach((detail, episodeIndex) => {
+      const finding = detail?.findings?.find((item) => item.findingId === findingId);
+      if (!finding) return;
+      changed.push({ episodeIndex, detail, finding, previous: finding.reviewStatus || 'unreviewed' });
+      finding.reviewStatus = reviewStatus;
+    });
+    const rerender = () => {
+      if (changed.some((item) => item.episodeIndex === state.currentEpisode)) renderQcInlineEvidence();
+      const selected = changed.find((item) => item.episodeIndex === state.qcSelectedEpisode);
+      if (selected) renderQcEpisodeDetail(selected.detail);
+    };
+    rerender();
+    try {
+      await api(`/api/qc/scans/${encodeURIComponent(state.autoFilterJobId)}/findings/${encodeURIComponent(findingId)}/review`, {
+        method: 'POST', body: JSON.stringify({ reviewStatus }),
+      });
+      showToast(t('qcReviewSaved', { status: qcFindingReviewLabel(reviewStatus) }));
+    } catch (error) {
+      changed.forEach((item) => { item.finding.reviewStatus = item.previous; });
+      rerender();
+      showToast(error.message, true);
+    }
+  }
+
+  function qcFindingWhere(finding) {
+    return [finding?.cameraKey, finding?.signalKey].filter(Boolean).join(' · ');
+  }
+
+  function renderQcTimeline(findings = []) {
+    const host = $('#qcTimelineOverlay');
+    const episode = currentEpisode();
+    if (!host || !episode || !state.qcSummary) {
+      if (host) host.innerHTML = '';
+      return;
+    }
+    const duration = Math.max(0.001, Number(episode.duration || 0));
+    host.innerHTML = findings.map((finding) => {
+      const { start, end } = qcFindingBounds(finding);
+      if (start == null) return '';
+      const safeStart = Math.max(0, Math.min(duration, start));
+      const safeEnd = Math.max(safeStart, Math.min(duration, end ?? start));
+      const left = safeStart / duration * 100;
+      const width = Math.max(0.35, (safeEnd - safeStart) / duration * 100);
+      const severity = qcFindingSeverity(finding);
+      const rejected = finding.reviewStatus === 'rejected' ? ' rejected' : '';
+      const active = state.qcActiveFindingId === finding.findingId ? ' active' : '';
+      const label = `${qcFindingCode(finding)} · ${safeStart.toFixed(2)}s–${safeEnd.toFixed(2)}s`;
+      return `<button class="qc-timeline-segment ${escapeAttr(severity)}${rejected}${active}" style="left:${left.toFixed(4)}%;width:max(7px,${width.toFixed(4)}%)" data-qc-inline-play data-finding="${escapeAttr(finding.findingId)}" data-start="${safeStart}" data-end="${safeEnd}" aria-label="${escapeAttr(label)}" data-tip="${escapeAttr(label)}"></button>`;
+    }).join('');
+  }
+
+  function renderQcInlineEvidence(explicitDetail = null, loading = false) {
+    const panel = $('#qcEvidencePanel');
+    if (!panel) return;
+    if (!state.qcSummary) {
+      renderQcTimeline([]);
+      const running = ['queued', 'running', 'paused'].includes(state.qcCurrentJob?.status);
+      const message = running
+        ? `${statusLabel(state.qcCurrentJob.status)} · ${Math.round(Number(state.qcCurrentJob.progress || 0) * 100)}%`
+        : t('qcInlineEmpty');
+      panel.innerHTML = `<div class="qc-evidence-empty"><div><strong>${escapeHtml(t('qcInlineTitle'))}</strong><span>${escapeHtml(message)}</span></div><button data-open-qc>${escapeHtml(t('qcInlineConfigure'))}</button></div>`;
+      return;
+    }
+    if (loading) {
+      renderQcTimeline([]);
+      panel.innerHTML = `<div class="qc-evidence-empty"><div><strong>${escapeHtml(t('qcInlineTitle'))}</strong><span>${escapeHtml(t('qcInlineLoading'))}</span></div></div>`;
+      return;
+    }
+    const detail = explicitDetail || state.qcDetailByEpisode.get(state.currentEpisode);
+    if (!detail || detail.error) {
+      renderQcTimeline([]);
+      panel.innerHTML = `<div class="qc-evidence-empty"><div><strong>${escapeHtml(t('qcInlineTitle'))}</strong><span>${escapeHtml(detail?.error || t('qcInlineLoading'))}</span></div></div>`;
+      return;
+    }
+    const episode = detail.episode || {};
+    const findings = detail.findings || [];
+    const intervals = findings.filter((finding) => qcFindingBounds(finding).start != null);
+    const whole = findings.length - intervals.length;
+    if (state.qcActiveFindingId && !findings.some((finding) => finding.findingId === state.qcActiveFindingId)) {
+      state.qcActiveFindingId = null;
+    }
+    renderQcTimeline(intervals);
+    const cards = findings.map((finding) => {
+      const { start, end } = qcFindingBounds(finding);
+      const range = start == null ? t('qcWholeEpisode') : `${start.toFixed(2)}s – ${(end ?? start).toFixed(2)}s`;
+      const where = qcFindingWhere(finding);
+      const severity = qcFindingSeverity(finding);
+      const active = state.qcActiveFindingId === finding.findingId ? ' active' : '';
+      const reviewed = finding.reviewStatus === 'confirmed' || finding.reviewStatus === 'rejected'
+        ? ` ${finding.reviewStatus}` : '';
+      return `<button class="qc-evidence-card ${escapeAttr(severity)}${active}${reviewed}" data-qc-select-finding="${escapeAttr(finding.findingId)}">
+        <i class="qc-evidence-dot"></i><span><strong>${escapeHtml(qcFindingCode(finding))}</strong><small>${escapeHtml(range)}${where ? ` · ${escapeHtml(where)}` : ''}</small></span>
+      </button>`;
+    }).join('');
+    const selected = findings.find((finding) => finding.findingId === state.qcActiveFindingId);
+    let selectedHtml = '';
+    if (selected) {
+      const { start, end } = qcFindingBounds(selected);
+      const confidence = Math.round(Number(selected.confidence || 0) * 100);
+      const where = qcFindingWhere(selected);
+      const reviewStatus = selected.reviewStatus || 'unreviewed';
+      selectedHtml = `<div class="qc-evidence-detail">
+        <div><p>${escapeHtml(selected.explanation || qcFindingCode(selected))}</p><div class="qc-evidence-detail-meta">${escapeHtml(t('qcInlineConfidence', { n: confidence }))}${where ? ` · ${escapeHtml(where)}` : ''} · ${escapeHtml(qcFindingSeverity(selected))}</div></div>
+        <div class="qc-evidence-detail-actions">
+          ${start == null ? '' : `<button class="primary" data-qc-inline-play data-finding="${escapeAttr(selected.findingId)}" data-start="${start}" data-end="${end ?? start}">▶ ${escapeHtml(t('qcInlinePlay'))}</button>`}
+          <button class="qc-review-choice confirmed${reviewStatus === 'confirmed' ? ' active' : ''}" data-qc-inline-review="confirmed" data-finding="${escapeAttr(selected.findingId)}" aria-pressed="${reviewStatus === 'confirmed'}">${escapeHtml(t('qcConfirmIssue'))}</button>
+          <button class="qc-review-choice rejected${reviewStatus === 'rejected' ? ' active' : ''}" data-qc-inline-review="rejected" data-finding="${escapeAttr(selected.findingId)}" aria-pressed="${reviewStatus === 'rejected'}">${escapeHtml(t('qcRejectIssue'))}</button>
+          <span class="qc-review-state review-${escapeAttr(reviewStatus)}">${escapeHtml(qcFindingReviewLabel(reviewStatus))}</span>
+        </div>
+        <details class="qc-evidence-raw"><summary>${escapeHtml(t('qcMetrics'))}</summary><pre>${escapeHtml(JSON.stringify({ metrics: selected.metrics, threshold: selected.threshold }, null, 2))}</pre></details>
+      </div>`;
+    }
+    const countText = intervals.length ? t('qcInlineSegments', { n: intervals.length }) : t('qcInlineClean');
+    const wholeText = whole ? ` · ${t('qcInlineWholeIssues', { n: whole })}` : '';
+    panel.innerHTML = `<div class="qc-evidence-head"><div><div class="qc-evidence-title"><strong>${escapeHtml(t('qcInlineTitle'))}</strong><span>${escapeHtml(countText + wholeText)}</span><span class="qc-status ${escapeAttr(episode.integrityStatus || '')}">${escapeHtml(episode.integrityStatus === 'invalid' ? t('qcInvalid') : t('qcValid'))}</span></div><div class="qc-evidence-hint">${escapeHtml(t('qcInlineHint'))}</div></div><div class="qc-evidence-score"><span>${escapeHtml(t('qualityScore'))} <b>${Number(episode.qualityScore || 0).toFixed(1)}</b></span><span>${escapeHtml(t('qcAverageUsable'))} <b>${Number(episode.usableRatio || 0).toFixed(1)}%</b></span></div></div>${cards ? `<div class="qc-evidence-cards">${cards}</div>` : ''}${selectedHtml}`;
+  }
+
+  async function onQcInlineClick(event) {
+    const open = event.target.closest('[data-open-qc]');
+    if (open) return openAutoFilterDialog();
+    const select = event.target.closest('[data-qc-select-finding]');
+    if (select) {
+      const findingId = select.dataset.qcSelectFinding;
+      state.qcActiveFindingId = findingId;
+      const finding = state.qcDetailByEpisode.get(state.currentEpisode)?.findings?.find(
+        (item) => item.findingId === findingId,
+      );
+      const { start, end } = qcFindingBounds(finding);
+      if (start != null) {
+        playQcInterval(state.currentEpisode, start, end, findingId);
+        return;
+      }
+      renderQcInlineEvidence();
+      return;
+    }
+    const play = event.target.closest('[data-qc-inline-play]');
+    if (play) {
+      state.qcActiveFindingId = play.dataset.finding || null;
+      playQcInterval(state.currentEpisode, Number(play.dataset.start), Number(play.dataset.end));
+      return;
+    }
+    const review = event.target.closest('[data-qc-inline-review]');
+    if (review) {
+      await saveQcFindingReview(review.dataset.finding, review.dataset.qcInlineReview);
+    }
+  }
+
+  function playQcInterval(episodeIndex, start, end, findingId = state.qcActiveFindingId) {
+    if (!Number.isFinite(start)) return;
+    if (state.currentEpisode !== episodeIndex) {
+      selectEpisode(episodeIndex);
+      state.pendingAutoPlay = false;
+    }
+    state.qcActiveFindingId = findingId || null;
+    pauseAll();
+    const episode = currentEpisode();
+    const safeStart = Math.max(0, Math.min(Number(episode?.duration || 0), start));
+    const safeEnd = Math.max(safeStart + 0.03, Math.min(Number(episode?.duration || end), Number.isFinite(end) ? end : start + 1));
+    const token = ++state.qcPlaybackToken;
+    state.qcPlaybackEnd = safeEnd;
+    renderQcInlineEvidence();
+    seekAll(safeStart);
+    const tryPlay = (attempt = 0) => {
+      if (token !== state.qcPlaybackToken || state.currentEpisode !== episodeIndex) return;
+      if (state.episodeReady) {
+        playAll();
+        return;
+      }
+      if (attempt < 30) setTimeout(() => tryPlay(attempt + 1), 100);
+    };
+    setTimeout(() => tryPlay(), 80);
+  }
+
+  async function openAutoFilterDialog() {
+    if (!state.dataset) return showToast(t('needConvertDataset'), true);
+    $('#qcDatasetPath').textContent = state.dataset.path;
     $('#autoFilterDialog').classList.remove('hidden');
+    try { await refreshQcJobs(); } catch (error) { showToast(error.message, true); }
   }
 
   function closeAutoFilterDialog() {
     $('#autoFilterDialog').classList.add('hidden');
+  }
+
+  async function refreshQcJobs() {
+    if (!state.dataset) return;
+    const result = await api(`/api/qc/scans?dataset=${encodeURIComponent(state.dataset.path)}`);
+    state.qcJobs = result.jobs || [];
+    const history = $('#qcHistory');
+    const previous = history.value || state.autoFilterJobId || '';
+    history.innerHTML = state.qcJobs.length
+      ? state.qcJobs.map((job) => {
+        const stamp = job.createdAt ? new Date(job.createdAt).toLocaleString() : '';
+        const label = `${String(job.jobId || '').slice(0, 8)} · ${statusLabel(job.status)}${stamp ? ` · ${stamp}` : ''}`;
+        return `<option value="${escapeAttr(job.jobId)}">${escapeHtml(label)}</option>`;
+      }).join('')
+      : `<option value="">${escapeHtml(t('qcNoHistory'))}</option>`;
+    const chosen = state.qcJobs.find((job) => job.jobId === previous)
+      || state.qcJobs.find((job) => ['queued', 'running', 'paused'].includes(job.status))
+      || state.qcJobs[0];
+    if (chosen) {
+      history.value = chosen.jobId;
+      await selectQcJob(chosen.jobId);
+    } else {
+      state.autoFilterJobId = null;
+      renderQcJob(null);
+      $('#qcReport')?.classList.add('hidden');
+    }
+  }
+
+  async function startQcScan() {
+    if (!state.dataset) return showToast(t('needConvertDataset'), true);
+    const button = $('#startQcScan');
+    button.disabled = true;
+    try {
+      const config = {
+        profile: $('#qcProfile').value,
+        requirements: { state: $('#qcRequireState').checked },
+      };
+      const episodeWorkers = Number($('#qcEpisodeWorkers')?.value || 0);
+      const cameraWorkers = Number($('#qcCameraWorkers')?.value || 0);
+      if (episodeWorkers > 0 || cameraWorkers > 0) {
+        config.runtime = {};
+        if (episodeWorkers > 0) config.runtime.episodeWorkers = episodeWorkers;
+        if (cameraWorkers > 0) config.runtime.cameraWorkers = cameraWorkers;
+      }
+      const job = await api('/api/qc/scans', {
+        method: 'POST',
+        body: JSON.stringify({
+          dataset: state.dataset.path,
+          config,
+          useCache: $('#qcUseCache').checked,
+        }),
+      });
+      state.autoFilterJobId = job.jobId;
+      state.qcStartedJobId = job.jobId;
+      state.qcCurrentJob = job;
+      state.qcSummary = null;
+      state.qcLoadedScanId = null;
+      state.qcOverviewByEpisode = new Map();
+      state.qcDetailByEpisode = new Map();
+      state.qcActiveFindingId = null;
+      renderEpisodeList();
+      renderEpisodeHeader();
+      renderQcInlineEvidence();
+      state.qcJobs = [job, ...state.qcJobs.filter((item) => item.jobId !== job.jobId)];
+      renderQcJob(job);
+      showToast(t('qcScanStarted', { id: String(job.jobId).slice(0, 8) }));
+      await refreshQcJobs();
+    } catch (error) {
+      showToast(error.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function selectQcJob(jobId) {
+    if (!jobId) return;
+    state.autoFilterJobId = jobId;
+    if ($('#qcHistory')) $('#qcHistory').value = jobId;
+    if (state.autoFilterPollTimer) clearTimeout(state.autoFilterPollTimer);
+    try {
+      const job = await api(`/api/qc/scans/${encodeURIComponent(jobId)}/status`);
+      renderQcJob(job);
+      if (job.status === 'completed') {
+        await loadQcReport(jobId);
+        if (state.qcStartedJobId === jobId) {
+          state.qcStartedJobId = null;
+          closeAutoFilterDialog();
+          applyWorkspaceMode('filter');
+          showToast(t('qcInlineCompleted'));
+        }
+      } else if (['queued', 'running', 'paused'].includes(job.status)) {
+        if (state.qcLoadedScanId !== jobId) {
+          state.qcSummary = null;
+          state.qcOverviewByEpisode = new Map();
+          state.qcDetailByEpisode = new Map();
+          renderEpisodeList();
+          renderEpisodeHeader();
+          renderQcInlineEvidence();
+        }
+        scheduleQcPoll(job.status === 'paused' ? 3000 : 1000);
+      } else {
+        $('#qcReport')?.classList.add('hidden');
+      }
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  }
+
+  function scheduleQcPoll(delay = 1200) {
+    if (state.autoFilterPollTimer) clearTimeout(state.autoFilterPollTimer);
+    state.autoFilterPollTimer = setTimeout(async () => {
+      state.autoFilterPollTimer = null;
+      if (!state.autoFilterJobId) return;
+      await selectQcJob(state.autoFilterJobId);
+    }, delay);
+  }
+
+  function renderQcJob(job) {
+    const progress = $('#qcProgress');
+    const actions = $('#qcJobActions');
+    if (!job) {
+      state.qcCurrentJob = null;
+      progress?.classList.add('hidden');
+      actions?.classList.add('hidden');
+      renderQcInlineEvidence();
+      return;
+    }
+    state.qcCurrentJob = job;
+    const ratio = Math.max(0, Math.min(1, Number(job.progress) || 0));
+    const pct = Math.round(ratio * 100);
+    progress?.classList.remove('hidden');
+    if (progress) {
+      progress.querySelector('i').style.width = `${pct}%`;
+      progress.querySelector('span').textContent = `${statusLabel(job.status)} · ${job.current || 0}/${job.total || 0} · ${pct}%${job.message ? ` · ${job.message}` : ''}`;
+    }
+    const active = ['queued', 'running', 'paused'].includes(job.status);
+    actions?.classList.toggle('hidden', !active);
+    $('#pauseQcScan').classList.toggle('hidden', job.status === 'paused');
+    $('#resumeQcScan').classList.toggle('hidden', job.status !== 'paused');
+    if (job.status === 'failed') showToast(job.error || job.message || t('qcScanFailed'), true);
+    if (!state.qcSummary) renderQcInlineEvidence();
+  }
+
+  async function controlQcScan(action) {
+    if (!state.autoFilterJobId) return;
+    try {
+      const job = await api(`/api/qc/scans/${encodeURIComponent(state.autoFilterJobId)}/${action}`, {
+        method: 'POST', body: '{}',
+      });
+      renderQcJob(job);
+      if (action !== 'cancel') scheduleQcPoll(500);
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  }
+
+  async function loadQcReport(scanId) {
+    state.autoFilterJobId = scanId;
+    const summary = await api(`/api/qc/scans/${encodeURIComponent(scanId)}/summary`);
+    if (state.autoFilterJobId !== scanId) return;
+    state.qcSummary = summary;
+    state.qcLoadedScanId = scanId;
+    state.qcDetailByEpisode = new Map();
+    state.qcActiveFindingId = null;
+    $('#qcReport').classList.remove('hidden');
+    renderQcSummary();
+    await Promise.all([
+      queryQcEpisodes(0),
+      loadQcEpisodeOverview(scanId),
+    ]);
+    await loadQcInlineEvidence(state.currentEpisode, { force: true });
+  }
+
+  function renderQcSummary() {
+    const totals = state.qcSummary?.totals || {};
+    const cards = [
+      [t('qcEpisodes'), totals.episodes || 0, ''],
+      [t('qcInvalid'), totals.invalid || 0, 'invalid'],
+      [t('qcAverageQuality'), Number(totals.averageQuality || 0).toFixed(1), 'good'],
+      [t('qcAverageUsable'), `${Number(totals.averageUsable || 0).toFixed(1)}%`, 'good'],
+      [t('qcAverageCoverage'), `${Number(totals.averageCoverage || 0).toFixed(1)}%`, ''],
+    ];
+    $('#qcSummaryCards').innerHTML = cards.map(([label, value, css]) =>
+      `<div class="qc-summary-card ${css}"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join('');
+    const issues = state.qcSummary?.issues || [];
+    const issueHtml = issues.length
+      ? issues.map((item) => `<span class="qc-issue-chip ${escapeAttr(item.severity)}"><b>${escapeHtml(item.issueCode)}</b> ${item.count} · ${item.episodes} ep</span>`).join('')
+      : `<span class="muted">${escapeHtml(t('qcNoFindings'))}</span>`;
+    const detectorHtml = (state.qcSummary?.detectors || []).map((detector) => {
+      const coverage = detector.coverage == null ? '—' : `${Number(detector.coverage).toFixed(0)}%`;
+      const skipped = Number(detector.skippedCount) || 0;
+      const failed = Number(detector.failedCount) || 0;
+      const css = failed ? 'error' : skipped ? 'warning' : '';
+      const details = `${coverage}${skipped ? ` · ${t('qcSkippedCount', { n: skipped })}` : ''}${failed ? ` · ${t('qcFailedCount', { n: failed })}` : ''}`;
+      return `<span class="qc-issue-chip detector ${css}" data-tip="${escapeAttr(detector.skipReason || '')}"><b>${escapeHtml(detector.detectorId)}</b> ${escapeHtml(details)}</span>`;
+    }).join('');
+    $('#qcIssueSummary').innerHTML = `${issueHtml}${detectorHtml}`;
+    const checked = new Set($$('#qcIssueFilters input:checked').map((input) => input.value));
+    $('#qcIssueFilters').innerHTML = issues.map((item) => `<label>
+      <input type="checkbox" value="${escapeAttr(item.issueCode)}"${checked.has(item.issueCode) ? ' checked' : ''}>
+      <span>${escapeHtml(item.issueCode)} (${item.episodes})</span>
+    </label>`).join('');
+  }
+
+  function qcFilters({ paginate = true } = {}) {
+    const numberOrNull = (selector) => {
+      const raw = $(selector)?.value;
+      return raw === '' || raw == null ? null : Number(raw);
+    };
+    return {
+      search: $('#qcSearch')?.value.trim() || '',
+      integrityStatus: $('#qcIntegrityFilter')?.value || null,
+      decision: $('#qcDecisionFilter')?.value || null,
+      minimumQuality: numberOrNull('#qcMinQuality'),
+      minimumUsable: numberOrNull('#qcMinUsable'),
+      issueCodes: $$('#qcIssueFilters input:checked').map((input) => input.value),
+      ...(paginate ? { limit: 100, offset: state.qcOffset } : {}),
+    };
+  }
+
+  async function queryQcEpisodes(offset = 0) {
+    if (!state.autoFilterJobId) return;
+    state.qcOffset = Math.max(0, Number(offset) || 0);
+    try {
+      const page = await api(`/api/qc/scans/${encodeURIComponent(state.autoFilterJobId)}/episodes/query`, {
+        method: 'POST', body: JSON.stringify({ filters: qcFilters() }),
+      });
+      state.qcPage = page;
+      renderQcEpisodeTable();
+      renderQcPagination();
+      $('#qcSelectionCount').textContent = t('qcSelectionCount', { n: page.total || 0 });
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  }
+
+  function effectiveQcDecision(episode) {
+    return episode.manualDecision || episode.autoDecision || 'review';
+  }
+
+  function renderQcEpisodeTable() {
+    const rows = state.qcPage?.episodes || [];
+    $('#qcEpisodeTable').innerHTML = rows.length ? rows.map((episode) => {
+      const decision = effectiveQcDecision(episode);
+      const issues = (episode.issues || []).map((item) => `<span class="severity-${escapeAttr(item.severity)}">${escapeHtml(item.issueCode)}${item.count > 1 ? ` ×${item.count}` : ''}</span>`).join('');
+      return `<button class="qc-episode-row ${escapeAttr(episode.integrityStatus)}${state.qcSelectedEpisode === episode.episodeIndex ? ' selected' : ''}" data-qc-episode="${episode.episodeIndex}">
+        <span><strong>Episode ${episode.episodeIndex}</strong><small>${escapeHtml(episode.taskText || t('noTask'))}</small></span>
+        <span class="qc-score"><b>${Number(episode.qualityScore).toFixed(1)}</b><small>${escapeHtml(t('qualityScore'))}</small></span>
+        <span class="qc-score"><b>${Number(episode.usableRatio).toFixed(1)}%</b><small>${escapeHtml(t('qcAverageUsable'))}</small></span>
+        <span class="qc-status ${escapeAttr(episode.integrityStatus)}">${escapeHtml(episode.integrityStatus === 'invalid' ? t('qcInvalid') : t('qcValid'))}</span>
+        <span class="qc-status ${escapeAttr(decision)}">${escapeHtml(stateLabel(decision))}</span>
+        <span class="qc-row-issues">${issues || escapeHtml(t('qcNoFindings'))}</span>
+      </button>`;
+    }).join('') : `<div class="empty">${escapeHtml(t('noMatchingEpisode'))}</div>`;
+  }
+
+  function renderQcPagination() {
+    const page = state.qcPage || { total: 0, limit: 100, offset: 0 };
+    const current = Math.floor(page.offset / page.limit) + 1;
+    const totalPages = Math.max(1, Math.ceil(page.total / page.limit));
+    $('#qcPagination').innerHTML = `<button data-qc-page="${Math.max(0, page.offset - page.limit)}"${page.offset <= 0 ? ' disabled' : ''}>${escapeHtml(t('qcPrevious'))}</button>
+      <span>${escapeHtml(t('qcPage', { current, total: totalPages }))}</span>
+      <button data-qc-page="${page.offset + page.limit}"${page.offset + page.limit >= page.total ? ' disabled' : ''}>${escapeHtml(t('qcNext'))}</button>`;
+  }
+
+  function onQcEpisodeTableClick(event) {
+    const row = event.target.closest('[data-qc-episode]');
+    if (row) loadQcEpisodeDetail(Number(row.dataset.qcEpisode));
+  }
+
+  function onQcPaginationClick(event) {
+    const button = event.target.closest('[data-qc-page]');
+    if (button && !button.disabled) queryQcEpisodes(Number(button.dataset.qcPage));
+  }
+
+  async function loadQcEpisodeDetail(episodeIndex) {
+    if (!state.autoFilterJobId || !Number.isInteger(episodeIndex)) return;
+    state.qcSelectedEpisode = episodeIndex;
+    renderQcEpisodeTable();
+    const panel = $('#qcEpisodeDetail');
+    panel.innerHTML = `<div class="empty">${escapeHtml(t('busyDefault'))}</div>`;
+    try {
+      const detail = await api(`/api/qc/scans/${encodeURIComponent(state.autoFilterJobId)}/episodes/${episodeIndex}`);
+      state.qcDetailByEpisode.set(episodeIndex, detail);
+      if (state.qcSelectedEpisode === episodeIndex) renderQcEpisodeDetail(detail);
+      if (state.currentEpisode === episodeIndex) renderQcInlineEvidence(detail);
+    } catch (error) {
+      panel.innerHTML = `<div class="empty error">${escapeHtml(error.message)}</div>`;
+    }
+  }
+
+  function renderQcEpisodeDetail(detail) {
+    const episode = detail.episode;
+    const decision = effectiveQcDecision(episode);
+    const findings = detail.findings || [];
+    const detectorSkips = (detail.detectors || []).filter((item) => item.status === 'skipped' || item.status === 'failed');
+    const findingHtml = findings.length ? findings.map((finding) => {
+      const start = finding.adjustedStartS ?? finding.startS;
+      const end = finding.adjustedEndS ?? finding.endS;
+      const code = finding.adjustedIssueCode || finding.issueCode;
+      const severity = finding.adjustedSeverity || finding.severity;
+      const where = [finding.cameraKey, finding.signalKey].filter(Boolean).join(' · ');
+      const interval = start == null ? t('qcWholeEpisode') : `${Number(start).toFixed(2)}s – ${Number(end ?? start).toFixed(2)}s`;
+      const reviewStatus = finding.reviewStatus || 'unreviewed';
+      return `<article class="qc-finding ${escapeAttr(severity)}">
+        <header class="qc-finding-head"><strong>${escapeHtml(code)}</strong><span>${escapeHtml(severity)} · ${Math.round(Number(finding.confidence || 0) * 100)}%</span></header>
+        <div class="qc-finding-meta">${escapeHtml(interval)}${where ? ` · ${escapeHtml(where)}` : ''}</div>
+        <p>${escapeHtml(finding.explanation || '')}</p>
+        <details><summary>${escapeHtml(t('qcMetrics'))}</summary><pre>${escapeHtml(JSON.stringify({ metrics: finding.metrics, threshold: finding.threshold }, null, 2))}</pre></details>
+        <footer class="qc-finding-actions">
+          ${start == null ? '' : `<button data-qc-seek="${Number(start)}" data-qc-seek-episode="${episode.episodeIndex}">${escapeHtml(t('qcViewEvidence'))}</button>`}
+          <button class="qc-review-choice confirmed${reviewStatus === 'confirmed' ? ' active' : ''}" data-qc-review="confirmed" data-finding="${escapeAttr(finding.findingId)}" aria-pressed="${reviewStatus === 'confirmed'}">${escapeHtml(t('qcConfirmIssue'))}</button>
+          <button class="qc-review-choice rejected${reviewStatus === 'rejected' ? ' active' : ''}" data-qc-review="rejected" data-finding="${escapeAttr(finding.findingId)}" aria-pressed="${reviewStatus === 'rejected'}">${escapeHtml(t('qcRejectIssue'))}</button>
+          <span class="qc-review-state review-${escapeAttr(reviewStatus)}">${escapeHtml(qcFindingReviewLabel(reviewStatus))}</span>
+        </footer>
+      </article>`;
+    }).join('') : `<div class="empty">${escapeHtml(t('qcNoFindings'))}</div>`;
+    const skipHtml = detectorSkips.length
+      ? `<details class="qc-skips"><summary>${escapeHtml(t('qcSkippedDetectors', { n: detectorSkips.length }))}</summary>${detectorSkips.map((item) => `<p><b>${escapeHtml(item.detectorId)}</b>: ${escapeHtml(item.skipReason || item.status)}</p>`).join('')}</details>`
+      : '';
+    $('#qcEpisodeDetail').innerHTML = `<div class="qc-detail-head">
+      <div><h3>Episode ${episode.episodeIndex}</h3><p>${escapeHtml(episode.taskText || t('noTask'))}</p></div>
+      <span class="qc-status ${escapeAttr(episode.integrityStatus)}">${escapeHtml(episode.integrityStatus === 'invalid' ? t('qcInvalid') : t('qcValid'))}</span>
+    </div>
+    <div class="qc-detail-metrics"><div><strong>${Number(episode.qualityScore).toFixed(1)}</strong><span>${escapeHtml(t('qualityScore'))}</span></div><div><strong>${Number(episode.usableRatio).toFixed(1)}%</strong><span>${escapeHtml(t('qcAverageUsable'))}</span></div><div><strong>${Number(episode.coverage).toFixed(1)}%</strong><span>${escapeHtml(t('qcAverageCoverage'))}</span></div></div>
+    <div class="qc-manual-decision"><span>${escapeHtml(t('qcManualDecision'))}: <b>${escapeHtml(stateLabel(decision))}</b></span>
+      <button data-qc-decision="pass">${escapeHtml(t('filterPass'))}</button><button data-qc-decision="review">${escapeHtml(t('filterReview'))}</button><button data-qc-decision="quarantine">${escapeHtml(t('filterQuarantine'))}</button>
+    </div>${skipHtml}<div class="qc-findings"><h4>${escapeHtml(t('qcFindings'))} (${findings.length})</h4>${findingHtml}</div>`;
+  }
+
+  async function onQcDetailClick(event) {
+    const seek = event.target.closest('[data-qc-seek]');
+    if (seek) {
+      const episodeIndex = Number(seek.dataset.qcSeekEpisode);
+      const seconds = Number(seek.dataset.qcSeek);
+      if (!state.episodeByIndex.has(episodeIndex)) return showToast(t('qcEpisodeUnavailable'), true);
+      closeAutoFilterDialog();
+      applyWorkspaceMode('filter');
+      const finding = state.qcDetailByEpisode.get(episodeIndex)?.findings?.find((item) => {
+        const start = item.adjustedStartS ?? item.startS;
+        return Math.abs(Number(start) - seconds) < 0.001;
+      });
+      const end = finding ? (finding.adjustedEndS ?? finding.endS ?? seconds + 1) : seconds + 1;
+      state.qcActiveFindingId = finding?.findingId || null;
+      playQcInterval(episodeIndex, seconds, Number(end));
+      return;
+    }
+    const review = event.target.closest('[data-qc-review]');
+    if (review) {
+      await saveQcFindingReview(review.dataset.finding, review.dataset.qcReview);
+      return;
+    }
+    const decision = event.target.closest('[data-qc-decision]');
+    if (decision) {
+      try {
+        await api(`/api/qc/scans/${encodeURIComponent(state.autoFilterJobId)}/episodes/${state.qcSelectedEpisode}/review`, {
+          method: 'POST', body: JSON.stringify({ decision: decision.dataset.qcDecision, note: '' }),
+        });
+        state.qcDetailByEpisode.delete(state.qcSelectedEpisode);
+        await loadQcEpisodeDetail(state.qcSelectedEpisode);
+        await queryQcEpisodes(state.qcOffset);
+      } catch (error) { showToast(error.message, true); }
+    }
+  }
+
+  async function exportQcSelection() {
+    if (!state.autoFilterJobId || !state.dataset) return;
+    try {
+      const selection = await api(`/api/qc/scans/${encodeURIComponent(state.autoFilterJobId)}/selection/preview`, {
+        method: 'POST', body: JSON.stringify({ filters: qcFilters({ paginate: false }) }),
+      });
+      if (selection.invalidEpisodes?.length) showToast(t('qcInvalidExcluded', { n: selection.invalidEpisodes.length }), true);
+      if (!selection.episodes?.length) return showToast(t('qcNoExportable'), true);
+      openExportDialog({
+        fixedEpisodes: selection.episodes,
+        invalidCount: selection.invalidEpisodes?.length || 0,
+        suffix: '_qc_filtered',
+        source: 'qc',
+      });
+    } catch (error) { showToast(error.message, true); }
+  }
+
+  function downloadQcReport(kind) {
+    if (!state.autoFilterJobId) return;
+    window.open(`/api/qc/scans/${encodeURIComponent(state.autoFilterJobId)}/export-report?kind=${encodeURIComponent(kind)}`, '_blank', 'noopener');
+  }
+
+  let exportCapabilities = new Map();
+
+  function exportDecisionCounts() {
+    const counts = { pass: 0, review: 0, quarantine: 0 };
+    (state.dataset?.episodes || []).forEach((episode) => {
+      counts[getState(episode.episodeIndex)] += 1;
+    });
+    return counts;
+  }
+
+  function exportEpisodes() {
+    const ctx = state.exportContext;
+    if (!ctx) return [];
+    if (Array.isArray(ctx.fixedEpisodes)) return [...ctx.fixedEpisodes];
+    const includeReview = Boolean($('#exportIncludeReview')?.checked);
+    return (state.dataset?.episodes || [])
+      .filter((episode) => {
+        const decision = getState(episode.episodeIndex);
+        return decision === 'pass' || (includeReview && decision === 'review');
+      })
+      .map((episode) => episode.episodeIndex)
+      .sort((a, b) => a - b);
+  }
+
+  function replaceExportSuffix(path, suffixes, nextSuffix) {
+    const lower = path.toLowerCase();
+    const matched = suffixes.find((suffix) => lower.endsWith(suffix));
+    if (matched) return `${path.slice(0, -matched.length)}${nextSuffix}`;
+    const slash = path.lastIndexOf('/');
+    const dot = path.lastIndexOf('.');
+    return dot > slash ? `${path.slice(0, dot)}${nextSuffix}` : `${path}${nextSuffix}`;
+  }
+
+  function resolvedExportPath(path, targetFormat) {
+    const value = String(path || '').trim();
+    if (!value) return '';
+    if (targetFormat === 'hdf5') return replaceExportSuffix(value, ['.hdf5', '.h5'], '.hdf5');
+    if (targetFormat === 'mcap') return replaceExportSuffix(value, ['.mcap'], '.mcap');
+    return value.replace(/\/$/, '');
+  }
+
+  function exportResultName(targetFormat) {
+    const dataset = state.dataset;
+    const suffix = state.exportContext?.suffix || '_filtered';
+    let name = String(dataset?.name || 'dataset').replace(/\/$/, '');
+    if (dataset?.format === 'hdf5') name = name.replace(/\.(hdf5|h5)$/i, '');
+    if (dataset?.format === 'mcap') name = name.replace(/\.mcap$/i, '');
+    return resolvedExportPath(`${name}${suffix}`, targetFormat);
+  }
+
+  function dirname(path) {
+    const clean = String(path || '').replace(/\/+$/, '');
+    const index = clean.lastIndexOf('/');
+    if (index <= 0) return '/';
+    return clean.slice(0, index);
+  }
+
+  function joinServerPath(directory, name) {
+    return `${String(directory || '/').replace(/\/+$/, '') || '/'}${directory === '/' ? '' : '/'}${name}`;
+  }
+
+  function suggestedExportPath(targetFormat) {
+    const ctx = state.exportContext;
+    if (ctx?.chosenDirectory) return joinServerPath(ctx.chosenDirectory, exportResultName(targetFormat));
+    const source = String(state.dataset?.path || '').replace(/\/+$/, '');
+    const suffix = ctx?.suffix || '_filtered';
+    let base = source;
+    if (state.dataset?.format === 'hdf5') base = base.replace(/\.(hdf5|h5)$/i, '');
+    if (state.dataset?.format === 'mcap') base = base.replace(/\.mcap$/i, '');
+    return resolvedExportPath(`${base}${suffix}`, targetFormat);
+  }
+
+  function formatCapabilityText(info) {
+    if (!info?.fidelity) return '';
+    const fidelityText = info.fidelity === 'full'
+      ? t('fidelityFull')
+      : info.fidelity === 'high' ? t('fidelityHigh') : t('fidelityPartial');
+    const notes = (info.notes || []).map((note) => {
+      const translated = t(`convertNote_${note}`);
+      return translated === `convertNote_${note}` ? note : translated;
+    }).join('；');
+    return notes ? `${fidelityText} · ${notes}` : fidelityText;
+  }
+
+  async function loadExportCapabilities(sourceFormat) {
+    exportCapabilities = new Map();
+    try {
+      const result = await api(`/api/convert/targets?sourceFormat=${encodeURIComponent(sourceFormat || '')}`);
+      (result.formats || []).forEach((item) => exportCapabilities.set(item.id, item));
+    } catch {}
+    if (!exportCapabilities.has(sourceFormat)) {
+      exportCapabilities.set(sourceFormat, {
+        id: sourceFormat,
+        label: state.dataset?.formatLabel || sourceFormat,
+        fidelity: 'full',
+        notes: ['sameFormatLossless'],
+      });
+    }
+    const target = $('#exportTarget');
+    if (!target) return;
+    target.innerHTML = [...exportCapabilities.values()]
+      .map((item) => `<option value="${escapeAttr(item.id)}">${escapeHtml(item.label || item.id)}</option>`)
+      .join('');
+    target.value = sourceFormat;
+    if (!target.value && target.options.length) target.selectedIndex = 0;
+    if (state.exportContext && !state.exportContext.outputTouched) {
+      $('#exportOutput').value = suggestedExportPath(target.value);
+    }
+    renderExportDialog();
+  }
+
+  function openExportDialog(options = {}) {
+    if (!state.dataset) return showToast(t('needConvertDataset'), true);
+    state.exportContext = {
+      fixedEpisodes: Array.isArray(options.fixedEpisodes)
+        ? [...new Set(options.fixedEpisodes.map(Number).filter(Number.isInteger))].sort((a, b) => a - b)
+        : null,
+      invalidCount: Number(options.invalidCount) || 0,
+      suffix: options.suffix || '_filtered',
+      source: options.source || 'review',
+      outputTouched: false,
+      chosenDirectory: null,
+      browserPath: null,
+      browserParent: null,
+    };
+    const fixed = Array.isArray(state.exportContext.fixedEpisodes);
+    $('#exportSource').textContent = state.dataset.path;
+    $('#exportSourceFormat').textContent = state.dataset.formatLabel || state.dataset.format || '—';
+    $('#exportIncludeReviewLabel').classList.toggle('hidden', fixed);
+    $('#exportFixedSelectionHint').classList.toggle('hidden', !fixed);
+    if (fixed) $('#exportFixedSelectionHint').textContent = t('exportFixedSelectionHint');
+    $('#exportIncludeReview').checked = false;
+    $('#exportMediaMode').value = 'hardlink';
+    $('#exportCopyLabels').checked = true;
+    $('#exportPathBrowser').classList.add('hidden');
+    $('#exportOutput').value = suggestedExportPath(state.dataset.format);
+    $('#startExport').disabled = false;
+    $('#exportDialog').classList.remove('hidden');
+    renderExportDialog();
+    loadExportCapabilities(state.dataset.format).catch(() => {});
+  }
+
+  function closeExportDialog() {
+    $('#exportDialog')?.classList.add('hidden');
+    state.exportContext = null;
+  }
+
+  function renderExportDialog() {
+    if (!state.exportContext || !state.dataset) return;
+    const counts = exportDecisionCounts();
+    const selected = exportEpisodes();
+    const fixed = Array.isArray(state.exportContext.fixedEpisodes);
+    const stats = fixed
+      ? [
+        [selected.length, t('exportStatSelected'), 'good'],
+        [state.dataset.totalEpisodes || state.dataset.episodes.length, t('exportStatTotal'), ''],
+        [Math.max(0, (state.dataset.totalEpisodes || 0) - selected.length), t('exportStatFilteredOut'), 'warn'],
+        [state.exportContext.invalidCount, t('exportStatInvalid'), 'bad'],
+      ]
+      : [
+        [selected.length, t('exportStatSelected'), 'good'],
+        [counts.pass, t('filterPass'), 'good'],
+        [counts.review, t('filterReview'), 'warn'],
+        [counts.quarantine, t('filterQuarantine'), 'bad'],
+      ];
+    $('#exportScopeStats').innerHTML = stats.map(([value, label, cls]) =>
+      `<div class="export-scope-stat ${cls}"><strong>${value}</strong><span>${escapeHtml(label)}</span></div>`
+    ).join('');
+
+    const targetFormat = $('#exportTarget')?.value || state.dataset.format;
+    const capability = exportCapabilities.get(targetFormat);
+    const fidelity = $('#exportFidelity');
+    fidelity.textContent = formatCapabilityText(capability) || t('exportCapabilityLoading');
+    fidelity.classList.toggle('partial', capability?.fidelity === 'partial');
+    const output = $('#exportOutput')?.value.trim() || '';
+    const resolved = resolvedExportPath(output, targetFormat);
+    const absoluteOutput = output.startsWith('/');
+    const mediaMode = $('#exportMediaMode')?.value || 'hardlink';
+    const copyLabels = Boolean($('#exportCopyLabels')?.checked);
+    $('#exportReviewCount').textContent = String(selected.length);
+    $('#exportReviewFormat').textContent = capability?.label || $('#exportTarget')?.selectedOptions?.[0]?.textContent || targetFormat;
+    $('#exportReviewMedia').textContent = t(mediaMode === 'copy' ? 'exportMediaCopyShort' : 'exportMediaHardlinkShort');
+    $('#exportReviewLabels').textContent = t(copyLabels ? 'yes' : 'no');
+    $('#exportResolvedOutput').textContent = resolved || t('exportPathMissing');
+    $('#exportReviewNotice').textContent = !absoluteOutput
+      ? t('exportAbsolutePathRequired')
+      : targetFormat === state.dataset.format ? t('exportSameFormatNotice') : t('exportConvertNotice');
+    $('#exportReviewNotice').classList.toggle('error', Boolean(output && !absoluteOutput));
+    $('#startExport').disabled = !selected.length || !output || !absoluteOutput;
+  }
+
+  function openExportPathBrowser() {
+    if (!state.exportContext) return;
+    const browser = $('#exportPathBrowser');
+    if (!browser.classList.contains('hidden')) {
+      browser.classList.add('hidden');
+      return;
+    }
+    browser.classList.remove('hidden');
+    const start = state.exportContext.browserPath || dirname($('#exportOutput').value) || state.browseRoot;
+    browseExportDirectory(start);
+  }
+
+  async function browseExportDirectory(path) {
+    if (!state.exportContext) return;
+    const list = $('#exportBrowserList');
+    list.innerHTML = `<div class="export-browser-empty">${escapeHtml(t('loading'))}</div>`;
+    try {
+      const result = await api(`/api/list?path=${encodeURIComponent(path)}`);
+      if (!state.exportContext) return;
+      state.exportContext.browserPath = result.path;
+      state.exportContext.browserParent = result.parent;
+      $('#exportBrowserPath').textContent = result.path;
+      $('#exportBrowserParent').disabled = !result.parent;
+      const directories = (result.entries || []).filter((entry) => entry.isDir !== false);
+      list.innerHTML = directories.length
+        ? directories.map((entry) => `<button type="button" class="export-browser-entry" data-export-directory="${escapeAttr(entry.path)}"><span>▰</span><span>${escapeHtml(entry.name)}</span></button>`).join('')
+        : `<div class="export-browser-empty">${escapeHtml(t('exportNoSubdirectories'))}</div>`;
+    } catch (error) {
+      list.innerHTML = `<div class="export-browser-empty error">${escapeHtml(error.message)}</div>`;
+    }
+  }
+
+  function useCurrentExportDirectory() {
+    const directory = state.exportContext?.browserPath;
+    if (!directory) return;
+    state.exportContext.chosenDirectory = directory;
+    state.exportContext.outputTouched = false;
+    $('#exportOutput').value = suggestedExportPath($('#exportTarget').value);
+    $('#exportPathBrowser').classList.add('hidden');
+    renderExportDialog();
+  }
+
+  async function startExport() {
+    if (!state.exportContext || !state.dataset) return;
+    const episodes = exportEpisodes();
+    const output = $('#exportOutput').value.trim();
+    if (!episodes.length) return showToast(t('needPassEpisode'), true);
+    if (!output) return showToast(t('needOutputPath'), true);
+    if (!output.startsWith('/')) return showToast(t('exportAbsolutePathRequired'), true);
+    const button = $('#startExport');
+    button.disabled = true;
+    try {
+      const job = await api('/api/create', {
+        method: 'POST',
+        body: JSON.stringify({
+          dataset: state.dataset.path,
+          output,
+          episodes,
+          mediaMode: $('#exportMediaMode').value,
+          targetFormat: $('#exportTarget').value || state.dataset.format,
+          copyLabels: $('#exportCopyLabels').checked,
+        }),
+      });
+      closeExportDialog();
+      showToast(t('exportStarted', { n: episodes.length, id: String(job.jobId || '').slice(0, 8) }));
+      await refreshConvertJobs();
+      trackConvertJob(job.jobId);
+    } catch (error) {
+      showToast(error.message, true);
+      button.disabled = false;
+    }
   }
 
   function openConvertDialog(pathOrEvent, formatHint) {
@@ -1546,6 +2608,7 @@
   function statusLabel(status) {
     if (status === 'queued') return t('convertStatusQueued');
     if (status === 'running') return t('convertStatusRunning');
+    if (status === 'paused') return t('qcPaused');
     if (status === 'completed') return t('convertStatusDone');
     if (status === 'failed') return t('convertStatusFailed');
     if (status === 'cancelled') return t('jobStatusCancelled');
@@ -2370,42 +3433,10 @@
     }
   }
 
-  async function createDataset() {
-    const episodes = Object.entries(state.states)
-      .filter(([, value]) => normalizeDecision(value) === 'pass')
-      .map(([key]) => Number(key))
-      .sort((a, b) => a - b);
-    if (!episodes.length) return showToast(t('needPassEpisode'), true);
-    const output = prompt(t('exportPathPrompt'), `${state.dataset.path}_filtered`);
-    if (!output) return;
-    const doConvert = confirm(t('exportConvertConfirm'));
-    let targetFormat = null;
-    if (doConvert) {
-      targetFormat = prompt(t('targetFormatPrompt'), state.dataset.format === 'lerobot_v3' ? 'lerobot_v21' : 'lerobot_v3');
-      if (!targetFormat) return;
-    }
-    const copy = confirm(t('mediaModeConfirm'));
-    if (!confirm(t('exportConfirm', { n: episodes.length }))) return;
-    setBusy(true, t('exporting'), `${episodes.length} episodes`);
-    try {
-      const job = await api('/api/create', {
-        method: 'POST',
-        body: JSON.stringify({
-          dataset: state.dataset.path,
-          output,
-          episodes,
-          mediaMode: copy ? 'copy' : 'hardlink',
-          targetFormat,
-          copyLabels: true,
-        }),
-      });
-      // Export now runs as a detached background job; progress shows in the
-      // convert job dock instead of blocking this request.
-      showToast(t('convertBgStarted', { id: String(job.jobId || '').slice(0, 8) }));
-      await refreshConvertJobs();
-      trackConvertJob(job.jobId);
-    } catch (error) { showToast(error.message, true); }
-    finally { setBusy(false); }
+  function createDataset() {
+    const counts = exportDecisionCounts();
+    if (!counts.pass) return showToast(t('needPassEpisode'), true);
+    openExportDialog();
   }
 
   function setEpisodeReady(ready, message = '') {
@@ -2458,7 +3489,15 @@
     return 0;
   }
 
-  function togglePlay() { state.playing ? pauseAll() : playAll(); }
+  function togglePlay() {
+    if (state.playing) {
+      pauseAll();
+      return;
+    }
+    state.qcPlaybackEnd = null;
+    state.qcPlaybackToken += 1;
+    playAll();
+  }
 
   async function playAll() {
     const videos = getVideos();
@@ -2492,6 +3531,8 @@
 
   function beginTimelineSeek() {
     if (state.timelineDragging) return;
+    state.qcPlaybackEnd = null;
+    state.qcPlaybackToken += 1;
     state.timelineDragging = true;
     state.resumeAfterSeek = state.playing;
     state.pendingSeekSeconds = Number($('#timeline').value);
@@ -2574,6 +3615,14 @@
     const episode = currentEpisode();
     if (!master || !episode) return;
     const relative = Math.max(0, master.currentTime - Number(master.dataset.start || 0));
+    if (Number.isFinite(state.qcPlaybackEnd) && relative >= state.qcPlaybackEnd - 0.015) {
+      const stopAt = state.qcPlaybackEnd;
+      state.qcPlaybackEnd = null;
+      state.qcPlaybackToken += 1;
+      seekAll(stopAt);
+      pauseAll();
+      return;
+    }
     if (relative >= episode.duration) { seekAll(episode.duration); pauseAll(); return; }
     videos.forEach((video) => {
       if (video === master) return;
@@ -2604,6 +3653,10 @@
 
   function onKeyDown(event) {
     if ($('#review').classList.contains('hidden')) return;
+    if (!$('#exportDialog')?.classList.contains('hidden')) {
+      if (event.key === 'Escape') closeExportDialog();
+      return;
+    }
     if (['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target.tagName)) return;
     const key = event.key.toLowerCase();
     const mode = state.workspaceMode;
@@ -2633,9 +3686,44 @@
     return out;
   }
 
+  const QUARANTINE_REASON_KEYS = new Set([
+    'task_failed', 'unsafe_collision', 'human_intervention', 'poor_execution', 'sensor_data', 'other',
+  ]);
+
+  function normalizeQuarantineReason(reason) {
+    const value = String(reason || '').trim();
+    return QUARANTINE_REASON_KEYS.has(value) ? value : '';
+  }
+
+  function normalizeQuarantineReasons(reasons) {
+    const out = {};
+    Object.entries(reasons || {}).forEach(([key, value]) => {
+      const normalized = normalizeQuarantineReason(value);
+      if (normalized) out[key] = normalized;
+    });
+    return out;
+  }
+
+  function quarantineReasonLabel(reason) {
+    const labels = {
+      task_failed: 'quarantineReasonTaskFailed',
+      unsafe_collision: 'quarantineReasonUnsafeCollision',
+      human_intervention: 'quarantineReasonHumanIntervention',
+      poor_execution: 'quarantineReasonPoorExecution',
+      sensor_data: 'quarantineReasonSensorData',
+      other: 'quarantineReasonOther',
+    };
+    return labels[reason] ? t(labels[reason]) : reason;
+  }
+
   function getState(index) { return normalizeDecision(state.states[index] || 'review'); }
-  function saveLocalStates() { localStorage.setItem(`embody-review:${state.dataset.path}`, JSON.stringify(state.states)); }
+  function getQuarantineReason(index) { return normalizeQuarantineReason(state.quarantineReasons[index]); }
+  function saveLocalStates() {
+    localStorage.setItem(`embody-review:${state.dataset.path}`, JSON.stringify(state.states));
+    localStorage.setItem(`embody-quarantine-reasons:${state.dataset.path}`, JSON.stringify(state.quarantineReasons));
+  }
   function loadLocalStates(path) { try { return JSON.parse(localStorage.getItem(`embody-review:${path}`) || '{}'); } catch { return {}; } }
+  function loadLocalQuarantineReasons(path) { try { return JSON.parse(localStorage.getItem(`embody-quarantine-reasons:${path}`) || '{}'); } catch { return {}; } }
   function updateTimeLabel(value) { $('#timeLabel').textContent = `${formatTime(value)} / ${formatTime(currentEpisode()?.duration || 0)}`; }
   function setStatus(message, error = false) { $('#status').textContent = message; $('#status').classList.toggle('error', error); }
 

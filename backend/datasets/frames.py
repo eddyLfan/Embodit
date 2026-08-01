@@ -36,6 +36,21 @@ class FrameSource:
     def iter_rgb(self) -> Iterator[np.ndarray]:
         raise NotImplementedError
 
+    def iter_rgb_samples(self, stride: int = 1) -> Iterator[tuple[int, np.ndarray | None]]:
+        """Decode every frame but only retain pixels at the requested stride.
+
+        Generic frame stores already materialize each image, but downstream QC
+        can still avoid expensive color conversion and image metrics. Video
+        sources override this method so unsampled AV frames never become RGB
+        arrays at all.
+        """
+        stride = max(1, int(stride))
+        for index, frame in enumerate(self.iter_rgb()):
+            array = np.asarray(frame)
+            if array.ndim != 3 or array.shape[2] < 3:
+                raise ValueError(f"非法 frame shape: {array.shape}")
+            yield index, array if index % stride == 0 else None
+
     def load_rgb(self) -> np.ndarray:
         """Materialize all frames as one (T, H, W, 3) uint8 array."""
         frames = list(self.iter_rgb())
@@ -62,7 +77,8 @@ class Mp4FrameSource(FrameSource):
         if not self.video_path.is_file():
             raise FileNotFoundError(f"视频文件不存在：{self.video_path}")
 
-    def iter_rgb(self) -> Iterator[np.ndarray]:
+    def iter_rgb_samples(self, stride: int = 1) -> Iterator[tuple[int, np.ndarray | None]]:
+        stride = max(1, int(stride))
         import av
 
         container = av.open(str(self.video_path))
@@ -87,7 +103,8 @@ class Mp4FrameSource(FrameSource):
                         continue
                 if self.expected_frames and yielded >= self.expected_frames:
                     break
-                yield frame.to_ndarray(format="rgb24")
+                pixels = frame.to_ndarray(format="rgb24") if yielded % stride == 0 else None
+                yield yielded, pixels
                 yielded += 1
         finally:
             container.close()
@@ -95,6 +112,11 @@ class Mp4FrameSource(FrameSource):
             raise RuntimeError(
                 f"{self.video_path}: episode expected {self.expected_frames} frames, decoded {yielded}"
             )
+
+    def iter_rgb(self) -> Iterator[np.ndarray]:
+        for _index, frame in self.iter_rgb_samples(1):
+            if frame is not None:
+                yield frame
 
 
 class AdapterFrameSource(FrameSource):

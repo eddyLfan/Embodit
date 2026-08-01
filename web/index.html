@@ -64,7 +64,7 @@
       <button id="loadProgress" data-i18n="loadProgress">载入进度</button>
       <button id="saveProgress" data-i18n="saveProgress">保存进度</button>
       <button id="createDataset" class="primary" data-i18n="exportDataset">导出数据集</button>
-      <span class="mode-toolbar-note" data-i18n="autoFilterReservedNote">自动筛选功能预留中</span>
+      <button id="openAutoFilter" class="primary" data-i18n="autoFilterOpen">自动质检</button>
     </section>
 
     <section class="review-workspace">
@@ -93,6 +93,24 @@
 
       <section class="viewer">
         <div id="episodeHeader" class="episode-header"></div>
+        <div class="decision-bar mode-only-filter" aria-label="手动筛选" data-i18n-aria="manualScreening">
+          <span class="decision-bar-label" data-i18n="manualScreening">手动筛选</span>
+          <button class="decision keep" data-state="pass" data-i18n="decisionPass">✓ 通过 <kbd>K</kbd></button>
+          <button class="decision pending" data-state="review" data-i18n="decisionReview">? 待审 <kbd>U</kbd></button>
+          <button class="decision exclude" data-state="quarantine" data-i18n="decisionQuarantine">× 隔离 <kbd>X</kbd></button>
+          <label class="quarantine-reason-field">
+            <span data-i18n="quarantineReasonLabel">不合格原因</span>
+            <select id="quarantineReason">
+              <option value="" data-i18n="quarantineReasonNone">可选</option>
+              <option value="task_failed" data-i18n="quarantineReasonTaskFailed">任务未完成</option>
+              <option value="unsafe_collision" data-i18n="quarantineReasonUnsafeCollision">碰撞或不安全行为</option>
+              <option value="human_intervention" data-i18n="quarantineReasonHumanIntervention">人工干预</option>
+              <option value="poor_execution" data-i18n="quarantineReasonPoorExecution">执行质量差</option>
+              <option value="sensor_data" data-i18n="quarantineReasonSensorData">传感器或数据异常</option>
+              <option value="other" data-i18n="quarantineReasonOther">其他</option>
+            </select>
+          </label>
+        </div>
         <div class="strip-wrap">
           <div id="videoStrip" class="video-strip"></div>
           <div id="splitColumns" class="col-handle" role="separator" aria-orientation="vertical" tabindex="0" data-i18n-title="resizeHead" title="拖动调整主画面宽度 · 双击复位"></div>
@@ -101,11 +119,15 @@
         <div id="splitStrip" class="splitter splitter-row" role="separator" aria-orientation="horizontal" tabindex="0" data-i18n-title="resizeStrip" title="拖动调整视频区高度 · 双击复位"></div>
         <div class="transport">
           <button id="playPause" class="play-button">▶</button>
-          <input id="timeline" type="range" min="0" max="1" value="0" step="0.001">
+          <div class="timeline-stack">
+            <input id="timeline" type="range" min="0" max="1" value="0" step="0.001">
+            <div id="qcTimelineOverlay" class="qc-timeline-overlay mode-only-filter" aria-label="自动质检异常区间"></div>
+          </div>
           <span id="timeLabel">00:00.000 / 00:00.000</span>
           <button id="previousEpisode" data-i18n="prevEpisode">← 上一个</button>
           <button id="nextEpisode" data-i18n="nextEpisode">下一个 →</button>
         </div>
+        <section id="qcEvidencePanel" class="qc-evidence-panel mode-only-filter" aria-live="polite"></section>
         <section id="signalPanel" class="signal-panel mode-only-browse-annotate">
           <div class="signal-prompt">
             <span class="signal-label" data-i18n="promptLabel">Prompt</span>
@@ -128,11 +150,6 @@
             <div id="trajReadout" class="traj-readout muted"></div>
           </div>
         </section>
-        <div class="decision-bar mode-only-filter">
-          <button class="decision keep" data-state="pass" data-i18n="decisionPass">✓ 通过 <kbd>K</kbd></button>
-          <button class="decision pending" data-state="review" data-i18n="decisionReview">? 待审 <kbd>U</kbd></button>
-          <button class="decision exclude" data-state="quarantine" data-i18n="decisionQuarantine">× 隔离 <kbd>X</kbd></button>
-        </div>
         <aside id="labelPanel" class="label-panel mode-only-annotate">
           <div class="label-title" data-i18n="labelPanelTitle">打分与标注</div>
           <div class="label-row">
@@ -185,10 +202,123 @@
   <div id="toast" class="toast hidden"></div>
 
   <div id="autoFilterDialog" class="modal hidden">
-    <section class="modal-card">
-      <div class="modal-title"><div><h2 data-i18n="autoFilterTitle">自动筛选（预留）</h2><p data-i18n="autoFilterDesc">筛选标准尚未确认，本期不实现规则引擎。</p></div><button id="closeAutoFilter" data-i18n="close">关闭</button></div>
-      <p class="muted-block" data-i18n="autoFilterBody">接入后将基于 UnifiedView 的 state/action（及可选视频）产出建议态与时间轴证据，经人工确认后再导出。参考实现仍在 <code>demo/backend/auto_filter.py</code>。</p>
-      <div class="modal-actions"><button id="closeAutoFilter2" class="primary" data-i18n="gotIt">知道了</button></div>
+    <section class="modal-card qc-report-card">
+      <div class="modal-title">
+        <div><h2 data-i18n="autoFilterTitle">自动质检</h2><p data-i18n="autoFilterDesc">配置扫描；完成后直接在筛选页时间轴复核异常片段。</p></div>
+        <button id="closeAutoFilter" data-i18n="close">关闭</button>
+      </div>
+      <section class="qc-launch">
+        <div class="auto-filter-fields">
+          <div class="field-block"><span class="field-label" data-i18n="qcDataset">数据集</span><div id="qcDatasetPath" class="convert-source-path">—</div></div>
+          <label><span data-i18n="qcProfile">扫描配置</span><select id="qcProfile"><option value="standard" data-i18n="qcProfileStandard">标准扫描</option><option value="fast" data-i18n="qcProfileFast">快速扫描</option><option value="deep" data-i18n="qcProfileDeep">深度扫描</option></select></label>
+          <label><span data-i18n="qcEpisodeWorkers">Episode 并行</span><input id="qcEpisodeWorkers" type="number" min="1" max="16" data-i18n-placeholder="qcWorkersAuto" placeholder="默认"></label>
+          <label><span data-i18n="qcCameraWorkers">相机并行</span><input id="qcCameraWorkers" type="number" min="1" max="16" data-i18n-placeholder="qcWorkersAuto" placeholder="默认"></label>
+          <label><input id="qcRequireState" type="checkbox"> <span data-i18n="qcRequireState">将 state 设为必需</span></label>
+          <label><input id="qcUseCache" type="checkbox" checked> <span data-i18n="qcUseCache">复用匹配的扫描缓存</span></label>
+        </div>
+        <div class="qc-launch-actions">
+          <button id="startQcScan" class="primary" data-i18n="qcStart">开始扫描</button>
+          <button id="refreshQcJobs" data-i18n="refresh">刷新</button>
+          <select id="qcHistory"><option value="" data-i18n="qcNoHistory">暂无历史报告</option></select>
+        </div>
+        <div id="qcProgress" class="auto-filter-progress hidden"><div><i></i></div><span>—</span></div>
+        <div id="qcJobActions" class="qc-job-actions hidden"><button id="pauseQcScan" data-i18n="qcPause">暂停</button><button id="resumeQcScan" data-i18n="qcResume">继续</button><button id="cancelQcScan" class="danger" data-i18n="qcCancel">取消</button></div>
+      </section>
+      <section id="qcReport" class="qc-report hidden">
+        <div id="qcSummaryCards" class="qc-summary-cards"></div>
+        <div id="qcIssueSummary" class="qc-issue-summary"></div>
+        <div class="qc-filter-bar">
+          <input id="qcSearch" type="search" data-i18n-placeholder="searchPlaceholder" placeholder="搜索 episode、任务">
+          <select id="qcIntegrityFilter"><option value="" data-i18n="qcAllIntegrity">全部有效性</option><option value="valid" data-i18n="qcValid">有效</option><option value="invalid" data-i18n="qcInvalid">不可用</option></select>
+          <select id="qcDecisionFilter"><option value="" data-i18n="filterAll">全部状态</option><option value="pass" data-i18n="filterPass">通过</option><option value="review" data-i18n="filterReview">待审</option><option value="quarantine" data-i18n="filterQuarantine">隔离</option></select>
+          <label><span data-i18n="qcMinQuality">最低质量</span><input id="qcMinQuality" type="number" min="0" max="100" placeholder="0"></label>
+          <label><span data-i18n="qcMinUsable">最低合格时长%</span><input id="qcMinUsable" type="number" min="0" max="100" placeholder="0"></label>
+          <button id="applyQcFilters" data-i18n="qcApplyFilters">应用筛选</button>
+        </div>
+        <div id="qcIssueFilters" class="qc-issue-filters"></div>
+        <div class="qc-report-actions">
+          <span id="qcSelectionCount" class="muted"></span>
+          <button id="exportQcSelection" class="primary" data-i18n="qcExportSelection">导出筛选数据</button>
+          <button id="downloadQcEpisodes" data-i18n="qcExportEpisodeCsv">Episode CSV</button>
+          <button id="downloadQcFindings" data-i18n="qcExportFindingCsv">问题 CSV</button>
+        </div>
+        <div class="qc-report-body">
+          <div><div id="qcEpisodeTable" class="qc-episode-table"></div><div id="qcPagination" class="qc-pagination"></div></div>
+          <aside id="qcEpisodeDetail" class="qc-episode-detail"><div class="empty" data-i18n="qcSelectEpisode">选择一个 episode 查看证据</div></aside>
+        </div>
+      </section>
+    </section>
+  </div>
+
+  <div id="exportDialog" class="modal hidden">
+    <section class="modal-card export-card" role="dialog" aria-modal="true" aria-labelledby="exportDialogTitle">
+      <div class="modal-title">
+        <div>
+          <h2 id="exportDialogTitle" data-i18n="exportOptionsTitle">导出选项</h2>
+          <p data-i18n="exportOptionsDesc">确认导出范围、格式和服务器保存位置后启动后台任务。</p>
+        </div>
+        <button id="closeExport" data-i18n="close">关闭</button>
+      </div>
+      <div class="export-layout">
+        <div class="export-config">
+          <section class="export-section">
+            <div class="export-section-title">
+              <span class="export-step">1</span>
+              <div><strong data-i18n="exportSourceAndScope">数据源与范围</strong><small data-i18n="exportSourceAndScopeHint">仅导出选中的 episode，源数据不会改变</small></div>
+            </div>
+            <div class="export-source-row">
+              <div><span class="field-label" data-i18n="convertSourceLabel">源数据集</span><div id="exportSource" class="convert-source-path">—</div></div>
+              <span id="exportSourceFormat" class="export-format-badge">—</span>
+            </div>
+            <div id="exportScopeStats" class="export-scope-stats"></div>
+            <label id="exportIncludeReviewLabel" class="export-check-row"><input id="exportIncludeReview" type="checkbox"> <span><strong data-i18n="exportIncludeReview">同时导出待审 episode</strong><small data-i18n="exportIncludeReviewHint">隔离项始终不会导出</small></span></label>
+            <p id="exportFixedSelectionHint" class="field-hint hidden"></p>
+          </section>
+
+          <section class="export-section">
+            <div class="export-section-title">
+              <span class="export-step">2</span>
+              <div><strong data-i18n="exportFormatAndContent">格式与内容</strong><small data-i18n="exportFormatAndContentHint">同格式导出最快；跨格式会按兼容能力转换</small></div>
+            </div>
+            <div class="export-fields-grid">
+              <label><span data-i18n="targetFormat">目标格式</span><select id="exportTarget"></select></label>
+              <label><span data-i18n="exportMediaMode">媒体文件</span><select id="exportMediaMode"><option value="hardlink" data-i18n="exportMediaHardlink">硬链接（推荐，省空间）</option><option value="copy" data-i18n="exportMediaCopy">完整复制（可独立移动）</option></select></label>
+            </div>
+            <p id="exportFidelity" class="export-fidelity"></p>
+            <label class="export-check-row"><input id="exportCopyLabels" type="checkbox" checked> <span><strong data-i18n="exportCopyLabels">复制标注文件</strong><small data-i18n="exportCopyLabelsHint">将已有 labels.jsonl 一并写入结果</small></span></label>
+          </section>
+
+          <section class="export-section">
+            <div class="export-section-title">
+              <span class="export-step">3</span>
+              <div><strong data-i18n="exportDestination">导出地址</strong><small data-i18n="exportDestinationHint">填写服务器绝对路径，或浏览并选择目录</small></div>
+            </div>
+            <label class="export-output-label"><span data-i18n="outputPath">输出路径</span><div class="export-output-row"><input id="exportOutput" spellcheck="false"><button type="button" id="browseExportOutput" data-i18n="browseDir">浏览目录</button></div></label>
+            <div id="exportPathBrowser" class="export-path-browser hidden">
+              <div class="export-browser-head"><button type="button" id="exportBrowserParent" data-i18n-title="parentDir">↑</button><code id="exportBrowserPath">/</code><button type="button" id="useExportDirectory" class="primary" data-i18n="exportUseDirectory">使用此目录</button></div>
+              <div id="exportBrowserList" class="export-browser-list"></div>
+            </div>
+          </section>
+        </div>
+
+        <aside class="export-review" aria-live="polite">
+          <span class="export-review-kicker" data-i18n="exportSummary">导出摘要</span>
+          <strong id="exportReviewCount" class="export-review-count">0</strong>
+          <span data-i18n="exportEpisodesSelected">个 episode 将被导出</span>
+          <dl>
+            <div><dt data-i18n="exportSummaryFormat">输出格式</dt><dd id="exportReviewFormat">—</dd></div>
+            <div><dt data-i18n="exportSummaryMedia">媒体方式</dt><dd id="exportReviewMedia">—</dd></div>
+            <div><dt data-i18n="exportSummaryLabels">标注</dt><dd id="exportReviewLabels">—</dd></div>
+          </dl>
+          <div class="export-review-path"><span data-i18n="exportActualPath">实际写入位置</span><code id="exportResolvedOutput">—</code></div>
+          <p id="exportReviewNotice" class="export-review-notice"></p>
+        </aside>
+      </div>
+      <div class="modal-actions export-actions">
+        <span data-i18n="exportBackgroundHint">导出在后台运行，关闭页面不会中断。</span>
+        <button id="cancelExport" data-i18n="cancel">取消</button>
+        <button id="startExport" class="primary" data-i18n="startExport">开始导出</button>
+      </div>
     </section>
   </div>
 
@@ -216,7 +346,7 @@
       <div class="modal-actions">
         <button id="startConvert" class="primary" data-i18n="startConvert">开始后台转换</button>
       </div>
-      <p class="convert-bg-hint" data-i18n="convertBgHint">任务在独立进程后台执行：关闭网页不会中断；关闭启动终端一般也不影响（start.sh 已 nohup）。可在页面底部查看进度。</p>
+      <p class="convert-bg-hint" data-i18n="convertBgHint">任务在独立进程后台执行：关闭网页不会中断；通过 embodit.sh 启动时，关闭启动终端通常也不影响。可在页面底部查看进度。</p>
     </section>
   </div>
 

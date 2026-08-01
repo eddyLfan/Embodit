@@ -1,7 +1,8 @@
-.convert_jobs/
-.augment_jobs/
-.augment_previews/
-.augment_cache/
+/.convert_jobs
+/.augment_jobs
+/.augment_previews
+/.augment_cache
+/.embodit_cache
 
 # Local runtime state and secrets
 .env
@@ -18,6 +19,18 @@ __pycache__/
 *.pyc
 .venv/
 config/token
+
+# Developer tool and editor artifacts
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.DS_Store
+*.orig
+*.rej
+*.swp
+*~
 
 # User annotations and review sidecars
 *.review.json

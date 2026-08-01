@@ -41,3 +41,26 @@ MCAP_GAP_S = _env_float("EMBODIT_MCAP_GAP_S", 2.0)
 # Restrict client-supplied paths to the browse root. Off by default so users
 # can browse anywhere on the machine; set EMBODIT_SANDBOX=1 to enforce.
 SANDBOX_PATHS = os.environ.get("EMBODIT_SANDBOX", "").strip() in {"1", "true", "yes"}
+
+# All generated cache, previews, detached job state and QC reports live under
+# one root.  Keeping this outside source datasets guarantees that maintenance
+# never mutates training payloads.
+_cache_override = os.environ.get("EMBODIT_CACHE_DIR", "").strip()
+CACHE_DIR = (
+    Path(_cache_override).expanduser().resolve()
+    if _cache_override
+    else PROJECT_ROOT / ".embodit_cache"
+)
+
+# Stable, purpose-oriented layout.  Keep QC_CACHE_DIR as a compatibility alias
+# for callers that only need to validate that a report is under the cache root.
+JOBS_DIR = CACHE_DIR / "jobs"
+CONVERT_JOBS_DIR = JOBS_DIR / "convert"
+AUGMENT_JOBS_DIR = JOBS_DIR / "augment"
+QC_JOBS_DIR = JOBS_DIR / "qc"
+AUGMENT_PREVIEW_DIR = CACHE_DIR / "previews" / "augment"
+SAM_TRACK_CACHE_DIR = CACHE_DIR / "reusable" / "sam_tracks"
+HDF5_VIDEO_CACHE_DIR = CACHE_DIR / "media" / "hdf5"
+MCAP_VIDEO_CACHE_DIR = CACHE_DIR / "media" / "mcap"
+QC_REPORT_DIR = CACHE_DIR / "reports" / "qc"
+QC_CACHE_DIR = CACHE_DIR
