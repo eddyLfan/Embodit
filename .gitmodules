@@ -1,0 +1,9 @@
+[submodule "third_party/models/lerobot"]
+	path = third_party/models/lerobot
+	url = https://github.com/huggingface/lerobot.git
+[submodule "third_party/models/openpi"]
+	path = third_party/models/openpi
+	url = https://github.com/Physical-Intelligence/openpi.git
+[submodule "third_party/models/starvla"]
+	path = third_party/models/starvla
+	url = https://github.com/starVLA/starVLA.git
