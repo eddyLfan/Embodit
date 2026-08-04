@@ -37,6 +37,9 @@ Commands:
   logs [LINES]         Show recent logs (default: 50 lines)
   logs -f              Follow the service log
   clean [MODE]         Clean managed files: expired (default), --cache, or --all
+  recipe-validate FILE Validate a Recipe v2 deployment
+  recipe-run FILE      Start and monitor a Recipe v2 deployment
+  recipe-stop FILE     Stop services declared by a Recipe v2 deployment
   help                 Show this help
 
 Examples:
@@ -47,6 +50,9 @@ Examples:
   bash embodit.sh stop
   bash embodit.sh clean --dry-run
   bash embodit.sh clean --cache
+  bash embodit.sh recipe-validate config/deployment.recipe-v2.example.json
+  bash embodit.sh recipe-run config/deployment.recipe-v2.example.json --mode dry_run
+  bash embodit.sh recipe-stop config/deployment.recipe-v2.example.json
 
 Optional env vars: EMBODY_ROOT, EMBODY_HOST, EMBODY_PORT,
   EMBODY_PUBLIC_HOST, EMBODY_TOKEN, EMBODY_PROXY, EMBODIT_SANDBOX,
@@ -360,6 +366,24 @@ EOF
   python3 "${args[@]}"
 }
 
+run_recipe_cli() {
+  local subcommand="$1"
+  shift
+  if (( $# < 1 )); then
+    fail "recipe-${subcommand} requires a Recipe v2 path."
+    return 2
+  fi
+  if [[ -x "${SCRIPT_DIR}/.venv/bin/python" ]]; then
+    "${SCRIPT_DIR}/.venv/bin/python" "${SCRIPT_DIR}/backend/deploy/cli.py" "$subcommand" "$@"
+    return
+  fi
+  if ! command -v uv >/dev/null 2>&1; then
+    fail "uv is required to create the Embodit environment."
+    return 1
+  fi
+  uv run --project "$SCRIPT_DIR" python "${SCRIPT_DIR}/backend/deploy/cli.py" "$subcommand" "$@"
+}
+
 command="${1:-help}"
 if (( $# > 0 )); then
   shift
@@ -383,6 +407,9 @@ case "$command" in
   status) show_status "$@" ;;
   logs|log) show_logs "$@" ;;
   clean) clean_cache "$@" ;;
+  recipe-validate) run_recipe_cli validate "$@" ;;
+  recipe-run) run_recipe_cli run "$@" ;;
+  recipe-stop) run_recipe_cli stop "$@" ;;
   help|-h|--help) usage ;;
   *)
     fail "Unknown command: ${command}"

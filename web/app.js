@@ -34,6 +34,7 @@
     trajectory: null, trajectoryEpisode: null,
     convertContext: null, // { path, format } for standalone convert
     convertJobs: [],
+    mergeContext: null, // { sources, preflight, browserPath, outputTouched }
     augmentContext: null,
     augmentJobs: [],
     augmentOptions: null,
@@ -44,7 +45,11 @@
     trajVisible: null, // boolean[] aligned to action dims
     trajScaleMode: 'per', // shared | per
     workspaceMode: 'browse',
+    primaryLayer: 'data',
     exportContext: null,
+    deploymentSessionId: null,
+    deploymentRuntimeKind: null,
+    deploymentTimer: null,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -113,6 +118,7 @@
   async function initialize() {
     bindChooser();
     bindReview();
+    bindDeployment();
     bindLanguage();
     initTooltips();
     window.EmbodyI18n?.applyStaticI18n();
@@ -131,6 +137,419 @@
     try {
       await refreshAugmentJobs();
     } catch {}
+    const preferredLayer = location.hash === '#deploy'
+      ? 'deploy'
+      : (localStorage.getItem('embodit-primary-layer') || 'data');
+    if (preferredLayer === 'deploy') await openDeploymentWorkspace();
+    else activatePrimaryLayer('data');
+  }
+
+  function bindDeployment() {
+    $('#openDataWorkspace')?.addEventListener('click', openDataWorkspace);
+    $('#openDeployment')?.addEventListener('click', openDeploymentWorkspace);
+    $('#loadDeploymentExample')?.addEventListener('click', () => loadDeploymentExample('recipe-v2'));
+    $('#deploymentFile')?.addEventListener('change', importDeploymentFile);
+    $('#deploymentRecipe')?.addEventListener('input', () => {
+      try {
+        localStorage.setItem('embodit-deployment-recipe', $('#deploymentRecipe').value);
+        const recipe = JSON.parse($('#deploymentRecipe').value);
+        renderDeploymentHosts(recipe);
+      } catch {}
+    });
+    $('#validateDeployment')?.addEventListener('click', validateDeploymentRecipe);
+    $('#doctorDeployment')?.addEventListener('click', doctorDeployment);
+    $('#quickstartDeployment')?.addEventListener('click', quickstartDeployment);
+    $('#stopDeployment')?.addEventListener('click', stopDeploymentSession);
+    $('#startLiveDeployment')?.addEventListener('click', startLiveDeployment);
+    $('#emergencyStopDeployment')?.addEventListener('click', emergencyStopDeployment);
+    $('#saveDeployment')?.addEventListener('click', saveDeploymentRecipe);
+    $('#exportDeployment')?.addEventListener('click', exportDeploymentRecipe);
+    $('#loadSavedDeployment')?.addEventListener('click', loadSavedDeploymentRecipe);
+    $('#deleteSavedDeployment')?.addEventListener('click', deleteSavedDeploymentRecipe);
+    $('#downloadDeploymentRecord')?.addEventListener('click', downloadDeploymentRecord);
+    $('#deploymentComponents')?.addEventListener('click', onDeploymentComponentAction);
+  }
+
+  function activatePrimaryLayer(layer) {
+    const next = layer === 'deploy' ? 'deploy' : 'data';
+    state.primaryLayer = next;
+    $('#dataWorkspace')?.classList.toggle('hidden', next !== 'data');
+    $('#deploymentWorkspace')?.classList.toggle('hidden', next !== 'deploy');
+    $$('.layer-tab[data-layer]').forEach((button) => {
+      const active = button.dataset.layer === next;
+      button.classList.toggle('active', active);
+      if (active) button.setAttribute('aria-current', 'page');
+      else button.removeAttribute('aria-current');
+    });
+    document.body.classList.toggle('layer-data', next === 'data');
+    document.body.classList.toggle('layer-deploy', next === 'deploy');
+    try { localStorage.setItem('embodit-primary-layer', next); } catch {}
+    const hash = next === 'deploy' ? '#deploy' : '';
+    if (location.hash !== hash) history.replaceState(null, '', `${location.pathname}${location.search}${hash}`);
+  }
+
+  function openDataWorkspace() {
+    stopDeploymentPolling();
+    activatePrimaryLayer('data');
+    requestAnimationFrame(() => {
+      try { drawTrajectory(state.trajectory, Number($('#timeline')?.value) || 0); } catch {}
+    });
+  }
+
+  async function openDeploymentWorkspace() {
+    try { pauseAll(); } catch {}
+    activatePrimaryLayer('deploy');
+    await refreshSavedDeploymentRecipes();
+    if (!$('#deploymentRecipe').value.trim()) {
+      const saved = localStorage.getItem('embodit-deployment-recipe');
+      if (saved) {
+        $('#deploymentRecipe').value = saved;
+        try {
+          const recipe = JSON.parse(saved);
+          renderDeploymentHosts(recipe);
+        } catch {}
+      } else {
+        await loadDeploymentExample('recipe-v2');
+      }
+    }
+    try {
+      const orchestrations = await api('/api/deploy/orchestrations');
+      const activeRecipe = (orchestrations.orchestrations || []).find((item) => !['stopped', 'fault'].includes(item.state));
+      if (activeRecipe) {
+        state.deploymentSessionId = activeRecipe.orchestrationId;
+        state.deploymentRuntimeKind = 'recipe-v2';
+        renderDeploymentSnapshot(activeRecipe);
+        startDeploymentPolling();
+        return;
+      }
+    } catch {}
+  }
+
+  function deploymentRecipe() {
+    let recipe;
+    try {
+      recipe = JSON.parse($('#deploymentRecipe').value);
+    } catch (error) {
+      throw new Error(t('deployInvalidJson', { msg: error.message }));
+    }
+    if (!recipe || typeof recipe !== 'object' || Array.isArray(recipe)) {
+      throw new Error(t('deployProfileObject'));
+    }
+    if (recipe.version !== 2) throw new Error('仅支持最终版 Recipe v2');
+    return recipe;
+  }
+
+  function writeDeploymentRecipe(recipe) {
+    const text = JSON.stringify(recipe, null, 2);
+    $('#deploymentRecipe').value = text;
+    localStorage.setItem('embodit-deployment-recipe', text);
+    renderDeploymentHosts(recipe);
+  }
+
+  async function refreshSavedDeploymentRecipes() {
+    const select = $('#deploymentSavedRecipe');
+    if (!select) return;
+    try {
+      const result = await api('/api/deploy/recipes');
+      select.innerHTML = '<option value="">—</option>' + (result.recipes || []).filter((item) => item.valid).map((item) =>
+        `<option value="${escapeAttr(item.deploymentId)}">${escapeHtml(item.name)} · ${escapeHtml(item.deploymentId)}</option>`
+      ).join('');
+    } catch {}
+  }
+
+  async function saveDeploymentRecipe() {
+    try {
+      const result = await api('/api/deploy/recipes', { method: 'POST', body: JSON.stringify({ recipe: deploymentRecipe() }) });
+      await refreshSavedDeploymentRecipes();
+      $('#deploymentSavedRecipe').value = result.recipe.deploymentId;
+      setDeploymentResult(result, '配置已安全保存到本机');
+    } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
+  }
+
+  async function loadSavedDeploymentRecipe() {
+    const id = $('#deploymentSavedRecipe')?.value;
+    if (!id) return;
+    try {
+      const result = await api(`/api/deploy/recipes/${encodeURIComponent(id)}`);
+      writeDeploymentRecipe(result.recipe);
+      setDeploymentResult(result.recipe, '已打开保存的配置');
+    } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
+  }
+
+  async function deleteSavedDeploymentRecipe() {
+    const id = $('#deploymentSavedRecipe')?.value;
+    if (!id || !window.confirm(`确认删除部署配置 ${id}？`)) return;
+    try {
+      await api(`/api/deploy/recipes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await refreshSavedDeploymentRecipes();
+      setDeploymentResult({ deleted: id }, '配置已删除');
+    } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
+  }
+
+  function exportDeploymentRecipe() {
+    try {
+      const recipe = deploymentRecipe();
+      const blob = new Blob([`${JSON.stringify(recipe, null, 2)}\n`], { type: 'application/json' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `${recipe.deployment_id || 'deployment'}.json`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
+  }
+
+  async function loadDeploymentExample(name) {
+    try {
+      const result = await api(`/api/deploy/examples/${encodeURIComponent(name)}`);
+      writeDeploymentRecipe(result.recipe);
+      renderDeploymentHosts(result.recipe);
+      setDeploymentResult(result.recipe, t('deployTemplateLoaded'));
+    } catch (error) {
+      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
+    }
+  }
+
+  async function importDeploymentFile(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const recipe = JSON.parse(await file.text());
+      writeDeploymentRecipe(recipe);
+      renderDeploymentHosts(recipe);
+      setDeploymentResult(recipe, t('deployImported'));
+    } catch (error) {
+      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
+    } finally {
+      event.target.value = '';
+    }
+  }
+
+  function setDeploymentResult(payload, hint = '', error = false) {
+    const output = $('#deploymentResult');
+    if (output) output.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+    const hintElement = $('#deploymentResultHint');
+    if (hintElement) {
+      hintElement.textContent = hint || (error ? t('deployFailed') : t('deployReady'));
+      hintElement.classList.toggle('error', error);
+    }
+  }
+
+  function setDeploymentState(value) {
+    const element = $('#deploymentState');
+    if (!element) return;
+    element.textContent = value || 'disconnected';
+    element.className = `deployment-state ${value || 'disconnected'}`;
+  }
+
+  function syncDeploymentButtons(active, snapshot = null) {
+    $('#quickstartDeployment').disabled = active;
+    $('#stopDeployment').disabled = !active;
+    $('#emergencyStopDeployment').disabled = !active;
+    $('#startLiveDeployment').disabled = !active || snapshot?.state !== 'dry_run';
+    $('#downloadDeploymentRecord').disabled = !active;
+  }
+
+  async function validateDeploymentRecipe() {
+    try {
+      const result = await api('/api/deploy/recipes/validate', {
+        method: 'POST', body: JSON.stringify({ recipe: deploymentRecipe() })
+      });
+      setDeploymentResult(result, t('deployValid'));
+      renderDeploymentHosts(result.recipe);
+    } catch (error) {
+      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
+    }
+  }
+
+  async function doctorDeployment() {
+    setBusy(true, t('deployDoctorRunning'), t('deployDoctorWait'));
+    try {
+      const result = await api('/api/deploy/doctor', {
+        method: 'POST', body: JSON.stringify({ recipe: deploymentRecipe() })
+      });
+      setDeploymentResult(result, result.ok ? t('deployDoctorPassed') : t('deployDoctorFailed'), !result.ok);
+    } catch (error) {
+      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function quickstartDeployment() {
+    setBusy(true, t('deployStarting'), t('deployStartingHint'));
+    try {
+      const recipe = deploymentRecipe();
+      const snapshot = await api('/api/deploy/orchestrations', {
+        method: 'POST', body: JSON.stringify({ recipe, mode: 'dry_run' })
+      });
+      state.deploymentSessionId = snapshot.orchestrationId;
+      state.deploymentRuntimeKind = 'recipe-v2';
+      renderDeploymentSnapshot(snapshot);
+      setDeploymentResult(snapshot, '部署编排已启动');
+      startDeploymentPolling();
+    } catch (error) {
+      state.deploymentSessionId = null;
+      state.deploymentRuntimeKind = null;
+      syncDeploymentButtons(false);
+      setDeploymentState('disconnected');
+      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function startDeploymentPolling() {
+    stopDeploymentPolling();
+    state.deploymentTimer = window.setInterval(refreshDeploymentSession, 500);
+  }
+
+  function stopDeploymentPolling() {
+    if (state.deploymentTimer) window.clearInterval(state.deploymentTimer);
+    state.deploymentTimer = null;
+  }
+
+  async function refreshDeploymentSession() {
+    if (!state.deploymentSessionId) return;
+    try {
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}`);
+      renderDeploymentSnapshot(snapshot);
+      if (['fault', 'stopped', 'disconnected'].includes(snapshot.state)) {
+        stopDeploymentPolling();
+        setDeploymentResult(snapshot, snapshot.lastError || `部署已${snapshot.state}`, snapshot.state === 'fault');
+      }
+    } catch (error) {
+      stopDeploymentPolling();
+      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
+    }
+  }
+
+  async function stopDeploymentSession() {
+    stopDeploymentPolling();
+    if (!state.deploymentSessionId) return;
+    try {
+      const result = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/stop`, { method: 'POST' });
+      setDeploymentState(result.state);
+      setDeploymentResult(result, t('deployStopped'));
+    } catch (error) {
+      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
+    } finally {
+      state.deploymentSessionId = null;
+      state.deploymentRuntimeKind = null;
+      syncDeploymentButtons(false);
+    }
+  }
+
+  async function startLiveDeployment() {
+    if (!state.deploymentSessionId) return;
+    try {
+      const base = '/api/deploy/orchestrations';
+      const challenge = await api(`${base}/${encodeURIComponent(state.deploymentSessionId)}/arm-challenge`, { method: 'POST' });
+      const confirmation = window.prompt(`真机动作安全确认\n\n请逐字输入：\n${challenge.phrase}`);
+      if (!confirmation) return;
+      const snapshot = await api(`${base}/${encodeURIComponent(state.deploymentSessionId)}/start-live`, {
+        method: 'POST', body: JSON.stringify({ confirmation })
+      });
+      renderDeploymentSnapshot(snapshot);
+      startDeploymentPolling();
+      setDeploymentResult(snapshot, '真机循环运行中');
+    } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
+  }
+
+  async function emergencyStopDeployment() {
+    if (!state.deploymentSessionId || !window.confirm('立即停止动作、断开本体与模型并将会话置为故障？')) return;
+    stopDeploymentPolling();
+    try {
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/emergency-stop`, {
+        method: 'POST', body: JSON.stringify({ reason: '用户从网页触发急停' })
+      });
+      renderDeploymentSnapshot(snapshot);
+      setDeploymentResult(snapshot, '急停已执行', true);
+    } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
+  }
+
+  function downloadDeploymentRecord() {
+    if (!state.deploymentSessionId) return;
+    const path = `/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/manifest`;
+    window.open(path, '_blank', 'noopener');
+  }
+
+  function renderDeploymentSnapshot(snapshot) {
+    if (!snapshot) return;
+    setDeploymentState(snapshot.state);
+    state.deploymentRuntimeKind = 'recipe-v2';
+    syncDeploymentButtons(!['disconnected', 'stopped'].includes(snapshot.state), snapshot);
+    const passed = (snapshot.steps || []).filter((item) => item.status === 'passed').length;
+    const failed = (snapshot.steps || []).filter((item) => item.status === 'failed').length;
+    $('#deployMetricSteps').textContent = passed;
+    $('#deployMetricHz').textContent = snapshot.currentStep || '—';
+    $('#deployMetricInference').textContent = snapshot.mode || '—';
+    $('#deployMetricActions').textContent = Object.values(snapshot.components || {}).filter((item) => item.active).length;
+    $('#deployMetricErrors').textContent = failed;
+    renderDeploymentComponents(snapshot.components || {});
+    const output = $('#deploymentResult');
+    if (output) output.textContent = JSON.stringify({
+      state: snapshot.state,
+      mode: snapshot.mode,
+      currentStep: snapshot.currentStep,
+      components: snapshot.components,
+      steps: snapshot.steps,
+      lastError: snapshot.lastError,
+      recentEvents: (snapshot.events || []).slice(-30),
+    }, null, 2);
+    const hint = $('#deploymentResultHint');
+    if (hint) hint.textContent = snapshot.lastError || `${snapshot.name || snapshot.deploymentId} · ${snapshot.state}`;
+  }
+
+  function renderDeploymentComponents(components) {
+    const container = $('#deploymentComponents');
+    if (!container) return;
+    container.classList.remove('hidden');
+    container.innerHTML = Object.entries(components)
+      .filter(([name]) => ['model', 'tunnel', 'ros', 'client'].includes(name))
+      .map(([name, value]) => `<div class="deployment-component ${value.active ? 'active' : ''}">
+        <span><i></i><strong>${escapeHtml(name)}</strong><small>${escapeHtml(value.active ? 'active' : 'inactive')}</small></span>
+        <span><button data-component-action="logs" data-component="${escapeAttr(name)}">日志</button><button data-component-action="restart" data-component="${escapeAttr(name)}">重启</button></span>
+      </div>`).join('');
+  }
+
+  async function onDeploymentComponentAction(event) {
+    const button = event.target.closest('[data-component-action]');
+    if (!button || !state.deploymentSessionId || state.deploymentRuntimeKind !== 'recipe-v2') return;
+    const component = button.dataset.component;
+    const action = button.dataset.componentAction;
+    try {
+      let result;
+      if (action === 'logs') {
+        result = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/logs`, {
+          method: 'POST', body: JSON.stringify({ component, lines: 200 })
+        });
+        setDeploymentResult(result, `${component} 最近日志`);
+      } else {
+        if (!window.confirm(`确认重启 ${component}？相关依赖会执行安全检查。`)) return;
+        setBusy(true, `正在重启 ${component}`, '等待远端 systemd 和健康检查');
+        result = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/components/${encodeURIComponent(component)}/restart`, { method: 'POST' });
+        renderDeploymentSnapshot(result);
+        setDeploymentResult(result, `${component} 已重启`);
+      }
+    } catch (error) {
+      setDeploymentResult({ component, error: error.message }, t('deployFailed'), true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function renderDeploymentHosts(recipe) {
+    const container = $('#deploymentHosts');
+    if (!container) return;
+    const hosts = recipe?.hosts && typeof recipe.hosts === 'object' ? Object.entries(recipe.hosts) : [];
+    if (!hosts.length) {
+      container.innerHTML = `<div class="muted">${escapeHtml(t('deployNoHosts'))}</div>`;
+      return;
+    }
+    container.innerHTML = hosts.map(([name, host]) => `<article class="deployment-host-card">
+      <div class="deployment-host-head"><strong>${escapeHtml(name)}</strong><code>${escapeHtml(`${host.user}@${host.address}:${host.port || 22}`)}</code></div>
+      <div class="muted">认证：${escapeHtml(host.auth?.type || '未配置')} · systemd：${escapeHtml(host.service_manager || 'system')} · 启动编排时自动连接、固定 host key 并检测运行环境</div>
+    </article>`).join('');
   }
 
   function bindLanguage() {
@@ -179,6 +598,7 @@
     try { renderAugmentJobDock(); } catch {}
     try { renderConvertFidelity(); } catch {}
     try { if (!$('#exportDialog')?.classList.contains('hidden')) renderExportDialog(); } catch {}
+    try { if (!$('#mergeDialog')?.classList.contains('hidden')) renderMergeDialog(); } catch {}
     try {
       if (state.qcSummary) {
         renderQcSummary();
@@ -187,6 +607,9 @@
       }
     } catch {}
     try { fillAugmentColorPresets(); syncAugmentFormVisibility(); } catch {}
+    try {
+      if ($('#deploymentRecipe')?.value.trim()) renderDeploymentHosts(deploymentRecipe());
+    } catch {}
   }
 
   function bindChooser() {
@@ -281,6 +704,28 @@
     $('#closeConvert')?.addEventListener('click', closeConvertDialog);
     $('#startConvert')?.addEventListener('click', startConvert);
     $('#convertTarget')?.addEventListener('change', renderConvertFidelity);
+    $('#closeMerge')?.addEventListener('click', closeMergeDialog);
+    $('#addMergeSource')?.addEventListener('click', addMergeSourceFromInput);
+    $('#mergeSourceInput')?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') addMergeSourceFromInput();
+    });
+    $('#browseMergeSource')?.addEventListener('click', openMergePathBrowser);
+    $('#mergeBrowserParent')?.addEventListener('click', () => {
+      const parent = state.mergeContext?.browserParent;
+      if (parent) browseMergeDirectory(parent);
+    });
+    $('#mergeBrowserList')?.addEventListener('click', (event) => {
+      const add = event.target.closest('[data-merge-add-path]');
+      if (add) return addMergeSource(add.dataset.mergeAddPath);
+      const browse = event.target.closest('[data-merge-browse-path]');
+      if (browse) browseMergeDirectory(browse.dataset.mergeBrowsePath);
+    });
+    $('#mergeSourceList')?.addEventListener('click', onMergeSourceAction);
+    $('#mergeOutput')?.addEventListener('input', () => {
+      if (state.mergeContext) state.mergeContext.outputTouched = true;
+      renderMergeDialog();
+    });
+    $('#startMerge')?.addEventListener('click', startMerge);
     $('#refreshConvertJobs')?.addEventListener('click', () => refreshConvertJobs().catch(() => {}));
     $('#toggleConvertJobs')?.addEventListener('click', () => {
       $('#convertJobDock')?.classList.toggle('collapsed');
@@ -401,16 +846,28 @@
   }
 
   function setWorkspaceMode(mode) {
-    const allowed = new Set(['browse', 'annotate', 'filter', 'convert', 'augment']);
+    const allowed = new Set(['browse', 'annotate', 'filter', 'convert', 'merge', 'augment']);
     const next = allowed.has(mode) ? mode : 'browse';
-    // Convert / augment are actions: open dialog and stay on prior work mode.
+    // Convert / merge / augment are actions: open a dialog and stay on the prior work mode.
     if (next === 'convert') {
       if (state.dataset) {
         openConvertDialog(state.dataset.path, state.dataset.format || null);
       } else {
         showToast(t('needConvertDataset'), true);
       }
-      const fallback = state.workspaceMode && !['convert', 'augment'].includes(state.workspaceMode)
+      const fallback = state.workspaceMode && !['convert', 'merge', 'augment'].includes(state.workspaceMode)
+        ? state.workspaceMode
+        : 'browse';
+      applyWorkspaceMode(fallback);
+      return;
+    }
+    if (next === 'merge') {
+      if (state.dataset) {
+        openMergeDialog(state.dataset.path);
+      } else {
+        showToast(t('needMergeDataset'), true);
+      }
+      const fallback = state.workspaceMode && !['convert', 'merge', 'augment'].includes(state.workspaceMode)
         ? state.workspaceMode
         : 'browse';
       applyWorkspaceMode(fallback);
@@ -422,7 +879,7 @@
       } else {
         showToast(t('needAugmentDataset'), true);
       }
-      const fallback = state.workspaceMode && !['convert', 'augment'].includes(state.workspaceMode)
+      const fallback = state.workspaceMode && !['convert', 'merge', 'augment'].includes(state.workspaceMode)
         ? state.workspaceMode
         : 'browse';
       applyWorkspaceMode(fallback);
@@ -2497,6 +2954,217 @@
     }
   }
 
+  function suggestedMergeOutput(path) {
+    const source = String(path || '').replace(/\/+$/, '');
+    if (!source) return '';
+    const folder = dirname(source);
+    let name = source.split('/').pop() || 'dataset';
+    name = name.replace(/\.(hdf5|h5|mcap)$/i, '');
+    return joinServerPath(folder || '/', `${name}_merged`);
+  }
+
+  function openMergeDialog(initialPath) {
+    const first = typeof initialPath === 'string' ? initialPath : state.dataset?.path;
+    if (!first) return showToast(t('needMergeDataset'), true);
+    state.mergeContext = {
+      sources: [first],
+      preflight: null,
+      checking: false,
+      requestSequence: 0,
+      browserPath: dirname(first) || state.currentFolder || state.browseRoot || '/',
+      browserParent: null,
+      outputTouched: false,
+    };
+    $('#mergeSourceInput').value = '';
+    $('#mergeOutput').value = suggestedMergeOutput(first);
+    $('#mergeMediaMode').value = 'hardlink';
+    $('#mergeCopyLabels').checked = true;
+    $('#mergePathBrowser').classList.add('hidden');
+    $('#mergeProgress').classList.add('hidden');
+    $('#mergeDialog').classList.remove('hidden');
+    renderMergeDialog();
+  }
+
+  function closeMergeDialog() {
+    $('#mergeDialog')?.classList.add('hidden');
+    state.mergeContext = null;
+  }
+
+  function addMergeSourceFromInput() {
+    addMergeSource($('#mergeSourceInput')?.value || '');
+  }
+
+  function addMergeSource(rawPath) {
+    const ctx = state.mergeContext;
+    const path = String(rawPath || '').trim().replace(/\/+$/, '') || '/';
+    if (!ctx || !path) return;
+    if (!path.startsWith('/')) return showToast(t('mergeAbsoluteSource'), true);
+    if (ctx.sources.includes(path)) return showToast(t('mergeDuplicateSource'), true);
+    ctx.sources.push(path);
+    ctx.preflight = null;
+    if (!ctx.outputTouched && ctx.sources.length === 2) {
+      $('#mergeOutput').value = suggestedMergeOutput(ctx.sources[0]);
+    }
+    $('#mergeSourceInput').value = '';
+    renderMergeDialog();
+    runMergePreflight();
+  }
+
+  function onMergeSourceAction(event) {
+    const button = event.target.closest('[data-merge-action]');
+    const ctx = state.mergeContext;
+    if (!button || !ctx) return;
+    const index = Number(button.dataset.mergeIndex);
+    if (!Number.isInteger(index) || index < 0 || index >= ctx.sources.length) return;
+    const action = button.dataset.mergeAction;
+    ctx.requestSequence += 1;
+    if (action === 'remove') ctx.sources.splice(index, 1);
+    if (action === 'up' && index > 0) [ctx.sources[index - 1], ctx.sources[index]] = [ctx.sources[index], ctx.sources[index - 1]];
+    if (action === 'down' && index < ctx.sources.length - 1) [ctx.sources[index + 1], ctx.sources[index]] = [ctx.sources[index], ctx.sources[index + 1]];
+    if (!ctx.outputTouched && ctx.sources[0]) $('#mergeOutput').value = suggestedMergeOutput(ctx.sources[0]);
+    ctx.preflight = null;
+    renderMergeDialog();
+    if (ctx.sources.length >= 2) runMergePreflight();
+  }
+
+  function renderMergeDialog() {
+    const ctx = state.mergeContext;
+    if (!ctx) return;
+    const list = $('#mergeSourceList');
+    list.innerHTML = ctx.sources.map((path, index) => `
+      <div class="merge-source-row">
+        <span class="merge-source-order">${index + 1}</span>
+        <span class="merge-source-path" title="${escapeAttr(path)}">${escapeHtml(path)}</span>
+        <span class="merge-source-actions">
+          <button type="button" data-merge-action="up" data-merge-index="${index}" ${index === 0 ? 'disabled' : ''} aria-label="${escapeAttr(t('mergeMoveUp'))}">↑</button>
+          <button type="button" data-merge-action="down" data-merge-index="${index}" ${index === ctx.sources.length - 1 ? 'disabled' : ''} aria-label="${escapeAttr(t('mergeMoveDown'))}">↓</button>
+          <button type="button" data-merge-action="remove" data-merge-index="${index}" aria-label="${escapeAttr(t('delete'))}">×</button>
+        </span>
+      </div>`).join('');
+
+    const checked = ctx.preflight;
+    $('#mergeFormat').textContent = checked?.formatLabel || state.dataset?.formatLabel || '—';
+    const preflight = $('#mergePreflight');
+    preflight.classList.remove('ok', 'error');
+    if (ctx.checking) {
+      preflight.textContent = t('mergeChecking');
+    } else if (ctx.sources.length < 2) {
+      preflight.textContent = t('mergeNeedTwo');
+    } else if (checked?.compatible) {
+      preflight.textContent = t('mergeCompatible');
+      preflight.classList.add('ok');
+    } else if (checked) {
+      const conflicts = checked.conflicts || [];
+      preflight.innerHTML = `<strong>${escapeHtml(t('mergeIncompatible'))}</strong><ul>${conflicts.map((item) => `<li>${escapeHtml(item.message || String(item))}</li>`).join('')}</ul>`;
+      preflight.classList.add('error');
+    } else {
+      preflight.textContent = t('mergeChecking');
+    }
+
+    const stats = $('#mergeStats');
+    stats.innerHTML = checked ? [
+      [checked.sources?.length || ctx.sources.length, t('mergeStatSources')],
+      [checked.totalEpisodes || 0, t('mergeStatEpisodes')],
+      [Number(checked.totalFrames || 0).toLocaleString(), t('mergeStatFrames')],
+      [checked.totalLabels || 0, t('mergeStatLabels')],
+    ].map(([value, label]) => `<div class="export-scope-stat"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join('') : '';
+    const output = $('#mergeOutput')?.value.trim() || '';
+    $('#startMerge').disabled = !checked?.compatible || !output.startsWith('/') || ctx.checking;
+  }
+
+  async function runMergePreflight() {
+    const ctx = state.mergeContext;
+    if (!ctx || ctx.sources.length < 2) return renderMergeDialog();
+    const sequence = ++ctx.requestSequence;
+    ctx.checking = true;
+    renderMergeDialog();
+    try {
+      const result = await api('/api/merge/preflight', {
+        method: 'POST',
+        body: JSON.stringify({ sources: ctx.sources }),
+      });
+      if (!state.mergeContext || sequence !== state.mergeContext.requestSequence) return;
+      ctx.preflight = result;
+    } catch (error) {
+      if (!state.mergeContext || sequence !== state.mergeContext.requestSequence) return;
+      ctx.preflight = { compatible: false, conflicts: [{ message: error.message }], sources: [] };
+    } finally {
+      if (state.mergeContext && sequence === state.mergeContext.requestSequence) {
+        ctx.checking = false;
+        renderMergeDialog();
+      }
+    }
+  }
+
+  function openMergePathBrowser() {
+    const ctx = state.mergeContext;
+    if (!ctx) return;
+    $('#mergePathBrowser').classList.toggle('hidden');
+    if (!$('#mergePathBrowser').classList.contains('hidden')) {
+      browseMergeDirectory(ctx.browserPath || state.currentFolder || state.browseRoot || '/');
+    }
+  }
+
+  async function browseMergeDirectory(path) {
+    const ctx = state.mergeContext;
+    if (!ctx) return;
+    const list = $('#mergeBrowserList');
+    list.innerHTML = `<div class="export-browser-empty">${escapeHtml(t('loading'))}</div>`;
+    try {
+      const result = await api(`/api/list?path=${encodeURIComponent(path)}`);
+      if (!state.mergeContext) return;
+      ctx.browserPath = result.path;
+      ctx.browserParent = result.parent;
+      $('#mergeBrowserPath').textContent = result.path;
+      $('#mergeBrowserParent').disabled = !result.parent;
+      const rows = [];
+      if (result.isDataset) {
+        rows.push(`<button type="button" class="export-browser-entry" data-merge-add-path="${escapeAttr(result.path)}"><span>DS</span><span>${escapeHtml(t('mergeAddCurrentDataset'))}</span></button>`);
+      }
+      for (const entry of result.entries || []) {
+        if (entry.isDataset) {
+          rows.push(`<button type="button" class="export-browser-entry" data-merge-add-path="${escapeAttr(entry.path)}"><span>DS</span><span>${escapeHtml(entry.name)} · ${escapeHtml(entry.formatLabel || '')}</span></button>`);
+        } else if (entry.isDir !== false) {
+          rows.push(`<button type="button" class="export-browser-entry" data-merge-browse-path="${escapeAttr(entry.path)}"><span>▰</span><span>${escapeHtml(entry.name)}</span></button>`);
+        }
+      }
+      list.innerHTML = rows.join('') || `<div class="export-browser-empty">${escapeHtml(t('exportNoSubdirectories'))}</div>`;
+    } catch (error) {
+      list.innerHTML = `<div class="export-browser-empty error">${escapeHtml(error.message)}</div>`;
+    }
+  }
+
+  async function startMerge() {
+    const ctx = state.mergeContext;
+    const output = $('#mergeOutput')?.value.trim() || '';
+    if (!ctx || !ctx.preflight?.compatible) return showToast(t('mergeMustPass'), true);
+    if (!output.startsWith('/')) return showToast(t('exportAbsolutePathRequired'), true);
+    const progress = $('#mergeProgress');
+    progress.classList.remove('hidden');
+    progress.querySelector('i').style.width = '5%';
+    progress.querySelector('span').textContent = t('mergePreparing');
+    $('#startMerge').disabled = true;
+    try {
+      const job = await api('/api/merge/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          sources: ctx.sources,
+          output,
+          mediaMode: $('#mergeMediaMode').value,
+          copyLabels: $('#mergeCopyLabels').checked,
+        }),
+      });
+      showToast(t('mergeStarted', { id: String(job.jobId || '').slice(0, 8) }));
+      closeMergeDialog();
+      await refreshConvertJobs();
+      trackConvertJob(job.jobId);
+    } catch (error) {
+      showToast(error.message, true);
+      progress.classList.add('hidden');
+      renderMergeDialog();
+    }
+  }
+
   // Shared job poller: re-entrancy guard + exponential backoff on errors.
   function createJobPoller({ refresh, isActive, interval = 1500, maxInterval = 10000 }) {
     let timer = null;
@@ -2553,11 +3221,15 @@
       if (job.status === 'queued' || job.status === 'running') convertPoller.tracked.add(job.jobId);
       if (prev && prev !== job.status) {
         if (job.status === 'completed') {
-          const reportPath = job.result?.reportPath || '';
-          showToast(t('convertDone', {
-            output: job.result?.output || job.output || '',
-            report: reportPath ? t('convertReport', { path: reportPath }) : '',
-          }));
+          if (job.kind === 'merge') {
+            showToast(t('mergeDone', { output: job.result?.output || job.output || '' }));
+          } else {
+            const reportPath = job.result?.reportPath || '';
+            showToast(t('convertDone', {
+              output: job.result?.output || job.output || '',
+              report: reportPath ? t('convertReport', { path: reportPath }) : '',
+            }));
+          }
         } else if (job.status === 'failed') {
           showToast(job.message || t('convertFailed'), true);
         }
@@ -2582,7 +3254,9 @@
       const pct = Math.max(0, Math.min(100, Math.round((Number(job.progress) || 0) * 100)));
       const status = job.status || 'unknown';
       const shortId = String(job.jobId || '').slice(0, 8);
-      const src = String(job.dataset || '').split('/').pop() || job.dataset || '';
+      const src = job.kind === 'merge'
+        ? t('mergeJobSources', { n: job.sourceCount || job.sources?.length || 0 })
+        : String(job.dataset || '').split('/').pop() || job.dataset || '';
       const detail = job.total
         ? `${job.current || 0}/${job.total}`
         : '';
@@ -2598,7 +3272,7 @@
           <span class="convert-job-status">${escapeHtml(statusLabel(status))}</span>
           ${dismissBtn}
         </div>
-        <div class="convert-job-meta">${escapeHtml(src)} → ${escapeHtml(job.targetFormat || '')}${detail ? ` · ${escapeHtml(detail)}` : ''}</div>
+        <div class="convert-job-meta">${escapeHtml(src)} → ${escapeHtml(job.kind === 'merge' ? t('mergeJobOutput') : (job.targetFormat || ''))}${detail ? ` · ${escapeHtml(detail)}` : ''}</div>
         <div class="convert-job-bar"><i style="width:${pct}%"></i></div>
         <div class="convert-job-msg">${escapeHtml(job.message || '')}${status === 'completed' && resultPath ? `<br><span class="muted">${escapeHtml(resultPath)}${report}</span>` : ''}</div>
       </div>`;

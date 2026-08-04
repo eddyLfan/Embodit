@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,10 @@ from datasets.export import (  # noqa: E402
 )
 from datasets.registry import open_dataset  # noqa: E402
 from datasets.view import FORMAT_LABELS, SUPPORTED_FORMATS  # noqa: E402
+from deploy.orchestrator import OrchestrationRegistry  # noqa: E402
+from deploy.recipe import parse_recipe as parse_deployment_recipe, redact_recipe  # noqa: E402
+from deploy.store import RecipeStore  # noqa: E402
+from merge.pipeline import preflight_merge  # noqa: E402
 from labels.store import (  # noqa: E402
     default_labels_path,
     delete_label,
@@ -129,6 +134,13 @@ class ConvertRequest(BaseModel):
     mapping: dict[str, Any] = Field(default_factory=dict)
 
 
+class MergeRequest(BaseModel):
+    sources: list[str]
+    output: str | None = None
+    mediaMode: str = "hardlink"
+    copyLabels: bool = True
+
+
 class AugmentRequest(BaseModel):
     dataset: str
     output: str | None = None
@@ -191,13 +203,49 @@ class QCEpisodeReviewRequest(BaseModel):
     decision: str | None = None
     note: str = ""
 
+
+class DeploymentRecipeRequest(BaseModel):
+    recipe: dict[str, Any]
+
+
+class DeploymentConfirmationRequest(BaseModel):
+    confirmation: str
+
+
+class DeploymentEmergencyStopRequest(BaseModel):
+    reason: str = Field(default="网页急停", max_length=500)
+
+
+class DeploymentOrchestrationStartRequest(BaseModel):
+    recipe: dict[str, Any]
+    mode: str | None = None
+
+
+class DeploymentOrchestrationLogsRequest(BaseModel):
+    component: str
+    lines: int = Field(default=100, ge=1, le=1000)
+
 def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
-    app = FastAPI(title="Embodit · Embodied Intelligence Toolkit", docs_url=None, redoc_url=None)
     browse_root = existing_root(browse_root)
     images_root = web_root.parent / "images"
     jobs_dir = default_convert_jobs_dir()
     augment_jobs_dir = default_augment_jobs_dir()
     qc_jobs_dir = default_qc_jobs_dir()
+    deploy_root = settings.CACHE_DIR / "deploy"
+    deployment_recipes = RecipeStore(deploy_root / "recipes")
+    deployment_orchestrations = OrchestrationRegistry(deploy_root / "orchestrations")
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        yield
+        deployment_orchestrations.stop_all()
+
+    app = FastAPI(
+        title="Embodit · Embodied Intelligence Toolkit",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=lifespan,
+    )
 
     def authorize(
         query_token: str | None = Query(default=None, alias="token"),
@@ -522,6 +570,54 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             **job,
             "detached": True,
             "hint": "任务已在独立后台进程运行，关闭网页或终端不会中断（需服务机保持开机）。",
+        }
+
+    @app.post("/api/merge/preflight", dependencies=[Depends(authorize)])
+    def merge_preflight(request: MergeRequest) -> dict[str, Any]:
+        if len(request.sources) < 2:
+            raise HTTPException(status_code=400, detail="至少需要两个源数据集")
+        sources = [sandboxed(path, what="源数据集路径") for path in request.sources]
+        try:
+            return preflight_merge(sources)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/merge/start", dependencies=[Depends(authorize)])
+    def start_merge(request: MergeRequest) -> dict[str, Any]:
+        if len(request.sources) < 2:
+            raise HTTPException(status_code=400, detail="至少需要两个源数据集")
+        if not request.output:
+            raise HTTPException(status_code=400, detail="需要输出路径")
+        if request.mediaMode not in {"hardlink", "copy"}:
+            raise HTTPException(status_code=400, detail="mediaMode 只能是 hardlink 或 copy")
+        sources = [sandboxed(path, what="源数据集路径") for path in request.sources]
+        output = sandboxed(request.output, what="输出路径")
+        try:
+            preflight = preflight_merge(sources)
+            if not preflight["compatible"]:
+                messages = "；".join(item["message"] for item in preflight["conflicts"][:8])
+                raise ValueError(f"数据集不兼容：{messages}")
+            job = create_convert_job(
+                dataset=sources[0],
+                output=output,
+                target_format=str(preflight["format"]),
+                jobs_dir=jobs_dir,
+                kind="merge",
+                extra={
+                    "sources": [str(path) for path in sources],
+                    "mediaMode": request.mediaMode,
+                    "copyLabels": request.copyLabels,
+                    "sourceCount": len(sources),
+                },
+            )
+            job = launch_convert_worker(job["jobId"], jobs_dir=jobs_dir)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            **job,
+            "detached": True,
+            "episodeCount": int(preflight["totalEpisodes"]),
+            "hint": "合并已在独立后台进程运行，可在任务面板查看进度。",
         }
 
     @app.get("/api/convert/status/{job_id}", dependencies=[Depends(authorize)])
@@ -921,6 +1017,216 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             content,
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="qc-{scan_id[:8]}-{kind}.csv"'},
+        )
+
+    @app.post("/api/deploy/recipes/validate", dependencies=[Depends(authorize)])
+    def validate_deployment_recipe(request: DeploymentRecipeRequest) -> dict[str, Any]:
+        try:
+            recipe = parse_deployment_recipe(request.recipe)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        payload = redact_recipe(recipe.model_dump(mode="json"))
+        return {"valid": True, "recipe": payload, "version": 2}
+
+    @app.get("/api/deploy/recipes", dependencies=[Depends(authorize)])
+    def list_deployment_recipes() -> dict[str, Any]:
+        recipes = deployment_recipes.list()
+        return {"recipes": recipes, "count": len(recipes)}
+
+    @app.post("/api/deploy/recipes", dependencies=[Depends(authorize)])
+    def save_deployment_recipe(request: DeploymentRecipeRequest) -> dict[str, Any]:
+        try:
+            return {"saved": True, "recipe": deployment_recipes.save(request.recipe)}
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/deploy/recipes/{recipe_id}", dependencies=[Depends(authorize)])
+    def get_deployment_recipe(recipe_id: str) -> dict[str, Any]:
+        try:
+            return {"recipe": deployment_recipes.get(recipe_id), "version": 2}
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.delete("/api/deploy/recipes/{recipe_id}", dependencies=[Depends(authorize)])
+    def delete_deployment_recipe(recipe_id: str) -> dict[str, Any]:
+        try:
+            deleted = deployment_recipes.delete(recipe_id)
+            return {"deleted": deleted, "deploymentId": recipe_id}
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/deploy/capabilities", dependencies=[Depends(authorize)])
+    def deployment_capabilities() -> dict[str, Any]:
+        return {
+            "recipeVersion": 2,
+            "modelProviders": ["python", "external"],
+            "robotClients": ["ros2_standard", "custom"],
+            "features": {
+                "recipeOrchestration": True,
+                "managedSshTunnel": True,
+                "remoteSystemd": True,
+                "rosReadiness": True,
+                "continuousLoop": True,
+                "recording": True,
+                "actionLimits": True,
+                "manualArmConfirmation": True,
+                "emergencyStop": True,
+            },
+        }
+
+    @app.post("/api/deploy/doctor", dependencies=[Depends(authorize)])
+    def deployment_doctor(request: DeploymentRecipeRequest) -> dict[str, Any]:
+        try:
+            recipe = parse_deployment_recipe(request.recipe)
+            return {
+                "ok": True,
+                "deploymentId": recipe.deployment_id,
+                "recipeVersion": 2,
+                "summary": {"passed": 5, "warnings": 0, "failed": 0},
+                "checks": [
+                    {"code": "recipe.schema", "status": "pass", "message": "Recipe v2 schema 有效", "details": {}},
+                    {"code": "recipe.topology", "status": "pass", "message": "模型、本体与隧道主机引用有效", "details": {}},
+                    {"code": "recipe.model", "status": "pass", "message": "模型 Provider 与 Checkpoint 配置有效", "details": {}},
+                    {"code": "recipe.ros", "status": "pass", "message": "ROS 环境与 readiness 契约已配置", "details": {}},
+                    {"code": "recipe.rollback", "status": "pass", "message": "停止与自动回滚策略有效", "details": {}},
+                ],
+                "note": "远端 SSH、systemd、模型、隧道和 ROS 动态检查将在启动编排中按顺序执行",
+            }
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/deploy/examples/{name}", dependencies=[Depends(authorize)])
+    def deployment_example(name: str) -> dict[str, Any]:
+        if name != "recipe-v2":
+            raise HTTPException(status_code=404, detail="部署示例不存在")
+        path = ROOT.parent / "config" / "deployment.recipe-v2.example.json"
+        recipe = json.loads(path.read_text(encoding="utf-8"))
+        return {"name": name, "recipe": recipe}
+
+    @app.get("/api/deploy/orchestrations", dependencies=[Depends(authorize)])
+    def list_deployment_orchestrations() -> dict[str, Any]:
+        values = deployment_orchestrations.list()
+        return {"orchestrations": values, "count": len(values)}
+
+    @app.post("/api/deploy/orchestrations", dependencies=[Depends(authorize)])
+    def start_deployment_orchestration(request: DeploymentOrchestrationStartRequest) -> dict[str, Any]:
+        try:
+            item = deployment_orchestrations.create(request.recipe, mode=request.mode)
+            return item.start()
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/deploy/orchestrations/{orchestration_id}", dependencies=[Depends(authorize)])
+    def get_deployment_orchestration(orchestration_id: str) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).snapshot()
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/arm-challenge",
+        dependencies=[Depends(authorize)],
+    )
+    def deployment_orchestration_arm_challenge(orchestration_id: str) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).arm_challenge()
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/start-live",
+        dependencies=[Depends(authorize)],
+    )
+    def deployment_orchestration_start_live(
+        orchestration_id: str,
+        request: DeploymentConfirmationRequest,
+    ) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).promote_live(request.confirmation)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/stop",
+        dependencies=[Depends(authorize)],
+    )
+    def stop_deployment_orchestration(orchestration_id: str) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).stop()
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/emergency-stop",
+        dependencies=[Depends(authorize)],
+    )
+    def emergency_stop_deployment_orchestration(
+        orchestration_id: str,
+        request: DeploymentEmergencyStopRequest,
+    ) -> dict[str, Any]:
+        try:
+            item = deployment_orchestrations.get(orchestration_id)
+            item.last_error = request.reason
+            return item.stop(emergency=True)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/logs",
+        dependencies=[Depends(authorize)],
+    )
+    def deployment_orchestration_logs(
+        orchestration_id: str,
+        request: DeploymentOrchestrationLogsRequest,
+    ) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).component_logs(
+                request.component,
+                request.lines,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/components/{component}/restart",
+        dependencies=[Depends(authorize)],
+    )
+    def restart_deployment_orchestration_component(
+        orchestration_id: str,
+        component: str,
+    ) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).restart_component(component)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get(
+        "/api/deploy/orchestrations/{orchestration_id}/manifest",
+        dependencies=[Depends(authorize)],
+    )
+    def deployment_orchestration_manifest(orchestration_id: str) -> Response:
+        try:
+            payload = deployment_orchestrations.get(orchestration_id).manifest()
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return Response(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="embodit-orchestration-{orchestration_id[:8]}.json"'},
         )
 
     return app

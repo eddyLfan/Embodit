@@ -30,11 +30,13 @@ def main() -> int:
         print(f"job not found: {job_id}", file=sys.stderr)
         return 2
 
+    job_kind = str(job.get("kind") or "convert")
+
     update_job(
         jobs_dir,
         job_id,
         status="running",
-        message="转换中…",
+        message="合并中…" if job_kind == "merge" else "转换中…",
         progress=0.01,
         pid=os.getpid(),
     )
@@ -52,6 +54,9 @@ def main() -> int:
             return
         last_write["t"] = now
         last_write["current"] = current
+        finished_count = int(
+            result.get("episodes") or result.get("totalEpisodes") or job.get("total") or 0
+        )
         update_job(
             jobs_dir,
             job_id,
@@ -64,7 +69,7 @@ def main() -> int:
         )
 
     try:
-        if str(job.get("kind") or "convert") == "export":
+        if job_kind == "export":
             from datasets.export import export_dataset
 
             labels_path = Path(job["labelsPath"]) if job.get("labelsPath") else None
@@ -78,6 +83,27 @@ def main() -> int:
                 labels_path=labels_path if labels_path and labels_path.is_file() else None,
                 progress_callback=on_progress,
             )
+        elif job_kind == "merge":
+            import signal
+
+            from merge.pipeline import merge_datasets
+
+            previous_handler = signal.getsignal(signal.SIGTERM)
+
+            def cancel_merge(_signum, _frame):
+                raise KeyboardInterrupt("merge cancelled")
+
+            signal.signal(signal.SIGTERM, cancel_merge)
+            try:
+                result = merge_datasets(
+                    [Path(path) for path in (job.get("sources") or [])],
+                    Path(job["output"]),
+                    media_mode=str(job.get("mediaMode") or "hardlink"),
+                    copy_labels=bool(job.get("copyLabels", True)),
+                    progress_callback=on_progress,
+                )
+            finally:
+                signal.signal(signal.SIGTERM, previous_handler)
         else:
             result = convert_dataset(
                 Path(job["dataset"]),
@@ -91,10 +117,10 @@ def main() -> int:
             jobs_dir,
             job_id,
             status="completed",
-            message="转换完成",
+            message="合并导出完成" if job_kind == "merge" else "转换完成",
             progress=1.0,
-            current=int(result.get("episodes") or job.get("total") or 0),
-            total=int(result.get("episodes") or job.get("total") or 0),
+            current=finished_count,
+            total=finished_count,
             result=result,
             pid=os.getpid(),
         )

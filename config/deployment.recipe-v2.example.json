@@ -1,0 +1,208 @@
+{
+  "version": 2,
+  "deployment_id": "robot-a-vla",
+  "name": "Robot A + VLA Server",
+  "hosts": {
+    "model": {
+      "address": "10.40.1.181",
+      "port": 5115,
+      "user": "root",
+      "auth": {
+        "type": "password",
+        "password": "CHANGE_ME_MODEL_PASSWORD"
+      },
+      "host_key_policy": "accept-new",
+      "service_manager": "system"
+    },
+    "robot": {
+      "address": "192.168.10.20",
+      "port": 22,
+      "user": "root",
+      "auth": {
+        "type": "password",
+        "password": "CHANGE_ME_ROBOT_PASSWORD"
+      },
+      "host_key_policy": "accept-new",
+      "service_manager": "system"
+    }
+  },
+  "model": {
+    "host": "model",
+    "workdir": "/root/vla",
+    "setup": [],
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "0"
+    },
+    "provider": "python",
+    "entrypoint": "my_vla:MyVLA",
+    "checkpoint": "/root/checkpoints/my-vla",
+    "python_executable": "/root/miniconda3/envs/vla/bin/python",
+    "load_kwargs": {},
+    "predict_kwargs": {},
+    "startup_timeout_s": 180,
+    "restart": "on-failure"
+  },
+  "tunnel": {
+    "source_host": "robot",
+    "destination_host": "model",
+    "local_bind": "127.0.0.1",
+    "local_port": 8000,
+    "remote_bind": "127.0.0.1",
+    "remote_port": 8000,
+    "server_alive_interval_s": 10,
+    "server_alive_count_max": 3,
+    "restart": "always",
+    "health_path": "/health",
+    "startup_timeout_s": 30
+  },
+  "robot": {
+    "host": "robot",
+    "ros": {
+      "version": 2,
+      "distro": "humble",
+      "setup": [
+        "/opt/ros/humble/setup.bash",
+        "/root/robot_ws/install/setup.bash"
+      ],
+      "domain_id": 18
+    },
+    "bringup": {
+      "command": [
+        "ros2",
+        "launch",
+        "vendor_robot_bringup",
+        "robot.launch.py"
+      ],
+      "workdir": "/root/robot_ws",
+      "startup_timeout_s": 60,
+      "restart": "on-failure"
+    },
+    "readiness": {
+      "timeout_s": 60,
+      "interval_s": 1,
+      "nodes": [
+        "/robot_driver",
+        "/controller_manager"
+      ],
+      "topics": [
+        {
+          "name": "/joint_states",
+          "type": "sensor_msgs/msg/JointState",
+          "minimum_rate_hz": 50,
+          "sample_seconds": 2,
+          "maximum_age_ms": 200
+        }
+      ],
+      "actions": [
+        {
+          "name": "/arm_controller/follow_joint_trajectory",
+          "type": "control_msgs/action/FollowJointTrajectory"
+        }
+      ]
+    },
+    "power_on": {
+      "type": "ros2_service",
+      "name": "/robot/enable",
+      "service_type": "std_srvs/srv/SetBool",
+      "request": {
+        "data": true
+      },
+      "timeout_s": 10
+    },
+    "power_off": {
+      "type": "ros2_service",
+      "name": "/robot/enable",
+      "service_type": "std_srvs/srv/SetBool",
+      "request": {
+        "data": false
+      },
+      "timeout_s": 10
+    },
+    "hold": {
+      "type": "ros2_service",
+      "name": "/robot/hold",
+      "service_type": "std_srvs/srv/Trigger",
+      "request": {},
+      "timeout_s": 5
+    },
+    "stop": {
+      "type": "ros2_service",
+      "name": "/robot/stop",
+      "service_type": "std_srvs/srv/Trigger",
+      "request": {},
+      "timeout_s": 5
+    },
+    "initial_pose": {
+      "type": "follow_joint_trajectory",
+      "action": "/arm_controller/follow_joint_trajectory",
+      "joint_state_topic": "/joint_states",
+      "joint_names": [
+        "joint1",
+        "joint2",
+        "joint3",
+        "joint4",
+        "joint5",
+        "joint6"
+      ],
+      "positions": [
+        0.0,
+        -0.5,
+        0.3,
+        0.0,
+        0.4,
+        0.0
+      ],
+      "duration_s": 5,
+      "tolerance": 0.03,
+      "timeout_s": 20
+    },
+    "client": {
+      "host": "robot",
+      "builtin": "ros2_standard",
+      "config": {
+        "node_name": "vla_robot_client",
+        "status_topic": "/embodit/deployment_status",
+        "loop_rate_hz": 10,
+        "watchdog_timeout_s": 1.0,
+        "observation_timeout_s": 3,
+        "maximum_observation_age_ms": 500,
+        "observations": {
+          "joint_position": {
+            "topic": "/joint_states",
+            "type": "sensor_msgs/msg/JointState",
+            "joints": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+          }
+        },
+        "controller": {
+          "action": "/arm_controller/follow_joint_trajectory",
+          "server_timeout_s": 3
+        },
+        "action": {
+          "joints": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+          "horizon": 8,
+          "rate_hz": 50,
+          "baseline_observation": "joint_position",
+          "limits": {
+            "minimum": [-2.8, -2.0, -2.8, -3.0, -2.8, -3.0],
+            "maximum": [2.8, 2.0, 2.8, 3.0, 2.8, 3.0],
+            "max_step": [0.1, 0.1, 0.1, 0.15, 0.15, 0.2]
+          }
+        }
+      },
+      "startup_timeout_s": 30,
+      "restart": "on-failure",
+      "health": {
+        "type": "ros_node",
+        "name": "/vla_robot_client",
+        "startup_timeout_s": 30,
+        "interval_s": 1
+      }
+    }
+  },
+  "runtime": {
+    "default_mode": "dry_run",
+    "auto_rollback": true,
+    "stop_model_on_exit": true,
+    "power_off_on_exit": false
+  }
+}

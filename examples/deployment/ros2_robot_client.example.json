@@ -1,0 +1,41 @@
+{
+  "deployment_id": "robot-a-vla",
+  "node_name": "vla_robot_client",
+  "status_topic": "/embodit/deployment_status",
+  "mode": "dry_run",
+  "loop_rate_hz": 10,
+  "watchdog_timeout_s": 1.0,
+  "observation_timeout_s": 3,
+  "maximum_observation_age_ms": 500,
+  "model": {
+    "endpoint": "http://127.0.0.1:8000",
+    "infer_path": "/infer",
+    "timeout_s": 10
+  },
+  "observations": {
+    "joint_position": {
+      "topic": "/joint_states",
+      "type": "sensor_msgs/msg/JointState",
+      "joints": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+    },
+    "wrist_camera": {
+      "topic": "/camera/wrist/image_raw/compressed",
+      "type": "sensor_msgs/msg/CompressedImage"
+    }
+  },
+  "controller": {
+    "action": "/arm_controller/follow_joint_trajectory",
+    "server_timeout_s": 3
+  },
+  "action": {
+    "joints": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"],
+    "horizon": 8,
+    "rate_hz": 50,
+    "baseline_observation": "joint_position",
+    "limits": {
+      "minimum": [-2.8, -2.0, -2.8, -3.0, -2.8, -3.0],
+      "maximum": [2.8, 2.0, 2.8, 3.0, 2.8, 3.0],
+      "max_step": [0.1, 0.1, 0.1, 0.15, 0.15, 0.2]
+    }
+  }
+}

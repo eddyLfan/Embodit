@@ -1,11 +1,14 @@
 {
+  "version": 3,
   "profile": "standard",
   "requirements": {
     "action": true,
     "state": false,
     "minimumCameras": 1,
     "requiredCameraKeys": [],
-    "requiredCameraPatterns": []
+    "requiredCameraPatterns": [],
+    "lengthToleranceFrames": 2,
+    "lengthToleranceRatio": 0.1
   },
   "detectors": {
     "signalIntegrity": {"enabled": true},
@@ -26,18 +29,56 @@
       "minimumAccelerationRangeRatio": 0.15,
       "minimumJerkRangeRatio": 0.3,
       "derivativeAlignmentFrames": 1,
-      "stationaryMinimumSeconds": 3.0
+      "minimumAnomalySeconds": 0.08,
+      "mergeGapSeconds": 0.15,
+      "stationaryDelta": 0.0005,
+      "stationaryMinimumSeconds": 3.0,
+      "nearZeroMotionRange": 0.01,
+      "excludeNamePatterns": ["gripper"]
     },
-    "visualQuality": {"enabled": true, "sampleFps": 4.0, "resizeWidth": 320},
-    "cameraShake": {"enabled": true, "staticCameraKeys": []},
-    "gripper": {"enabled": true, "allowMultipleGrasps": false}
+    "visualQuality": {
+      "enabled": true,
+      "darkMeanThreshold": 40.0,
+      "brightMeanThreshold": 245.0,
+      "blurVarianceThreshold": 35.0,
+      "minimumIssueSeconds": 0.5,
+      "mergeGapSeconds": 0.25,
+      "sampleFps": 4.0,
+      "resizeWidth": 320
+    },
+    "cameraShake": {
+      "enabled": true,
+      "staticCameraKeys": [],
+      "sampleFps": 2.0,
+      "resizeWidth": 320,
+      "jitterThreshold": 4.0,
+      "uniformMotionRatio": 0.45
+    },
+    "gripper": {
+      "enabled": true,
+      "namePatterns": ["gripper", "finger", "jaw"],
+      "transitionThreshold": 0.2,
+      "maxTransitionsPerSecond": 4.0,
+      "regraspWindowSeconds": 5.0,
+      "allowMultipleGrasps": false
+    }
+  },
+  "intervals": {
+    "contextSeconds": 0.1
   },
   "scoring": {
     "passQualityScore": 80,
     "passUsableRatio": 90,
-    "minimumCoverage": 80
+    "minimumCoverage": 80,
+    "severityWeights": {
+      "info": 0.0,
+      "warning": 0.25,
+      "error": 1.0,
+      "fatal": 1.0
+    }
   },
   "runtime": {
+    "sleepBetweenEpisodes": 0.0,
     "episodeWorkers": 2,
     "cameraWorkers": 2
   }

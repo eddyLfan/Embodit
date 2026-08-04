@@ -1,9 +1,7 @@
 # Optional third-party components
 
 Embodit contains its own brightness, mask recoloring, and solid-background
-algorithms under `backend/augment/`. They were adapted from the project's
-original `data_strengthen/augment` prototype and are released under Embodit's
-MIT license.
+algorithms under `backend/augment/`.
 
 Color augmentation additionally uses **SAM3** from Meta:
 
