@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_DIR = PROJECT_ROOT / "config"
+DATA_CONFIG_DIR = CONFIG_DIR / "data"
+DEPLOYMENT_CONFIG_DIR = CONFIG_DIR / "deployment"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -41,6 +44,15 @@ MCAP_GAP_S = _env_float("EMBODIT_MCAP_GAP_S", 2.0)
 # Restrict client-supplied paths to the browse root. Off by default so users
 # can browse anywhere on the machine; set EMBODIT_SANDBOX=1 to enforce.
 SANDBOX_PATHS = os.environ.get("EMBODIT_SANDBOX", "").strip() in {"1", "true", "yes"}
+
+# Human-review dropdown options. The server reads this file on each page load,
+# so editing it only requires a browser refresh (override: EMBODIT_REVIEW_CONFIG).
+_review_config_override = os.environ.get("EMBODIT_REVIEW_CONFIG", "").strip()
+REVIEW_CONFIG_PATH = (
+    Path(_review_config_override).expanduser().resolve()
+    if _review_config_override
+    else DATA_CONFIG_DIR / "review.json"
+)
 
 # All generated cache, previews, detached job state and QC reports live under
 # one root.  Keeping this outside source datasets guarantees that maintenance

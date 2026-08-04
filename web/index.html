@@ -83,15 +83,12 @@
       <aside class="episode-panel">
         <div class="filters">
           <input id="search" type="search" data-i18n-placeholder="searchPlaceholder" placeholder="搜索 episode、任务">
-          <div class="filter-row">
-            <select id="stateFilter">
-              <option value="all" data-i18n="filterAll">全部状态</option>
-              <option value="review" data-i18n="filterReview">待审</option>
-              <option value="pass" data-i18n="filterPass">通过</option>
-              <option value="quarantine" data-i18n="filterQuarantine">隔离</option>
-            </select>
-            <label><input id="interventionOnly" type="checkbox"> <span data-i18n="interventionOnly">仅干预</span></label>
-          </div>
+          <select id="stateFilter" class="filter-state-select">
+            <option value="all" data-i18n="filterAll">全部状态</option>
+            <option value="review" data-i18n="filterReview">待审</option>
+            <option value="pass" data-i18n="filterPass">通过</option>
+            <option value="quarantine" data-i18n="filterQuarantine">隔离</option>
+          </select>
         </div>
         <div class="bulk-actions mode-only-filter">
           <button data-bulk="pass" data-i18n="bulkPass">全部通过</button>
@@ -114,12 +111,6 @@
             <span data-i18n="quarantineReasonLabel">不合格原因</span>
             <select id="quarantineReason">
               <option value="" data-i18n="quarantineReasonNone">可选</option>
-              <option value="task_failed" data-i18n="quarantineReasonTaskFailed">任务未完成</option>
-              <option value="unsafe_collision" data-i18n="quarantineReasonUnsafeCollision">碰撞或不安全行为</option>
-              <option value="human_intervention" data-i18n="quarantineReasonHumanIntervention">人工干预</option>
-              <option value="poor_execution" data-i18n="quarantineReasonPoorExecution">执行质量差</option>
-              <option value="sensor_data" data-i18n="quarantineReasonSensorData">传感器或数据异常</option>
-              <option value="other" data-i18n="quarantineReasonOther">其他</option>
             </select>
           </label>
         </div>
@@ -214,48 +205,106 @@
   <main id="deploymentWorkspace" class="deployment-workspace hidden" aria-labelledby="deploymentTitle">
     <section class="deployment-card">
       <div class="deployment-page-title modal-title">
-        <div>
-          <span class="workspace-kicker" data-i18n="deployLayerKicker">REAL-WORLD DEPLOYMENT LAYER</span>
+        <div class="deployment-title-copy">
           <h2 id="deploymentTitle" data-i18n="deployTitle">真机部署工作台</h2>
           <p data-i18n="deployDesc">独立完成本体连接、模型接入、预检、Dry Run、真机运行与实时观测。</p>
         </div>
-        <div class="deployment-page-status"><i></i><span data-i18n="deployControlPlaneReady">部署控制面已就绪</span></div>
-      </div>
-      <div class="deployment-toolbar">
-        <button id="loadDeploymentExample">重置为默认 Recipe</button>
-        <label><span>已保存配置</span><select id="deploymentSavedRecipe"><option value="">—</option></select></label>
-        <button id="loadSavedDeployment">打开</button>
-        <button id="saveDeployment">保存</button>
-        <button id="exportDeployment">导出 JSON</button>
-        <button id="deleteSavedDeployment" class="danger">删除</button>
-        <label class="file-button"><span data-i18n="deployImport">导入 JSON</span><input id="deploymentFile" type="file" accept=".json,application/json"></label>
-        <span id="deploymentState" class="deployment-state">disconnected</span>
+        <div class="deployment-title-status">
+          <div class="deployment-page-status"><i></i><span data-i18n="deployControlPlaneReady">部署控制面已就绪</span></div>
+          <span id="deploymentState" class="deployment-state">disconnected</span>
+        </div>
       </div>
       <div class="deployment-safety-bar">
         <strong>安全模式</strong><span>默认仅 Dry Run；真机动作必须先通过预检、连续试跑和一次性人工确认。</span>
         <button id="emergencyStopDeployment" class="danger emergency" disabled>立即急停</button>
       </div>
       <div class="deployment-layout">
-        <section class="deployment-config-pane">
-          <div class="deployment-pane-title"><strong>部署向导</strong><small>选择模板后通常只需填写连接信息</small></div>
-          <div id="deploymentRecipeV2Summary" class="deployment-recipe-summary">
-            Recipe v2 由工作电脑编排模型、机器人侧 SSH 隧道、ROS Bringup、上电、初始位姿和 Robot Client；模型通常只需填写 Python entrypoint、远端 checkpoint 和运行环境，无需实现 HTTP 服务。
+        <aside class="deployment-config-pane" aria-label="部署配置">
+          <div class="deployment-sidebar-head">
+            <div class="deployment-pane-title"><strong>部署操作</strong><small>按顺序完成真机任务</small></div>
           </div>
-          <details class="deployment-advanced">
-            <summary>Recipe JSON（SSH、模型、ROS、动作语义与安全限位）</summary>
-            <textarea id="deploymentRecipe" spellcheck="false" aria-label="Deployment Recipe JSON"></textarea>
-          </details>
+          <div class="deployment-config-scroll">
+            <div class="deployment-operation-flow">
+              <section class="deployment-operation-step">
+                <div class="deployment-step-number">1</div>
+                <div class="deployment-step-body">
+                  <label for="deploymentRobotSelect">选择本体</label>
+                  <select id="deploymentRobotSelect" aria-label="选择本体"><option value="">正在载入…</option></select>
+                  <div class="deployment-inline-status">
+                    <span id="deploymentRobotStatus" class="deployment-component-status idle"><i></i>未检测连接</span>
+                    <button id="checkDeploymentRobot" type="button">检测连接</button>
+                  </div>
+                </div>
+              </section>
+              <section class="deployment-operation-step">
+                <div class="deployment-step-number">2</div>
+                <div class="deployment-step-body">
+                  <label for="deploymentModelSelect">选择并启动模型</label>
+                  <select id="deploymentModelSelect" aria-label="选择模型"><option value="">正在载入…</option></select>
+                  <div class="deployment-step-actions">
+                    <span id="deploymentModelStatus" class="deployment-component-status idle"><i></i>未启动</span>
+                    <button id="prepareDeploymentModel" class="primary" type="button">启动模型</button>
+                  </div>
+                </div>
+              </section>
+              <section class="deployment-operation-step">
+                <div class="deployment-step-number">3</div>
+                <div class="deployment-step-body">
+                  <label for="deploymentTaskPrompt">任务 Prompt</label>
+                  <input id="deploymentTaskPrompt" list="deploymentTaskPromptOptions" placeholder="选择常用任务或直接输入" autocomplete="off">
+                  <datalist id="deploymentTaskPromptOptions">
+                    <option value="抓取目标物体并放入指定区域"></option>
+                    <option value="将桌面物体整理到托盘中"></option>
+                    <option value="移动机械臂到安全初始位姿"></option>
+                  </datalist>
+                </div>
+              </section>
+              <section class="deployment-operation-step deployment-run-step">
+                <div class="deployment-step-number">4</div>
+                <div class="deployment-step-body">
+                  <span class="deployment-step-label">运行任务</span>
+                  <div class="deployment-run-actions">
+                    <button id="quickstartDeployment" class="primary deploy-launch" disabled data-i18n="deployDryRun">开始 Dry Run</button>
+                    <button id="startLiveDeployment" class="danger" disabled>确认并正式执行</button>
+                  </div>
+                </div>
+              </section>
+            </div>
+            <details class="deployment-config-preview">
+              <summary>查看只读配置</summary>
+              <div class="deployment-composition-meta">
+                <label><span>部署 ID</span><input id="deploymentId" value="robot-a--my-vla" readonly spellcheck="false"></label>
+                <label><span>部署名称</span><input id="deploymentName" value="Robot A + My VLA" readonly spellcheck="false"></label>
+              </div>
+              <div class="deployment-config-editors">
+                <section>
+                  <div class="deployment-config-heading"><strong>本体配置</strong><small>只读预览</small></div>
+                  <textarea id="deploymentRobotConfig" readonly spellcheck="false" aria-label="Robot deployment config JSON preview"></textarea>
+                </section>
+                <section>
+                  <div class="deployment-config-heading"><strong>模型配置</strong><small>只读预览</small></div>
+                  <textarea id="deploymentModelConfig" readonly spellcheck="false" aria-label="Model deployment config JSON preview"></textarea>
+                </section>
+              </div>
+              <details class="deployment-advanced">
+                <summary>查看组合后的 Recipe</summary>
+                <textarea id="deploymentRecipe" readonly spellcheck="false" aria-label="Composed Deployment Recipe JSON"></textarea>
+              </details>
+            </details>
+          </div>
           <div class="deployment-actions">
             <button id="validateDeployment" data-i18n="deployValidate">校验配置</button>
-            <button id="doctorDeployment" class="primary" data-i18n="deployDoctor">运行预检</button>
-            <button id="quickstartDeployment" class="primary deploy-launch" data-i18n="deployDryRun">一键预检并 Dry Run</button>
-            <button id="startLiveDeployment" class="danger" disabled>确认并开始真机</button>
+            <button id="doctorDeployment" data-i18n="deployDoctor">运行预检</button>
             <button id="downloadDeploymentRecord" disabled>下载运行清单</button>
             <button id="stopDeployment" class="danger" disabled data-i18n="deployStop">停止会话</button>
           </div>
-        </section>
-        <section class="deployment-result-pane">
-          <div class="deployment-pane-title"><strong>实时运行状态</strong><small id="deploymentResultHint" data-i18n="deployReady">等待操作</small></div>
+        </aside>
+        <div id="splitDeploymentSidebar" class="splitter splitter-col deployment-splitter" role="separator" aria-orientation="vertical" tabindex="0" title="拖动调整部署操作栏宽度 · 双击复位"></div>
+        <section class="deployment-result-pane" aria-label="真机状态观测">
+          <div class="deployment-observation-head">
+            <div class="deployment-pane-title"><strong>真机状态观测</strong><small id="deploymentResultHint" data-i18n="deployReady">等待操作</small></div>
+            <span class="deployment-reserved-badge">观测区预留</span>
+          </div>
           <div class="deployment-metrics">
             <div><strong id="deployMetricSteps">0</strong><span>完成步骤</span></div>
             <div><strong id="deployMetricHz">—</strong><span>当前步骤</span></div>
@@ -263,14 +312,26 @@
             <div><strong id="deployMetricActions">0</strong><span>活动组件</span></div>
             <div><strong id="deployMetricErrors">0</strong><span>错误</span></div>
           </div>
+          <div class="deployment-observation-stage">
+            <div class="deployment-observation-placeholder">
+              <span class="deployment-observation-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+              <strong>真机状态观测区域</strong>
+              <p>为后续相机画面、关节状态、动作轨迹与告警信息预留</p>
+            </div>
+          </div>
           <div id="deploymentComponents" class="deployment-components hidden"></div>
-          <pre id="deploymentResult">—</pre>
+          <div class="deployment-runtime-details">
+            <details class="deployment-runtime-log">
+              <summary>运行日志</summary>
+              <pre id="deploymentResult">—</pre>
+            </details>
+            <details class="deployment-hosts-section">
+              <summary>部署主机</summary>
+              <div id="deploymentHosts" class="deployment-hosts"><div class="muted">当前 Recipe 没有部署主机</div></div>
+            </details>
+          </div>
         </section>
       </div>
-      <section class="deployment-hosts-section">
-        <div class="deployment-pane-title"><strong>远端主机</strong><small>启动编排时自动连接并验证 SSH 与 systemd 环境</small></div>
-        <div id="deploymentHosts" class="deployment-hosts"><div class="muted">当前 Recipe 没有远端主机</div></div>
-      </section>
     </section>
   </main>
 
@@ -278,20 +339,25 @@
   <div id="toast" class="toast hidden"></div>
 
   <div id="autoFilterDialog" class="modal hidden">
-    <section class="modal-card qc-report-card">
+    <section class="modal-card qc-report-card" role="dialog" aria-modal="true" aria-labelledby="autoFilterDialogTitle">
       <div class="modal-title">
-        <div><h2 data-i18n="autoFilterTitle">自动质检</h2><p data-i18n="autoFilterDesc">配置扫描；完成后直接在筛选页时间轴复核异常片段。</p></div>
+        <div><h2 id="autoFilterDialogTitle" data-i18n="autoFilterTitle">自动质检</h2><p data-i18n="autoFilterDesc">配置扫描；完成后直接在筛选页时间轴复核异常片段。</p></div>
         <button id="closeAutoFilter" data-i18n="close">关闭</button>
       </div>
       <section class="qc-launch">
         <div class="auto-filter-fields">
           <div class="field-block"><span class="field-label" data-i18n="qcDataset">数据集</span><div id="qcDatasetPath" class="convert-source-path">—</div></div>
           <label><span data-i18n="qcProfile">扫描配置</span><select id="qcProfile"><option value="standard" data-i18n="qcProfileStandard">标准扫描</option><option value="fast" data-i18n="qcProfileFast">快速扫描</option><option value="deep" data-i18n="qcProfileDeep">深度扫描</option></select></label>
-          <label><span data-i18n="qcEpisodeWorkers">Episode 并行</span><input id="qcEpisodeWorkers" type="number" min="1" max="16" data-i18n-placeholder="qcWorkersAuto" placeholder="默认"></label>
-          <label><span data-i18n="qcCameraWorkers">相机并行</span><input id="qcCameraWorkers" type="number" min="1" max="16" data-i18n-placeholder="qcWorkersAuto" placeholder="默认"></label>
-          <label><input id="qcRequireState" type="checkbox"> <span data-i18n="qcRequireState">将 state 设为必需</span></label>
-          <label><input id="qcUseCache" type="checkbox" checked> <span data-i18n="qcUseCache">复用匹配的扫描缓存</span></label>
         </div>
+        <details class="qc-advanced">
+          <summary data-i18n="qcAdvancedOptions">高级选项</summary>
+          <div class="qc-advanced-grid">
+            <label><span data-i18n="qcEpisodeWorkers">Episode 并行</span><input id="qcEpisodeWorkers" type="number" min="1" max="16" data-i18n-placeholder="qcWorkersAuto" placeholder="默认"></label>
+            <label><span data-i18n="qcCameraWorkers">相机并行</span><input id="qcCameraWorkers" type="number" min="1" max="16" data-i18n-placeholder="qcWorkersAuto" placeholder="默认"></label>
+            <label class="option-row"><input id="qcRequireState" type="checkbox"> <span><strong data-i18n="qcRequireState">要求包含 state 数据</strong><small data-i18n="qcRequireStateHint">缺少机器人状态的 episode 将被判为不可用</small></span></label>
+            <label class="option-row"><input id="qcUseCache" type="checkbox" checked> <span><strong data-i18n="qcUseCache">复用扫描缓存</strong><small data-i18n="qcUseCacheHint">配置和数据未变化时直接读取上次结果</small></span></label>
+          </div>
+        </details>
         <div class="qc-launch-actions">
           <button id="startQcScan" class="primary" data-i18n="qcStart">开始扫描</button>
           <button id="refreshQcJobs" data-i18n="refresh">刷新</button>
@@ -399,10 +465,11 @@
   </div>
 
   <div id="convertDialog" class="modal hidden">
-    <section class="modal-card">
-      <div class="modal-title"><div><h2 data-i18n="convertTitle">格式转换</h2><p data-i18n="convertDesc">针对整个数据集：源格式不变；结果写入新目录/文件，并生成转换报告。</p></div><button id="closeConvert" data-i18n="close">关闭</button></div>
-      <div class="auto-filter-fields">
-        <div class="field-block">
+    <section class="modal-card modal-card-compact convert-card" role="dialog" aria-modal="true" aria-labelledby="convertDialogTitle">
+      <div class="modal-title"><div><h2 id="convertDialogTitle" data-i18n="convertTitle">格式转换</h2><p data-i18n="convertDesc">针对整个数据集：源格式不变；结果写入新目录/文件，并生成转换报告。</p></div><button id="closeConvert" data-i18n="close">关闭</button></div>
+      <div class="modal-scroll-body">
+      <div class="auto-filter-fields convert-fields">
+        <div class="field-block convert-source-field">
           <span class="field-label" data-i18n="convertSourceLabel">源数据集</span>
           <div id="convertSource" class="convert-source-path">—</div>
         </div>
@@ -414,15 +481,16 @@
             <option value="mcap">MCAP</option>
           </select>
         </label>
-        <p id="convertFidelity" class="convert-bg-hint hidden"></p>
         <label data-i18n="outputPath">输出路径<input id="convertOutput" spellcheck="false"></label>
-        <label data-i18n="mappingJson">映射 JSON（可选）<textarea id="convertMapping" rows="4" placeholder='{"fps": 30, "state_key": "observation.state", "action_key": "action"}'></textarea></label>
+        <p id="convertFidelity" class="field-hint convert-fidelity hidden"></p>
+        <label class="convert-mapping-field" data-i18n="mappingJson">映射 JSON（可选）<textarea id="convertMapping" rows="3" placeholder='{"fps": 30, "state_key": "observation.state", "action_key": "action"}'></textarea></label>
       </div>
       <div id="convertProgress" class="auto-filter-progress hidden"><div><i></i></div><span data-i18n="convertPreparing">准备中…</span></div>
+      </div>
       <div class="modal-actions">
+        <span class="modal-action-hint" data-i18n="convertBgHint">任务在后台执行，关闭页面不会中断。</span>
         <button id="startConvert" class="primary" data-i18n="startConvert">开始后台转换</button>
       </div>
-      <p class="convert-bg-hint" data-i18n="convertBgHint">任务在独立进程后台执行：关闭网页不会中断；通过 embodit.sh 启动时，关闭启动终端通常也不影响。可在页面底部查看进度。</p>
     </section>
   </div>
 
@@ -474,16 +542,17 @@
   </div>
 
   <div id="augmentDialog" class="modal hidden">
-    <section class="modal-card modal-card-wide">
+    <section class="modal-card modal-card-wide modal-card-compact augment-card" role="dialog" aria-modal="true" aria-labelledby="augmentDialogTitle">
       <div class="modal-title">
         <div>
-          <h2 data-i18n="augmentTitle">数据增强</h2>
+          <h2 id="augmentDialogTitle" data-i18n="augmentTitle">数据增强</h2>
           <p data-i18n="augmentDesc">先配置并生成一条测试预览，确认效果后再批量写出新数据集。</p>
         </div>
         <button id="closeAugment" data-i18n="close">关闭</button>
       </div>
-      <div class="auto-filter-fields">
-        <div class="field-block">
+      <div class="modal-scroll-body">
+      <div class="auto-filter-fields augment-fields">
+        <div class="field-block augment-source-field">
           <span class="field-label" data-i18n="augmentSourceLabel">源数据集</span>
           <div id="augmentSource" class="convert-source-path">—</div>
         </div>
@@ -493,7 +562,7 @@
             <option value="color" data-i18n="augmentTypeColor">颜色替换</option>
           </select>
         </label>
-        <p id="augmentAvailability" class="field-hint"></p>
+        <p id="augmentAvailability" class="field-hint augment-availability"></p>
         <div id="augmentBrightnessFields" class="augment-brightness-fields">
           <label data-i18n="augmentBrightnessMode">亮度参数
             <select id="augmentBrightnessMode">
@@ -563,11 +632,12 @@
       <div id="augmentProgress" class="auto-filter-progress hidden"><div><i></i></div><span data-i18n="augmentPreparing">准备中…</span></div>
       <div id="augmentPreviewMeta" class="augment-preview-meta muted hidden"></div>
       <div id="augmentPreviewGrid" class="augment-preview-grid"></div>
+      </div>
       <div class="modal-actions">
+        <span class="modal-action-hint" data-i18n="augmentBgHint">批量任务在后台执行，关闭页面不会中断。</span>
         <button id="runAugmentPreview" class="primary" data-i18n="augmentRunPreview">生成测试</button>
         <button id="startAugmentBatch" disabled data-i18n="augmentStartBatch">确认并批量生成</button>
       </div>
-      <p class="convert-bg-hint" data-i18n="augmentBgHint">批量任务在独立进程后台执行；关闭网页不会中断。可在页面底部查看进度。</p>
     </section>
   </div>
 

@@ -1,12 +1,13 @@
-"""Declarative deployment recipe for workstation-orchestrated real robots.
+"""Composable deployment configs and runtime recipe for real robots.
 
-Recipe v2 deliberately keeps the Embodit Hub out of the control data path.  It
-describes how to start a model service, establish a robot-side SSH tunnel,
-bring ROS up, execute lifecycle operations, and start the robot client.
+Robot/model Config documents are independently reusable. They compose into a
+Recipe, which deliberately keeps the Embodit Hub out of the control data
+path and describes the complete model, tunnel, ROS, and robot-client runtime.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Any, Literal
@@ -51,21 +52,26 @@ class SshAuth(StrictModel):
 
 
 class RecipeHost(StrictModel):
-    address: str
+    connection: Literal["ssh", "local"] = "ssh"
+    address: str = Field(min_length=1)
     port: int = Field(default=22, ge=1, le=65535)
     user: str = Field(min_length=1)
-    auth: SshAuth
+    auth: SshAuth | None = None
     connect_timeout_s: int = Field(default=8, ge=1, le=60)
     host_key_policy: Literal["strict", "accept-new"] = "accept-new"
     service_manager: Literal["system", "user"] = "system"
 
     @model_validator(mode="after")
     def validate_target(self) -> "RecipeHost":
+        if self.connection == "ssh" and self.auth is None:
+            raise ValueError("SSH 主机必须配置 auth")
+        if self.connection == "local" and self.auth is not None:
+            raise ValueError("本地主机由 Embodit 直接执行，不能配置 SSH auth")
         for label, value in (("address", self.address), ("user", self.user)):
             if value.startswith("-") or any(char.isspace() for char in value):
-                raise ValueError(f"SSH {label} 非法")
+                raise ValueError(f"主机 {label} 非法")
         if "@" in self.user:
-            raise ValueError("SSH user 不能包含 @")
+            raise ValueError("主机 user 不能包含 @")
         return self
 
 
@@ -85,9 +91,9 @@ class CommandSpec(StrictModel):
         if any(not item or "\x00" in item for item in self.command):
             raise ValueError("command 不允许空参数或 NUL")
         if self.workdir is not None and not Path(self.workdir).is_absolute():
-            raise ValueError("workdir 必须使用远端绝对路径")
+            raise ValueError("workdir 必须使用目标主机绝对路径")
         if any(not Path(path).is_absolute() for path in self.setup):
-            raise ValueError("setup 必须使用远端绝对路径")
+            raise ValueError("setup 必须使用目标主机绝对路径")
         invalid_environment = [
             key for key in self.environment if not re_fullmatch_environment_name(key)
         ]
@@ -127,13 +133,13 @@ class ManagedService(CommandSpec):
 class ModelService(ManagedService):
     """Model process description.
 
-    ``python`` is the normal user-facing path: Embodit uploads and starts its
-    own HTTP runner, while the user's module only implements ``load`` and
-    ``predict``. ``external`` preserves the original command/HTTP contract for
-    already deployed inference services.
+    Built-in OpenPI/LeRobot/StarVLA providers take a checkpoint and use a
+    pinned adapter. ``python`` accepts a user entrypoint implementing ``load``
+    and ``predict``. ``external`` preserves the command/HTTP contract for an
+    already deployed inference service.
     """
 
-    provider: Literal["external", "python"] = "external"
+    provider: Literal["external", "python", "openpi", "lerobot", "starvla"] = "external"
     entrypoint: str | None = Field(
         default=None,
         pattern=r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_.]*$",
@@ -145,6 +151,7 @@ class ModelService(ManagedService):
     load_kwargs: dict[str, Any] = Field(default_factory=dict)
     predict_kwargs: dict[str, Any] = Field(default_factory=dict)
     maximum_request_bytes: int = Field(default=50_000_000, ge=1024, le=1_000_000_000)
+    source_path: str | None = None
 
     @model_validator(mode="after")
     def validate_provider(self) -> "ModelService":
@@ -157,8 +164,21 @@ class ModelService(ManagedService):
                 raise ValueError("python 模型由 Embodit 自动启动，不能同时配置 command")
             if self.health is not None:
                 raise ValueError("python 模型健康检查由 Embodit 自动生成，不能配置 health")
-            if not self.python_executable or "\x00" in self.python_executable:
-                raise ValueError("python_executable 非法")
+        elif self.provider in {"openpi", "lerobot", "starvla"}:
+            if not self.checkpoint:
+                raise ValueError(f"{self.provider} 模型必须配置 checkpoint")
+            if self.entrypoint:
+                raise ValueError(f"{self.provider} 是内置 Provider，不能配置 entrypoint")
+            if self.command:
+                raise ValueError(f"{self.provider} 模型由 Embodit 自动启动，不能同时配置 command")
+            if self.health is not None:
+                raise ValueError(f"{self.provider} 模型健康检查由 Embodit 自动生成，不能配置 health")
+            if not self.workdir:
+                raise ValueError(f"{self.provider} 模型必须配置包含 third_party/models 的目标主机 workdir")
+        if self.provider != "external" and (not self.python_executable or "\x00" in self.python_executable):
+            raise ValueError("python_executable 非法")
+        if self.source_path is not None and not Path(self.source_path).is_absolute():
+            raise ValueError("source_path 必须使用目标主机绝对路径")
         return self
 
 
@@ -203,7 +223,7 @@ class RosRuntime(StrictModel):
     @model_validator(mode="after")
     def validate_ros(self) -> "RosRuntime":
         if any(not Path(path).is_absolute() for path in self.setup):
-            raise ValueError("ROS setup 必须使用远端绝对路径")
+            raise ValueError("ROS setup 必须使用本体主机绝对路径")
         if self.version == 1 and self.domain_id is not None:
             raise ValueError("ROS1 不支持 domain_id")
         if self.version == 2 and self.master_uri is not None:
@@ -293,6 +313,84 @@ class RuntimePolicy(StrictModel):
     power_off_on_exit: bool = False
 
 
+class RobotBody(StrictModel):
+    """Reusable robot-only portion of a deployment.
+
+    Host references deliberately live outside this model so one robot config
+    can be paired with any model config without editing internal aliases.
+    """
+
+    ros: RosRuntime
+    bringup: CommandSpec
+    readiness: RosReadiness = Field(default_factory=RosReadiness)
+    power_on: RobotOperation = Field(default_factory=RobotOperation)
+    power_off: RobotOperation = Field(default_factory=RobotOperation)
+    hold: RobotOperation = Field(default_factory=RobotOperation)
+    stop: RobotOperation = Field(default_factory=RobotOperation)
+    initial_pose: InitialPose = Field(default_factory=InitialPose)
+    client: RobotClientService
+
+    @model_validator(mode="after")
+    def validate_client_runtime(self) -> "RobotBody":
+        if self.client.builtin == "ros2_standard" and self.ros.version != 2:
+            raise ValueError("内置 ros2_standard Client 只能用于 ROS2")
+        return self
+
+
+class RobotTunnelConfig(StrictModel):
+    """Robot-side half of the managed model tunnel."""
+
+    local_bind: str = "127.0.0.1"
+    local_port: int = Field(ge=1, le=65535)
+    server_alive_interval_s: int = Field(default=10, ge=1, le=300)
+    server_alive_count_max: int = Field(default=3, ge=1, le=20)
+    restart: Literal["on-failure", "always"] = "always"
+    health_path: str = "/health"
+    startup_timeout_s: PositiveFloat = 30
+
+
+class ModelEndpoint(StrictModel):
+    """Model-side endpoint consumed by a robot tunnel."""
+
+    bind: str = "127.0.0.1"
+    port: int = Field(ge=1, le=65535)
+
+
+class RobotConfig(StrictModel):
+    version: Literal[1] = 1
+    kind: Literal["robot"] = "robot"
+    config_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    name: str = Field(min_length=1)
+    host: RecipeHost
+    robot: RobotBody
+    tunnel: RobotTunnelConfig
+    runtime: RuntimePolicy = Field(default_factory=RuntimePolicy)
+
+    @model_validator(mode="after")
+    def validate_remote_robot(self) -> "RobotConfig":
+        if self.host.connection != "ssh":
+            raise ValueError("本体主机当前必须使用 SSH 连接")
+        return self
+
+
+class ModelConfig(StrictModel):
+    version: Literal[1] = 1
+    kind: Literal["model"] = "model"
+    config_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    name: str = Field(min_length=1)
+    host: RecipeHost
+    model: ModelService
+    endpoint: ModelEndpoint
+
+    @model_validator(mode="after")
+    def validate_service_host(self) -> "ModelConfig":
+        # Component configs have no recipe host namespace. Accept an omitted
+        # host or the canonical alias only, then normalize during composition.
+        if self.model.host not in {None, "model"}:
+            raise ValueError("模型配置中的 model.host 必须为空或为 model")
+        return self
+
+
 class DeploymentRecipe(StrictModel):
     version: Literal[2]
     deployment_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
@@ -323,9 +421,109 @@ class DeploymentRecipe(StrictModel):
             raise ValueError("tunnel.destination_host 必须与 model.host 相同")
         if self.robot.client.host not in {None, self.robot.host}:
             raise ValueError("robot.client.host 必须为空或与 robot.host 相同")
+        if self.hosts[self.robot.host].connection != "ssh":
+            raise ValueError("本体主机当前必须使用 SSH 连接")
         if self.robot.client.builtin == "ros2_standard" and self.robot.ros.version != 2:
             raise ValueError("内置 ros2_standard Client 只能用于 ROS2")
         return self
+
+
+def parse_robot_config(raw: dict[str, Any]) -> RobotConfig:
+    return RobotConfig.model_validate(raw)
+
+
+def parse_model_config(raw: dict[str, Any]) -> ModelConfig:
+    return ModelConfig.model_validate(raw)
+
+
+def parse_deployment_config(raw: dict[str, Any]) -> RobotConfig | ModelConfig:
+    kind = raw.get("kind") if isinstance(raw, dict) else None
+    if kind == "robot":
+        return parse_robot_config(raw)
+    if kind == "model":
+        return parse_model_config(raw)
+    raise ValueError("部署组件配置 kind 必须是 robot 或 model")
+
+
+def compose_recipe(
+    robot_config: RobotConfig | dict[str, Any],
+    model_config: ModelConfig | dict[str, Any],
+    *,
+    deployment_id: str | None = None,
+    name: str | None = None,
+    runtime: RuntimePolicy | dict[str, Any] | None = None,
+) -> DeploymentRecipe:
+    """Compose independently managed robot/model configs into a Recipe."""
+
+    robot = robot_config if isinstance(robot_config, RobotConfig) else parse_robot_config(robot_config)
+    model = model_config if isinstance(model_config, ModelConfig) else parse_model_config(model_config)
+    resolved_id = deployment_id or _bounded_config_id(f"{robot.config_id}--{model.config_id}")
+    resolved_runtime = robot.runtime if runtime is None else RuntimePolicy.model_validate(runtime)
+
+    model_service = model.model.model_copy(update={"host": "model"})
+    robot_client = robot.robot.client.model_copy(update={"host": "robot"})
+    robot_deployment = RobotDeployment(
+        host="robot",
+        **robot.robot.model_dump(mode="python", exclude={"client"}),
+        client=robot_client,
+    )
+    tunnel = TunnelSpec(
+        source_host="robot",
+        destination_host="model",
+        remote_bind=model.endpoint.bind,
+        remote_port=model.endpoint.port,
+        **robot.tunnel.model_dump(mode="python"),
+    )
+    return DeploymentRecipe(
+        version=2,
+        deployment_id=resolved_id,
+        name=name or f"{robot.name} + {model.name}",
+        hosts={"robot": robot.host, "model": model.host},
+        model=model_service,
+        tunnel=tunnel,
+        robot=robot_deployment,
+        runtime=resolved_runtime,
+    )
+
+
+def split_recipe(
+    recipe: DeploymentRecipe | dict[str, Any],
+    *,
+    robot_config_id: str | None = None,
+    model_config_id: str | None = None,
+) -> tuple[RobotConfig, ModelConfig]:
+    """Convert a full Recipe into reusable component configs."""
+
+    value = recipe if isinstance(recipe, DeploymentRecipe) else parse_recipe(recipe)
+    robot_body = RobotBody.model_validate(value.robot.model_dump(mode="python", exclude={"host"}))
+    robot = RobotConfig(
+        config_id=robot_config_id or _bounded_config_id(f"{value.deployment_id}-robot"),
+        name=f"{value.name} · Robot",
+        host=value.hosts[value.robot.host],
+        robot=robot_body,
+        tunnel=RobotTunnelConfig.model_validate(
+            value.tunnel.model_dump(
+                mode="python",
+                exclude={"source_host", "destination_host", "remote_bind", "remote_port"},
+            )
+        ),
+        runtime=value.runtime,
+    )
+    model = ModelConfig(
+        config_id=model_config_id or _bounded_config_id(f"{value.deployment_id}-model"),
+        name=f"{value.name} · Model",
+        host=value.hosts[value.model.host or ""],
+        model=value.model.model_copy(update={"host": None}),
+        endpoint=ModelEndpoint(bind=value.tunnel.remote_bind, port=value.tunnel.remote_port),
+    )
+    return robot, model
+
+
+def _bounded_config_id(value: str) -> str:
+    if len(value) <= 64:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
+    return f"{value[:53]}-{digest}"
 
 
 def parse_recipe(raw: dict[str, Any]) -> DeploymentRecipe:
@@ -344,6 +542,18 @@ def load_recipe(path: str | Path) -> DeploymentRecipe:
     return parse_recipe(raw)
 
 
+def load_deployment_config(path: str | Path) -> RobotConfig | ModelConfig:
+    import json
+
+    config_path = Path(path).expanduser().resolve()
+    if config_path.suffix.lower() != ".json":
+        raise ValueError("当前版本的部署组件配置仅支持 .json")
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("部署组件配置根节点必须是对象")
+    return parse_deployment_config(raw)
+
+
 def redact_recipe(raw: dict[str, Any]) -> dict[str, Any]:
     """Return a JSON-safe copy suitable for logs and session records."""
     import copy
@@ -353,6 +563,9 @@ def redact_recipe(raw: dict[str, Any]) -> dict[str, Any]:
         auth = host.get("auth") if isinstance(host, dict) else None
         if isinstance(auth, dict) and auth.get("password"):
             auth["password"] = "********"
+    standalone_auth = value.get("host", {}).get("auth") if isinstance(value.get("host"), dict) else None
+    if isinstance(standalone_auth, dict) and standalone_auth.get("password"):
+        standalone_auth["password"] = "********"
     _redact_environment_values(value)
     return value
 

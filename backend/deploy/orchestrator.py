@@ -1,13 +1,16 @@
-"""Recipe v2 deployment orchestration.
+"""Recipe deployment orchestration.
 
-The workstation is a control plane only.  Long-running model, tunnel, ROS and
-robot-client processes are supervised by systemd on their target hosts.  The
-robot client owns the real-time observation/action loop and safety checks.
+Long-running model, tunnel, ROS and robot-client processes are supervised by
+systemd on their target hosts. The model target may be the Embodit machine
+itself; the robot client still owns the real-time observation/action loop and
+safety checks.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import pwd
 import re
 import secrets
 import shlex
@@ -29,12 +32,13 @@ from .recipe import (
     parse_recipe,
     redact_recipe,
 )
-from .transport import RecipeSshRunner, RemoteResult, require_remote_ok
+from .transport import CommandRunner, LocalCommandRunner, RecipeSshRunner, RemoteResult, require_remote_ok
 
 
 class OrchestrationState(str, Enum):
     PENDING = "pending"
     STARTING = "starting"
+    MODEL_READY = "model_ready"
     DRY_RUN = "dry_run"
     RUNNING = "running"
     STOPPING = "stopping"
@@ -47,7 +51,7 @@ class StopRequested(RuntimeError):
 
 
 class RemoteServiceManager:
-    def __init__(self, runner: RecipeSshRunner, host: RecipeHost, deployment_id: str):
+    def __init__(self, runner: CommandRunner, host: RecipeHost, deployment_id: str):
         self.runner = runner
         self.host = host
         self.deployment_id = deployment_id
@@ -65,11 +69,11 @@ class RemoteServiceManager:
         if self._home is None:
             result = require_remote_ok(
                 self.runner.run(["python3", "-c", "from pathlib import Path; print(Path.home())"]),
-                "读取远端 HOME",
+                "读取目标主机 HOME",
             )
             self._home = result.stdout.strip()
             if not self._home.startswith("/"):
-                raise RuntimeError("远端 HOME 不是绝对路径")
+                raise RuntimeError("目标主机 HOME 不是绝对路径")
         return self._home
 
     @property
@@ -170,7 +174,7 @@ class DeploymentOrchestration:
         recipe: DeploymentRecipe,
         root: Path,
         *,
-        runner_factory: Callable[[str, RecipeHost], RecipeSshRunner] | None = None,
+        runner_factory: Callable[[str, RecipeHost], CommandRunner] | None = None,
     ):
         self.id = uuid.uuid4().hex
         self.recipe = recipe
@@ -192,7 +196,7 @@ class DeploymentOrchestration:
         self._thread: threading.Thread | None = None
         self._arm_token: str | None = None
         self._arm_expires_ns = 0
-        self._runners: dict[str, RecipeSshRunner] = {}
+        self._runners: dict[str, CommandRunner] = {}
         self._managers: dict[str, RemoteServiceManager] = {}
         self._robot_home: str | None = None
         self._model_home: str | None = None
@@ -216,7 +220,9 @@ class DeploymentOrchestration:
             self._managers[name] = RemoteServiceManager(runner, host, recipe.deployment_id)
         self._record("created", mode=self.mode)
 
-    def _default_runner(self, name: str, host: RecipeHost) -> RecipeSshRunner:
+    def _default_runner(self, name: str, host: RecipeHost) -> CommandRunner:
+        if host.connection == "local":
+            return LocalCommandRunner()
         return RecipeSshRunner(
             host,
             self.root / "known_hosts" / name,
@@ -233,11 +239,11 @@ class DeploymentOrchestration:
         return self.recipe.robot.host
 
     @property
-    def model_runner(self) -> RecipeSshRunner:
+    def model_runner(self) -> CommandRunner:
         return self._runners[self.model_host_name]
 
     @property
-    def robot_runner(self) -> RecipeSshRunner:
+    def robot_runner(self) -> CommandRunner:
         return self._runners[self.robot_host_name]
 
     @property
@@ -248,19 +254,68 @@ class DeploymentOrchestration:
     def robot_manager(self) -> RemoteServiceManager:
         return self._managers[self.robot_host_name]
 
-    def start(self) -> dict[str, Any]:
+    def start(self, *, task_prompt: str | None = None) -> dict[str, Any]:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return self.snapshot()
-            if self.state not in {OrchestrationState.PENDING, OrchestrationState.STOPPED, OrchestrationState.FAULT}:
+            if self.state not in {
+                OrchestrationState.PENDING,
+                OrchestrationState.MODEL_READY,
+                OrchestrationState.STOPPED,
+                OrchestrationState.FAULT,
+            }:
                 raise ValueError(f"当前状态不能启动：{self.state.value}")
+            resume_after_model = self.state == OrchestrationState.MODEL_READY and self.components["model"]["active"]
+            if task_prompt is not None:
+                normalized_prompt = task_prompt.strip()
+                if not normalized_prompt:
+                    raise ValueError("任务 Prompt 不能为空")
+                client_config = dict(self.recipe.robot.client.config or {})
+                client_config["task_prompt"] = normalized_prompt
+                self.recipe.robot.client.config = client_config
             self._stop_requested.clear()
             self.last_error = None
             self.state = OrchestrationState.STARTING
-            self._thread = threading.Thread(target=self._run, daemon=True, name=f"recipe-{self.id[:8]}")
+            target = self._run_after_model if resume_after_model else self._run
+            self._thread = threading.Thread(target=target, daemon=True, name=f"recipe-{self.id[:8]}")
             self._thread.start()
-            self._record("start_requested")
+            self._record("dry_run_requested", modelPrepared=resume_after_model)
             return self.snapshot()
+
+    def prepare_model(self) -> dict[str, Any]:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return self.snapshot()
+            if self.state == OrchestrationState.MODEL_READY and self.components["model"]["active"]:
+                return self.snapshot()
+            if self.state not in {OrchestrationState.PENDING, OrchestrationState.STOPPED, OrchestrationState.FAULT}:
+                raise ValueError(f"当前状态不能单独启动模型：{self.state.value}")
+            self._stop_requested.clear()
+            self.last_error = None
+            self.state = OrchestrationState.STARTING
+            self._thread = threading.Thread(target=self._run_model_only, daemon=True, name=f"model-{self.id[:8]}")
+            self._thread.start()
+            self._record("model_prepare_requested")
+            return self.snapshot()
+
+    def _run_model_only(self) -> None:
+        try:
+            self._step("precheck", self._precheck)
+            self._step("model", self._start_model)
+            self._step("model_health", self._wait_model_health)
+            with self._lock:
+                self.state = OrchestrationState.MODEL_READY
+                self.current_step = None
+                self._record("model_ready")
+        except StopRequested:
+            self._record("model_prepare_cancelled")
+        except Exception as error:  # noqa: BLE001
+            with self._lock:
+                self.last_error = str(error)
+                self.state = OrchestrationState.FAULT
+                self._record("fault", reason=str(error))
+            if self.recipe.runtime.auto_rollback:
+                self._rollback(emergency=True)
 
     def _run(self) -> None:
         try:
@@ -268,20 +323,7 @@ class DeploymentOrchestration:
             self._step("tunnel_credentials", self._ensure_tunnel_credentials)
             self._step("model", self._start_model)
             self._step("model_health", self._wait_model_health)
-            self._step("tunnel", self._start_tunnel)
-            self._step("tunnel_health", self._wait_tunnel_health)
-            self._step("ros", self._start_ros)
-            self._step("ros_readiness", self._wait_ros_readiness)
-            self._step("power_on", lambda: self._run_operation(self.recipe.robot.power_on, "上电"))
-            self.components["power"] = {"active": self.recipe.robot.power_on.type != "none", "unit": None, "host": self.robot_host_name}
-            self._step("initial_pose", self._move_initial_pose)
-            self._step("client", self._start_client)
-            self._step("client_health", self._wait_client_health)
-            with self._lock:
-                self.state = OrchestrationState.DRY_RUN if self.mode == "dry_run" else OrchestrationState.RUNNING
-                self.current_step = None
-                self._record("deployment_ready", mode=self.mode)
-            self._monitor()
+            self._run_after_model_steps(include_tunnel_credentials=False)
         except StopRequested:
             self._record("start_cancelled")
         except Exception as error:  # noqa: BLE001
@@ -294,6 +336,40 @@ class DeploymentOrchestration:
         finally:
             if self._stop_requested.is_set() and self.state not in {OrchestrationState.STOPPED, OrchestrationState.FAULT}:
                 self._rollback(emergency=False)
+
+    def _run_after_model(self) -> None:
+        try:
+            self._run_after_model_steps()
+        except StopRequested:
+            self._record("start_cancelled")
+        except Exception as error:  # noqa: BLE001
+            with self._lock:
+                self.last_error = str(error)
+                self.state = OrchestrationState.FAULT
+                self._record("fault", reason=str(error))
+            if self.recipe.runtime.auto_rollback:
+                self._rollback(emergency=True)
+        finally:
+            if self._stop_requested.is_set() and self.state not in {OrchestrationState.STOPPED, OrchestrationState.FAULT}:
+                self._rollback(emergency=False)
+
+    def _run_after_model_steps(self, *, include_tunnel_credentials: bool = True) -> None:
+        if include_tunnel_credentials:
+            self._step("tunnel_credentials", self._ensure_tunnel_credentials)
+        self._step("tunnel", self._start_tunnel)
+        self._step("tunnel_health", self._wait_tunnel_health)
+        self._step("ros", self._start_ros)
+        self._step("ros_readiness", self._wait_ros_readiness)
+        self._step("power_on", lambda: self._run_operation(self.recipe.robot.power_on, "上电"))
+        self.components["power"] = {"active": self.recipe.robot.power_on.type != "none", "unit": None, "host": self.robot_host_name}
+        self._step("initial_pose", self._move_initial_pose)
+        self._step("client", self._start_client)
+        self._step("client_health", self._wait_client_health)
+        with self._lock:
+            self.state = OrchestrationState.DRY_RUN if self.mode == "dry_run" else OrchestrationState.RUNNING
+            self.current_step = None
+            self._record("deployment_ready", mode=self.mode)
+        self._monitor()
 
     def _step(self, name: str, action: Callable[[], None]) -> None:
         if self._stop_requested.is_set():
@@ -332,6 +408,13 @@ class DeploymentOrchestration:
                 info.get(key) for key in ("ssh", "ssh_keygen", "ssh_keyscan")
             ):
                 raise RuntimeError("本体主机缺少 ssh/ssh-keygen/ssh-keyscan")
+            host = self.recipe.hosts[name]
+            if host.connection == "local":
+                actual_user = pwd.getpwuid(os.geteuid()).pw_name
+                if host.user != actual_user:
+                    raise RuntimeError(
+                        f"本地模型主机 user={host.user} 与 Embodit 运行用户 {actual_user} 不一致"
+                    )
         self._model_home = self.model_manager.home()
         self._robot_home = self.robot_manager.home()
 
@@ -407,17 +490,43 @@ open(path,'w').write('\n'.join(lines) + '\n'); os.chmod(path,0o600)
     def _start_model(self) -> None:
         configured = self.recipe.model
         service = configured
-        if configured.provider == "python":
+        managed_providers = {
+            "python": None,
+            "openpi": "model_adapters:OpenPIAdapter",
+            "lerobot": "model_adapters:LeRobotAdapter",
+            "starvla": "model_adapters:StarVLAAdapter",
+        }
+        if configured.provider in managed_providers:
             remote_script = f"{self.model_manager.deployment_dir}/model_runner.py"
             remote_config = f"{self.model_manager.deployment_dir}/model_runner.json"
-            source = Path(__file__).with_name("assets") / "model_runner.py"
-            self.model_manager.write_file(remote_script, source.read_bytes(), 0o700)
+            assets = Path(__file__).with_name("assets")
+            self.model_manager.write_file(remote_script, (assets / "model_runner.py").read_bytes(), 0o700)
+            entrypoint = configured.entrypoint
+            load_kwargs = dict(configured.load_kwargs)
+            if configured.provider != "python":
+                remote_adapters = f"{self.model_manager.deployment_dir}/model_adapters.py"
+                self.model_manager.write_file(
+                    remote_adapters,
+                    (assets / "model_adapters.py").read_bytes(),
+                    0o600,
+                )
+                entrypoint = managed_providers[configured.provider]
+                source_suffix = {
+                    "openpi": "third_party/models/openpi/src",
+                    "lerobot": "third_party/models/lerobot/src",
+                    "starvla": "third_party/models/starvla",
+                }[configured.provider]
+                default_source_path = f"{configured.workdir.rstrip('/')}/{source_suffix}"
+                if configured.source_path:
+                    load_kwargs["source_path"] = configured.source_path
+                else:
+                    load_kwargs.setdefault("source_path", default_source_path)
             runner_config = {
-                "entrypoint": configured.entrypoint,
+                "entrypoint": entrypoint,
                 "checkpoint": configured.checkpoint,
                 "load_method": configured.load_method,
                 "predict_method": configured.predict_method,
-                "load_kwargs": configured.load_kwargs,
+                "load_kwargs": load_kwargs,
                 "predict_kwargs": configured.predict_kwargs,
                 "maximum_request_bytes": configured.maximum_request_bytes,
                 "module_search_path": configured.workdir,
@@ -445,7 +554,7 @@ open(path,'w').write('\n'.join(lines) + '\n'); os.chmod(path,0o600)
         self.components["model"] = {"active": True, "unit": unit, "host": self.model_host_name}
 
     def _effective_model_health(self) -> HealthCheck | None:
-        if self.recipe.model.provider == "python":
+        if self.recipe.model.provider in {"python", "openpi", "lerobot", "starvla"}:
             return HealthCheck(
                 type="http",
                 url=(
@@ -832,7 +941,7 @@ node.destroy_node(); rclpy.shutdown()
             time.sleep(0.5)
         raise TimeoutError(f"{component} systemd 服务未就绪")
 
-    def _wait_health(self, runner: RecipeSshRunner, health: HealthCheck, ros: RosRuntime | None) -> None:
+    def _wait_health(self, runner: CommandRunner, health: HealthCheck, ros: RosRuntime | None) -> None:
         deadline = time.monotonic() + health.startup_timeout_s
         last_error = "health 尚未就绪"
         while time.monotonic() < deadline:

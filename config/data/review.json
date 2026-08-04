@@ -1,0 +1,35 @@
+{
+  "_help": "不合格原因配置：调整数组顺序即可排序；改 label 即可改名；新增时 id 必须唯一；已使用的原因请设 enabled=false 停用，不要修改 id。保存后刷新网页即可生效。",
+  "quarantineReasons": [
+    {
+      "id": "task_failed",
+      "label": { "zh": "任务未完成", "en": "Task not completed" },
+      "enabled": true
+    },
+    {
+      "id": "unsafe_collision",
+      "label": { "zh": "碰撞或不安全行为", "en": "Collision or unsafe behavior" },
+      "enabled": true
+    },
+    {
+      "id": "human_intervention",
+      "label": { "zh": "人工干预", "en": "Human intervention" },
+      "enabled": true
+    },
+    {
+      "id": "poor_execution",
+      "label": { "zh": "执行质量差", "en": "Poor execution" },
+      "enabled": true
+    },
+    {
+      "id": "sensor_data",
+      "label": { "zh": "传感器或数据异常", "en": "Sensor or data issue" },
+      "enabled": true
+    },
+    {
+      "id": "other",
+      "label": { "zh": "其他", "en": "Other" },
+      "enabled": true
+    }
+  ]
+}

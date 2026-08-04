@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "kind": "model",
+  "config_id": "starvla-checkpoint",
+  "name": "StarVLA Checkpoint",
+  "host": {
+    "address": "10.40.1.181",
+    "port": 22,
+    "user": "root",
+    "auth": {
+      "type": "password_env",
+      "environment_variable": "MODEL_SSH_PASSWORD"
+    },
+    "host_key_policy": "accept-new",
+    "service_manager": "system"
+  },
+  "model": {
+    "workdir": "/root/Embodit",
+    "environment": {"CUDA_VISIBLE_DEVICES": "0"},
+    "provider": "starvla",
+    "checkpoint": "/root/checkpoints/starvla-task",
+    "python_executable": "/root/miniconda3/envs/starvla/bin/python",
+    "load_kwargs": {},
+    "predict_kwargs": {},
+    "startup_timeout_s": 300,
+    "restart": "on-failure"
+  },
+  "endpoint": {"bind": "127.0.0.1", "port": 8000}
+}

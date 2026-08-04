@@ -381,9 +381,12 @@ def summary(path: Path) -> dict[str, Any]:
             dict(row)
             for row in db.execute(
                 """
-                SELECT issue_code AS issueCode, category, severity, COUNT(*) AS count,
-                       COUNT(DISTINCT episode_index) AS episodes
-                FROM findings GROUP BY issue_code, category, severity
+                SELECT f.issue_code AS issueCode, f.category, f.severity, COUNT(*) AS count,
+                       COUNT(DISTINCT f.episode_index) AS episodes
+                FROM findings f
+                LEFT JOIN finding_reviews r ON r.finding_id=f.finding_id
+                WHERE COALESCE(r.review_status, 'unreviewed') != 'rejected'
+                GROUP BY f.issue_code, f.category, f.severity
                 ORDER BY count DESC, issue_code
                 """
             )
@@ -460,7 +463,14 @@ def query_episodes(path: Path, filters: dict[str, Any] | None = None) -> dict[st
     issues = [str(item) for item in filters.get("issueCodes") or [] if str(item)]
     if issues:
         marks = ",".join("?" for _ in issues)
-        where.append(f"EXISTS (SELECT 1 FROM findings f WHERE f.episode_index=e.episode_index AND f.issue_code IN ({marks}))")
+        where.append(
+            "EXISTS ("
+            "SELECT 1 FROM findings f "
+            "LEFT JOIN finding_reviews r ON r.finding_id=f.finding_id "
+            f"WHERE f.episode_index=e.episode_index AND f.issue_code IN ({marks}) "
+            "AND COALESCE(r.review_status, 'unreviewed') != 'rejected'"
+            ")"
+        )
         values.extend(issues)
     search = str(filters.get("search") or "").strip()
     if search:
@@ -470,7 +480,12 @@ def query_episodes(path: Path, filters: dict[str, Any] | None = None) -> dict[st
     allowed_sort = {
         "episodeIndex": "e.episode_index", "qualityScore": "e.quality_score",
         "usableRatio": "e.usable_ratio", "coverage": "e.coverage",
-        "findingCount": "e.finding_count",
+        "findingCount": (
+            "(SELECT COUNT(*) FROM findings sf "
+            "LEFT JOIN finding_reviews sr ON sr.finding_id=sf.finding_id "
+            "WHERE sf.episode_index=e.episode_index "
+            "AND COALESCE(sr.review_status, 'unreviewed') != 'rejected')"
+        ),
     }
     sort = allowed_sort.get(str(filters.get("sort")), "e.episode_index")
     direction = "DESC" if str(filters.get("direction")).lower() == "desc" else "ASC"
@@ -488,11 +503,15 @@ def query_episodes(path: Path, filters: dict[str, Any] | None = None) -> dict[st
         for row in rows:
             issue_rows = db.execute(
                 """
-                SELECT issue_code, severity, COUNT(*) AS count FROM findings
-                WHERE episode_index=? GROUP BY issue_code, severity ORDER BY count DESC
+                SELECT f.issue_code, f.severity, COUNT(*) AS count FROM findings f
+                LEFT JOIN finding_reviews r ON r.finding_id=f.finding_id
+                WHERE f.episode_index=?
+                  AND COALESCE(r.review_status, 'unreviewed') != 'rejected'
+                GROUP BY f.issue_code, f.severity ORDER BY count DESC
                 """,
                 (row["episodeIndex"],),
             ).fetchall()
+            row["findingCount"] = sum(int(item["count"]) for item in issue_rows)
             row["issues"] = [
                 {"issueCode": item["issue_code"], "severity": item["severity"], "count": item["count"]}
                 for item in issue_rows

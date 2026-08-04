@@ -24,7 +24,7 @@ def robust_zscore(values: np.ndarray) -> np.ndarray:
 
 class MotionDetector:
     detector_id = "motion"
-    version = "2"
+    version = "3"
     coverage_weight = 1.5
     config_key = "motion"
 
@@ -118,6 +118,44 @@ class MotionDetector:
                 nearby_jerk[distance:] |= aligned_jerk[:-distance]
                 nearby_jerk[:-distance] |= aligned_jerk[distance:]
             joint_hits = aligned_acceleration & nearby_jerk
+            reversal_counts = np.zeros_like(joint_hits, dtype=np.int32)
+            excess_travel_ratios = np.zeros_like(joint_hits, dtype=np.float64)
+            window_frames = max(
+                2,
+                int(round(float(config["jitterWindowSeconds"]) * context.fps)),
+            )
+            radius = max(1, window_frames // 2)
+            for frame_index, dimension in np.argwhere(joint_hits):
+                left = max(0, int(frame_index) - radius)
+                right = min(len(values), int(frame_index) + radius + 1)
+                local = values[left:right, int(dimension)]
+                if len(local) < 3:
+                    continue
+                steps = np.diff(local)
+                local_span = float(np.ptp(local))
+                significance = max(
+                    np.finfo(np.float64).eps,
+                    float(config["minimumDimensionRange"]) * 0.05,
+                    local_span * 0.01,
+                )
+                directions = np.sign(steps[np.abs(steps) >= significance])
+                reversals = int(np.count_nonzero(directions[1:] != directions[:-1]))
+                travel = float(np.sum(np.abs(steps)))
+                net = float(abs(local[-1] - local[0]))
+                excess_ratio = max(0.0, travel - net) / max(
+                    local_span,
+                    np.finfo(np.float64).eps,
+                )
+                reversal_counts[frame_index, dimension] = reversals
+                excess_travel_ratios[frame_index, dimension] = excess_ratio
+
+            # Large derivatives also occur at a legitimate one-way setpoint
+            # step. Jitter must contain a local direction reversal and excess
+            # path length (backtracking) rather than just one abrupt move.
+            joint_hits &= reversal_counts >= int(config["minimumJitterReversals"])
+            joint_hits &= excess_travel_ratios >= float(
+                config["minimumJitterExcessTravelRatio"]
+            )
             padded = np.any(joint_hits, axis=1)
             intervals = mask_to_intervals(
                 padded,
@@ -143,6 +181,16 @@ class MotionDetector:
                 )
                 selected_jerk_ratio = (
                     local_jerk_ratio[:, selected_dims] if selected_dims else local_jerk_ratio[:0]
+                )
+                local_reversals = reversal_counts[left:right]
+                local_excess_travel = excess_travel_ratios[left:right]
+                selected_reversals = (
+                    local_reversals[:, selected_dims] if selected_dims else local_reversals[:0]
+                )
+                selected_excess_travel = (
+                    local_excess_travel[:, selected_dims]
+                    if selected_dims
+                    else local_excess_travel[:0]
                 )
                 findings.append(
                     Finding(
@@ -174,6 +222,16 @@ class MotionDetector:
                                 if selected_jerk_ratio.size
                                 else 0.0
                             ),
+                            "directionReversalsMax": (
+                                int(np.max(selected_reversals))
+                                if selected_reversals.size
+                                else 0
+                            ),
+                            "excessTravelRatioMax": (
+                                float(np.max(selected_excess_travel))
+                                if selected_excess_travel.size
+                                else 0.0
+                            ),
                             "dimensionNames": [
                                 names[index] for index in selected_dims if index < len(names)
                             ],
@@ -189,8 +247,17 @@ class MotionDetector:
                             "minimumJerkRangeRatio": float(
                                 config["minimumJerkRangeRatio"]
                             ),
+                            "jitterWindowSeconds": float(config["jitterWindowSeconds"]),
+                            "minimumJitterReversals": int(
+                                config["minimumJitterReversals"]
+                            ),
+                            "minimumJitterExcessTravelRatio": float(
+                                config["minimumJitterExcessTravelRatio"]
+                            ),
                         },
-                        explanation=f"{key} 同一维度出现相对量程显著的高加速度与高 jerk 异常",
+                        explanation=(
+                            f"{key} 同一维度出现高加速度、高 jerk 和短窗反向回摆"
+                        ),
                         suggested_decision="review",
                     )
                 )

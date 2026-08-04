@@ -9,15 +9,15 @@ import cv2
 import numpy as np
 
 from datasets.frames import episode_frame_source
-from qc.intervals import mask_to_intervals
+from qc.intervals import mask_to_intervals, union_duration
 from qc.schema import DetectorOutcome, Finding
 
-from .base import EpisodeContext
+from .base import EpisodeContext, as_matrix
 
 
 class VideoDetector:
     detector_id = "video"
-    version = "2"
+    version = "3"
     coverage_weight = 3.0
     config_key = "videoIntegrity"
 
@@ -107,6 +107,7 @@ class VideoDetector:
         means: list[float] = []
         blur_values: list[float] = []
         freeze_deltas: list[float] = []
+        freeze_changed_ratios: list[float] = []
         sampled_grays: list[np.ndarray] = []
         previous_freeze: np.ndarray | None = None
         expected = int(context.episode.length or 0)
@@ -147,8 +148,18 @@ class VideoDetector:
                 freeze_gray = resize_gray(gray, int(integrity.get("resizeWidth", 160)))
                 if previous_freeze is None:
                     freeze_deltas.append(float("inf"))
+                    freeze_changed_ratios.append(1.0)
                 else:
-                    freeze_deltas.append(float(np.mean(cv2.absdiff(freeze_gray, previous_freeze))))
+                    difference = cv2.absdiff(freeze_gray, previous_freeze)
+                    freeze_deltas.append(float(np.mean(difference)))
+                    freeze_changed_ratios.append(
+                        float(
+                            np.mean(
+                                difference
+                                > float(integrity.get("freezeChangedPixelThreshold", 0.0))
+                            )
+                        )
+                    )
                 previous_freeze = freeze_gray
 
                 if visual_enabled and sample_index % visual_step == 0:
@@ -197,32 +208,107 @@ class VideoDetector:
 
         duration = context.duration or decoded / context.fps
         context_seconds = float(context.config["intervals"].get("contextSeconds", 0.1))
-        freeze_mask = np.asarray(freeze_deltas) <= float(integrity["freezePixelDelta"])
-        freeze_intervals = mask_to_intervals(
+        delta_values = np.asarray(freeze_deltas[1:], dtype=np.float64)
+        changed_ratios = np.asarray(freeze_changed_ratios[1:], dtype=np.float64)
+        freeze_mask = (delta_values <= float(integrity["freezePixelDelta"])) & (
+            changed_ratios <= float(integrity["freezeMaximumChangedRatio"])
+        )
+        # A delta at sampled frame i represents the span (i-1, i]. Dropping
+        # the leading sentinel keeps the interval start aligned to that span.
+        candidate_intervals = mask_to_intervals(
             freeze_mask,
             analysis_fps,
             minimum_seconds=float(integrity["freezeMinimumSeconds"]),
             merge_gap_seconds=0.1,
-            context_seconds=context_seconds,
+            context_seconds=0.0,
             duration=duration,
         )
-        frozen_seconds = sum(end - start for start, end in freeze_intervals)
-        for start, end in freeze_intervals:
-            hard = duration > 0 and frozen_seconds / duration >= 0.5
+        accepted_freezes: list[dict] = []
+        background = delta_values[~freeze_mask]
+        background = background[np.isfinite(background)]
+        background_delta = float(np.median(background)) if background.size else 0.0
+        minimum_motion = float(integrity["freezeMinimumMotionRangeRatio"])
+        for start, end in candidate_intervals:
+            motion_ratio, motion_available = self._signal_motion_evidence(context, start, end)
+            # When proprioception is present, an exactly still scene while the
+            # robot is also still is observationally ambiguous and must not be
+            # called a camera freeze. Motion during unchanged video provides
+            # the cross-modal evidence required for a precise finding.
+            if motion_available and motion_ratio < minimum_motion:
+                continue
+            left = max(0, int(np.floor(start * analysis_fps)))
+            right = min(len(delta_values), int(np.ceil(end * analysis_fps)))
+            local_deltas = delta_values[left:right]
+            local_changed = changed_ratios[left:right]
+            after_index = min(len(delta_values) - 1, right) if len(delta_values) else 0
+            post_delta = float(delta_values[after_index]) if len(delta_values) else 0.0
+            accepted_freezes.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "motionRatio": motion_ratio,
+                    "motionAvailable": motion_available,
+                    "meanDeltaMax": float(np.max(local_deltas)) if local_deltas.size else 0.0,
+                    "meanDeltaMean": float(np.mean(local_deltas)) if local_deltas.size else 0.0,
+                    "changedRatioMax": (
+                        float(np.max(local_changed)) if local_changed.size else 0.0
+                    ),
+                    "postDelta": post_delta,
+                }
+            )
+        frozen_seconds = union_duration(
+            [(row["start"], row["end"]) for row in accepted_freezes],
+            duration,
+        )
+        hard_ratio = float(integrity["freezeHardRatio"])
+        for row in accepted_freezes:
+            start = max(0.0, float(row["start"]) - context_seconds)
+            end = min(duration, float(row["end"]) + context_seconds)
+            hard = (
+                duration > 0
+                and frozen_seconds / duration >= hard_ratio
+                and bool(row["motionAvailable"])
+            )
+            confidence = 0.95 if row["motionAvailable"] else 0.7
             findings.append(
                 Finding(
                     episode_index=context.episode.episode_index,
                     issue_code="integrity/video_frozen" if hard else "visual/frozen",
                     category="integrity" if hard else "visual",
                     severity="fatal" if hard else "error",
-                    confidence=0.9,
+                    confidence=confidence,
                     detector_id=self.detector_id,
                     detector_version=self.version,
                     start_s=start,
                     end_s=end,
                     camera_key=camera_key,
-                    metrics={"meanPixelDeltaThreshold": float(integrity["freezePixelDelta"])},
-                    explanation=f"相机 {camera_key} 画面连续冻结",
+                    metrics={
+                        "meanPixelDeltaMax": row["meanDeltaMax"],
+                        "meanPixelDeltaMean": row["meanDeltaMean"],
+                        "changedPixelRatioMax": row["changedRatioMax"],
+                        "backgroundPixelDeltaMedian": background_delta,
+                        "postFreezePixelDelta": row["postDelta"],
+                        "signalMotionRangeRatio": row["motionRatio"],
+                        "signalMotionEvidenceAvailable": row["motionAvailable"],
+                        "frozenSeconds": frozen_seconds,
+                        "frozenRatio": frozen_seconds / duration if duration else 0.0,
+                    },
+                    threshold={
+                        "meanPixelDelta": float(integrity["freezePixelDelta"]),
+                        "changedPixel": float(integrity["freezeChangedPixelThreshold"]),
+                        "maximumChangedPixelRatio": float(
+                            integrity["freezeMaximumChangedRatio"]
+                        ),
+                        "minimumSignalMotionRangeRatio": minimum_motion,
+                    },
+                    explanation=(
+                        f"相机 {camera_key} 画面近重复"
+                        + (
+                            "，且机器人信号仍在运动"
+                            if row["motionAvailable"]
+                            else "（无运动信号可交叉验证）"
+                        )
+                    ),
                     suggested_decision="quarantine" if hard else "review",
                     hard_invalid=hard,
                 )
@@ -277,7 +363,16 @@ class VideoDetector:
                         )
                     )
         if shake_enabled:
-            findings.extend(self._camera_shake(context, camera_key, sampled_grays, duration, shake, shake_sample_fps))
+            findings.extend(
+                self._camera_shake(
+                    context,
+                    camera_key,
+                    sampled_grays,
+                    duration,
+                    shake,
+                    shake_sample_fps,
+                )
+            )
         return findings
 
     def _is_static_camera(self, key: str, config: dict) -> bool:
@@ -285,9 +380,45 @@ class VideoDetector:
         if configured:
             return key in configured
         lowered = key.lower()
-        return any(token in lowered for token in ("base", "head", "main", "front", "overhead")) and not any(
-            token in lowered for token in ("wrist", "hand", "eef")
-        )
+        return any(
+            token in lowered for token in ("base", "head", "main", "front", "overhead")
+        ) and not any(token in lowered for token in ("wrist", "hand", "eef"))
+
+    def _signal_motion_evidence(
+        self,
+        context: EpisodeContext,
+        start: float,
+        end: float,
+    ) -> tuple[float, bool]:
+        """Return normalized in-interval signal range and whether it was observable."""
+
+        evidence = 0.0
+        available = False
+        for key in ("action", "observation.state"):
+            raw = context.signals.get(key)
+            if raw is None:
+                continue
+            values = as_matrix(raw).astype(np.float64, copy=False)
+            if len(values) < 2 or not np.all(np.isfinite(values)):
+                continue
+            available = True
+            left = max(0, min(len(values) - 1, int(np.floor(start * context.fps))))
+            right = max(
+                left + 1,
+                min(len(values), int(np.ceil(end * context.fps)) + 1),
+            )
+            global_low = np.quantile(values, 0.01, axis=0)
+            global_high = np.quantile(values, 0.99, axis=0)
+            global_range = global_high - global_low
+            active = global_range > np.finfo(np.float64).eps
+            if not np.any(active):
+                continue
+            local_range = np.ptp(values[left:right], axis=0)
+            evidence = max(
+                evidence,
+                float(np.max(local_range[active] / global_range[active])),
+            )
+        return evidence, available
 
     def _camera_shake(
         self,
@@ -300,26 +431,32 @@ class VideoDetector:
     ) -> list[Finding]:
         if len(frames) < 3:
             return []
-        vectors: list[np.ndarray] = []
-        uniformities: list[float] = []
-        for previous, current in zip(frames, frames[1:]):
-            flow = cv2.calcOpticalFlowFarneback(previous, current, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-            vector = np.median(flow.reshape(-1, 2), axis=0)
-            residual = np.linalg.norm(flow - vector, axis=2)
-            tolerance = max(0.75, float(np.median(residual)) * 2.5)
-            vectors.append(vector)
-            uniformities.append(float(np.mean(residual <= tolerance)))
-        changes = np.linalg.norm(np.diff(np.stack(vectors), axis=0), axis=1)
-        uniforms = np.asarray(uniformities[1:])
-        mask = (changes > float(config["jitterThreshold"])) & (
-            uniforms >= float(config["uniformMotionRatio"])
-        )
+        motions = np.full((len(frames) - 1, 4), np.nan, dtype=np.float64)
+        inlier_ratios = np.zeros(len(frames) - 1, dtype=np.float64)
+        spatial_coverages = np.zeros(len(frames) - 1, dtype=np.float64)
+        tracked_counts = np.zeros(len(frames) - 1, dtype=np.int32)
+        for index, (previous, current) in enumerate(zip(frames, frames[1:])):
+            estimate = self._estimate_global_motion(previous, current, config)
+            if estimate is None:
+                continue
+            motion, metrics = estimate
+            motions[index] = motion
+            inlier_ratios[index] = metrics["inlierRatio"]
+            spatial_coverages[index] = metrics["spatialCoverage"]
+            tracked_counts[index] = metrics["trackedPoints"]
+        reliable = np.all(np.isfinite(motions), axis=1)
+        changes = np.zeros(max(0, len(motions) - 1), dtype=np.float64)
+        reliable_changes = reliable[1:] & reliable[:-1]
+        if changes.size:
+            raw_changes = np.linalg.norm(np.diff(motions, axis=0), axis=1)
+            changes[reliable_changes] = raw_changes[reliable_changes]
+        mask = reliable_changes & (changes > float(config["jitterThreshold"]))
         sample_fps = max(float(sample_fps), 1e-6)
         intervals = mask_to_intervals(
             np.r_[False, False, mask],
             sample_fps,
-            minimum_seconds=1.0 / sample_fps,
-            merge_gap_seconds=1.0 / sample_fps,
+            minimum_seconds=int(config["minimumShakeChanges"]) / sample_fps,
+            merge_gap_seconds=float(config["mergeGapSeconds"]),
             context_seconds=float(context.config["intervals"].get("contextSeconds", 0.1)),
             duration=duration,
         )
@@ -335,16 +472,113 @@ class VideoDetector:
                 start_s=start,
                 end_s=end,
                 camera_key=camera_key,
-                metrics={"globalMotionChangeMax": float(np.max(changes)) if changes.size else 0.0},
+                metrics={
+                    "globalMotionChangeMax": float(np.max(changes)) if changes.size else 0.0,
+                    "inlierRatioMedian": (
+                        float(np.median(inlier_ratios[reliable])) if np.any(reliable) else 0.0
+                    ),
+                    "spatialCoverageMedian": (
+                        float(np.median(spatial_coverages[reliable]))
+                        if np.any(reliable)
+                        else 0.0
+                    ),
+                    "trackedPointsMin": (
+                        int(np.min(tracked_counts[reliable])) if np.any(reliable) else 0
+                    ),
+                },
                 threshold={
                     "jitter": float(config["jitterThreshold"]),
-                    "uniformMotionRatio": float(config["uniformMotionRatio"]),
+                    "minimumInlierRatio": float(config["minimumInlierRatio"]),
+                    "minimumSpatialCoverage": float(config["minimumSpatialCoverage"]),
+                    "minimumShakeChanges": int(config["minimumShakeChanges"]),
                 },
-                explanation=f"静态相机 {camera_key} 出现全局抖动",
+                explanation=(
+                    f"静态相机 {camera_key} 出现经 RANSAC 验证的高频全局抖动"
+                ),
                 suggested_decision="review",
             )
             for start, end in intervals
         ]
+
+    def _estimate_global_motion(
+        self,
+        previous: np.ndarray,
+        current: np.ndarray,
+        config: dict,
+    ) -> tuple[np.ndarray, dict] | None:
+        """Estimate robust global similarity motion from spatially spread features."""
+
+        points = cv2.goodFeaturesToTrack(
+            previous,
+            maxCorners=300,
+            qualityLevel=0.01,
+            minDistance=6,
+            blockSize=5,
+        )
+        minimum_points = int(config["minimumTrackedPoints"])
+        if points is None or len(points) < minimum_points:
+            return None
+        tracked, status, errors = cv2.calcOpticalFlowPyrLK(
+            previous,
+            current,
+            points,
+            None,
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        )
+        if tracked is None or status is None:
+            return None
+        valid = status.reshape(-1).astype(bool)
+        valid &= np.all(np.isfinite(tracked.reshape(-1, 2)), axis=1)
+        if errors is not None:
+            valid &= np.isfinite(errors.reshape(-1))
+        source = points.reshape(-1, 2)[valid]
+        target = tracked.reshape(-1, 2)[valid]
+        if len(source) < minimum_points:
+            return None
+        affine, inliers = cv2.estimateAffinePartial2D(
+            source,
+            target,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=2.0,
+            maxIters=2000,
+            confidence=0.99,
+            refineIters=10,
+        )
+        if affine is None or inliers is None:
+            return None
+        inlier_mask = inliers.reshape(-1).astype(bool)
+        inlier_count = int(np.count_nonzero(inlier_mask))
+        inlier_ratio = inlier_count / max(1, len(source))
+        minimum_inlier_ratio = max(
+            float(config["minimumInlierRatio"]),
+            float(config.get("uniformMotionRatio", 0.0)),
+        )
+        if inlier_count < minimum_points or inlier_ratio < minimum_inlier_ratio:
+            return None
+        height, width = previous.shape[:2]
+        inlier_points = source[inlier_mask]
+        grid_x = np.clip((inlier_points[:, 0] * 4 / max(width, 1)).astype(int), 0, 3)
+        grid_y = np.clip((inlier_points[:, 1] * 4 / max(height, 1)).astype(int), 0, 3)
+        spatial_coverage = len(set(zip(grid_x.tolist(), grid_y.tolist()))) / 16.0
+        if spatial_coverage < float(config["minimumSpatialCoverage"]):
+            return None
+        a, b, tx = affine[0]
+        c, d, ty = affine[1]
+        scale = max(float(np.sqrt(a * a + c * c)), np.finfo(np.float64).eps)
+        radius = 0.5 * float(np.hypot(width, height))
+        rotation_displacement = float(np.arctan2(c, a)) * radius
+        scale_displacement = float(np.log(scale)) * radius
+        motion = np.asarray(
+            [tx, ty, rotation_displacement, scale_displacement],
+            dtype=np.float64,
+        )
+        return motion, {
+            "inlierRatio": inlier_ratio,
+            "spatialCoverage": spatial_coverage,
+            "trackedPoints": inlier_count,
+        }
 
     def _hard(
         self,

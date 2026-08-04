@@ -45,8 +45,8 @@ Embodit was built to turn that repeated work into one inspectable workflow. It h
 | Data collection handoff | Open LeRobot v2.1/v3, RoboMimic HDF5, and MCAP; inspect episodes, cameras, state, and action together | Quickly verify what the robot actually recorded |
 | Quality control | Deterministic integrity, video, motion, and gripper checks with interval evidence and human review | Auditable `pass` / `review` / `quarantine` decisions |
 | Training-set preparation | Filter, label, merge, augment, convert, and export with explicit fidelity reports | A reproducible dataset for your training pipeline |
-| Model handoff | Load a user Python entrypoint and checkpoint; generate the internal inference service automatically | No custom `/health` or `/infer` server for the normal path |
-| Real-robot test | Manage dual-host SSH, tunnel, ROS bring-up, readiness, power, initial pose, and Robot Client | Repeatable one-click Dry Run instead of terminal choreography |
+| Model handoff | Run OpenPI, LeRobot, or StarVLA from a checkpoint; retain custom Python entrypoints | No custom `/health` or `/infer` server for the normal path |
+| Real-robot test | Manage a local or independent model host, robot SSH, tunnel, ROS bring-up, readiness, power, initial pose, and Robot Client | Repeatable one-click Dry Run instead of terminal choreography |
 | Safe iteration | Explicit Live confirmation, local action limits, watchdog, logs, stop, and reverse rollback | Failures become evidence for the next data iteration |
 
 ### Two layers, one workflow
@@ -54,11 +54,11 @@ Embodit was built to turn that repeated work into one inspectable workflow. It h
 | Layer | Key capabilities | Detailed guide |
 |---|---|---|
 | **Data layer** | Synchronized playback, automatic QC, review, labels, filtering, conversion, strict merge, visual augmentation, fidelity-aware export | [Read the data guide →](docs/data/README.md) |
-| **Real-robot deployment layer** | Recipe v2, managed model loading, SSH tunnel, ROS readiness, lifecycle operations, initial pose, Dry Run, Live, monitoring and rollback | [Read the deployment guide →](docs/deployment/README.md) |
+| **Real-robot deployment layer** | Reusable robot/model configs, local/SSH model supervision, Recipe, SSH tunnel, ROS readiness, lifecycle operations, Dry Run, Live, monitoring and rollback | [Read the deployment guide →](docs/deployment/README.md) |
 
 Automatic QC is rule-based and configuration-versioned. Its hard-invalid conditions, visual/motion thresholds, scoring formula, selection rules, and manual overrides are documented—not hidden behind an opaque score. Robot startup is also readiness-driven: Embodit checks actual model health, tunnel health, ROS graph/types/rates/freshness, measured initial pose, and the first complete inference instead of waiting for fixed delays.
 
-For the standard model path, users provide a remote Python `entrypoint` and checkpoint. The model class only needs `load(checkpoint)` and `predict(observations)`; Embodit owns the private transport, health checks, serialization, process supervision, and robot-side connection.
+After one-time pinned-source and isolated-environment setup, OpenPI, LeRobot, and StarVLA only need a provider and checkpoint. Custom models may still expose a Python `entrypoint` implementing `load(checkpoint)` and `predict(observations)`. Embodit owns the private transport, health checks, serialization, process supervision, and robot-side connection.
 
 ## Interface preview
 
@@ -103,7 +103,7 @@ For the standard model path, users provide a remote Python `entrypoint` and chec
   </tr>
 </table>
 
-The real-robot deployment workspace is still under active development, so its screenshot is intentionally omitted until the interface and workflow stabilize. Its Recipe v2 design, current behavior, configuration, and safety boundary are documented in the [deployment guide](docs/deployment/README.md).
+The real-robot deployment workspace is still under active development, so its screenshot is intentionally omitted until the interface and workflow stabilize. Its Recipe design, current behavior, configuration, and safety boundary are documented in the [deployment guide](docs/deployment/README.md).
 
 ## Quick start
 
@@ -125,9 +125,10 @@ bash embodit.sh status
 bash embodit.sh logs -f
 bash embodit.sh stop
 
-# Validate and start a real-robot Dry Run
-bash embodit.sh recipe-validate config/deployment.recipe-v2.example.json
-bash embodit.sh recipe-run config/deployment.recipe-v2.example.json --mode dry_run
+# Compose robot/model configs, validate, and start a real-robot Dry Run
+bash embodit.sh recipe-compose config/deployment/robot.example.json config/deployment/models/python.example.json --output /tmp/deployment.json
+bash embodit.sh recipe-validate /tmp/deployment.json
+bash embodit.sh recipe-run /tmp/deployment.json --mode dry_run
 ```
 
 For LAN access:
@@ -141,15 +142,17 @@ Next steps:
 
 1. Follow the [data guide](docs/data/README.md) to scan, review, and export a training subset.
 2. Train with your existing framework and produce a checkpoint.
-3. Implement the minimal model adapter and configure Recipe v2 using the [deployment guide](docs/deployment/README.md).
+3. Select a checkpoint-only provider (OpenPI, LeRobot, or StarVLA), or implement the custom Python adapter; configure robot/model components separately and combine them using the [deployment guide](docs/deployment/README.md).
 4. Complete Dry Run before explicitly enabling Live operation.
 
 ## Changelog
 
 ### 2026-08-04
 
-- Consolidated real-robot deployment on Recipe v2 and removed legacy deployment paths.
+- Split deployment configuration into independently reusable robot/model Config documents that compose into a Recipe at runtime.
+- Consolidated real-robot deployment on Recipe and removed legacy deployment paths.
 - Added an Embodit-managed Python model provider and standard ROS2 Robot Client.
+- Added pinned OpenPI, LeRobot, and StarVLA submodules with checkpoint-only deployment adapters and provider templates.
 - Completed model, SSH tunnel, ROS, initial-pose, Client monitoring, and reverse rollback orchestration.
 - Added strict same-format dataset merge and fidelity-aware conversion/export behavior.
 - Documented exact QC filtering, scoring, deployment readiness, and action-safety standards in English and Chinese.
@@ -169,7 +172,7 @@ See the [architecture guide](docs/architecture.md) for module boundaries and ext
 - new dataset format: implement and register the common interface in `backend/datasets/`;
 - new QC rule: add a versioned detector under `backend/qc/detectors/` with stable issue codes and evidence;
 - new conversion or augmentation: preserve capability checks, preview, and fidelity reporting;
-- new model: implement `load(checkpoint)` and `predict(observations)` for the Python provider;
+- new model family: add a pinned upstream source, license/reference record, checkpoint adapter, config template, and tests; custom models can implement `load(checkpoint)` and `predict(observations)` for the Python provider;
 - new robot SDK: prefer a thin ROS Bridge exposing typed topics, services, and actions.
 
 Before submitting changes:

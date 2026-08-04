@@ -11,7 +11,7 @@
   }
   const state = {
     browseRoot: '', currentFolder: '', parentFolder: null,
-    dataset: null, episodeByIndex: new Map(), states: {}, quarantineReasons: {}, filtered: [], currentEpisode: null,
+    dataset: null, episodeByIndex: new Map(), states: {}, quarantineReasons: {}, quarantineReasonOptions: [], filtered: [], currentEpisode: null,
     playing: false, animationFrame: null, progressPath: '',
     timelineDragging: false, resumeAfterSeek: false, seekSequence: 0,
     previewSeekTimer: null, pendingSeekSeconds: 0,
@@ -24,6 +24,7 @@
     qcOverviewByEpisode: new Map(),
     qcDetailByEpisode: new Map(),
     qcActiveFindingId: null,
+    qcShowRejected: false,
     qcPlaybackEnd: null,
     qcPlaybackToken: 0,
     qcStartedJobId: null,
@@ -50,6 +51,9 @@
     deploymentSessionId: null,
     deploymentRuntimeKind: null,
     deploymentTimer: null,
+    deploymentSnapshot: null,
+    deploymentRobotConnected: false,
+    deploymentConfigCache: { robot: new Map(), model: new Map() },
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -124,6 +128,11 @@
     window.EmbodyI18n?.applyStaticI18n();
     try {
       const health = await api('/api/health');
+      state.quarantineReasonOptions = normalizeQuarantineReasonOptions(health.review?.quarantineReasons);
+      renderQuarantineReasonOptions();
+      if (health.review?.configError) {
+        showToast(t('reviewConfigError', { msg: health.review.configError }), true);
+      }
       state.browseRoot = health.browseRoot;
       $('#pathInput').value = health.browseRoot;
       await browse(health.browseRoot);
@@ -147,25 +156,17 @@
   function bindDeployment() {
     $('#openDataWorkspace')?.addEventListener('click', openDataWorkspace);
     $('#openDeployment')?.addEventListener('click', openDeploymentWorkspace);
-    $('#loadDeploymentExample')?.addEventListener('click', () => loadDeploymentExample('recipe-v2'));
-    $('#deploymentFile')?.addEventListener('change', importDeploymentFile);
-    $('#deploymentRecipe')?.addEventListener('input', () => {
-      try {
-        localStorage.setItem('embodit-deployment-recipe', $('#deploymentRecipe').value);
-        const recipe = JSON.parse($('#deploymentRecipe').value);
-        renderDeploymentHosts(recipe);
-      } catch {}
-    });
+    $('#deploymentRobotSelect')?.addEventListener('change', () => loadSelectedDeploymentConfigs().catch((error) => setDeploymentResult({ error: error.message }, t('deployFailed'), true)));
+    $('#deploymentModelSelect')?.addEventListener('change', () => loadSelectedDeploymentConfigs().catch((error) => setDeploymentResult({ error: error.message }, t('deployFailed'), true)));
+    $('#deploymentTaskPrompt')?.addEventListener('input', () => refreshDeploymentComposition(false).catch(() => {}));
+    $('#checkDeploymentRobot')?.addEventListener('click', checkDeploymentRobotConnection);
+    $('#prepareDeploymentModel')?.addEventListener('click', prepareDeploymentModel);
     $('#validateDeployment')?.addEventListener('click', validateDeploymentRecipe);
     $('#doctorDeployment')?.addEventListener('click', doctorDeployment);
     $('#quickstartDeployment')?.addEventListener('click', quickstartDeployment);
     $('#stopDeployment')?.addEventListener('click', stopDeploymentSession);
     $('#startLiveDeployment')?.addEventListener('click', startLiveDeployment);
     $('#emergencyStopDeployment')?.addEventListener('click', emergencyStopDeployment);
-    $('#saveDeployment')?.addEventListener('click', saveDeploymentRecipe);
-    $('#exportDeployment')?.addEventListener('click', exportDeploymentRecipe);
-    $('#loadSavedDeployment')?.addEventListener('click', loadSavedDeploymentRecipe);
-    $('#deleteSavedDeployment')?.addEventListener('click', deleteSavedDeploymentRecipe);
     $('#downloadDeploymentRecord')?.addEventListener('click', downloadDeploymentRecord);
     $('#deploymentComponents')?.addEventListener('click', onDeploymentComponentAction);
   }
@@ -199,25 +200,15 @@
   async function openDeploymentWorkspace() {
     try { pauseAll(); } catch {}
     activatePrimaryLayer('deploy');
-    await refreshSavedDeploymentRecipes();
-    if (!$('#deploymentRecipe').value.trim()) {
-      const saved = localStorage.getItem('embodit-deployment-recipe');
-      if (saved) {
-        $('#deploymentRecipe').value = saved;
-        try {
-          const recipe = JSON.parse(saved);
-          renderDeploymentHosts(recipe);
-        } catch {}
-      } else {
-        await loadDeploymentExample('recipe-v2');
-      }
+    try { await refreshDeploymentOptions(); } catch (error) {
+      setDeploymentResult({ error: error.message }, '载入本体与模型失败', true);
     }
     try {
       const orchestrations = await api('/api/deploy/orchestrations');
       const activeRecipe = (orchestrations.orchestrations || []).find((item) => !['stopped', 'fault'].includes(item.state));
       if (activeRecipe) {
         state.deploymentSessionId = activeRecipe.orchestrationId;
-        state.deploymentRuntimeKind = 'recipe-v2';
+        state.deploymentRuntimeKind = 'recipe';
         renderDeploymentSnapshot(activeRecipe);
         startDeploymentPolling();
         return;
@@ -225,103 +216,122 @@
     } catch {}
   }
 
-  function deploymentRecipe() {
-    let recipe;
+  function deploymentConfig(kind) {
+    const selector = kind === 'robot' ? '#deploymentRobotConfig' : '#deploymentModelConfig';
+    let config;
     try {
-      recipe = JSON.parse($('#deploymentRecipe').value);
+      config = JSON.parse($(selector).value);
     } catch (error) {
-      throw new Error(t('deployInvalidJson', { msg: error.message }));
+      throw new Error(`${kind === 'robot' ? '本体' : '模型'}配置 JSON 无效：${error.message}`);
     }
-    if (!recipe || typeof recipe !== 'object' || Array.isArray(recipe)) {
+    if (!config || typeof config !== 'object' || Array.isArray(config)) {
       throw new Error(t('deployProfileObject'));
     }
-    if (recipe.version !== 2) throw new Error('仅支持最终版 Recipe v2');
-    return recipe;
+    if (config.kind !== kind || config.version !== 1) {
+      throw new Error(`${kind === 'robot' ? '本体' : '模型'}配置必须是 version=1、kind=${kind}`);
+    }
+    return config;
   }
 
-  function writeDeploymentRecipe(recipe) {
-    const text = JSON.stringify(recipe, null, 2);
-    $('#deploymentRecipe').value = text;
-    localStorage.setItem('embodit-deployment-recipe', text);
-    renderDeploymentHosts(recipe);
+  function writeDeploymentConfig(kind, config) {
+    const selector = kind === 'robot' ? '#deploymentRobotConfig' : '#deploymentModelConfig';
+    const text = JSON.stringify(config, null, 2);
+    $(selector).value = text;
   }
 
-  async function refreshSavedDeploymentRecipes() {
-    const select = $('#deploymentSavedRecipe');
-    if (!select) return;
+  function syncDeploymentCompositionIdentity() {
+    const robot = deploymentConfig('robot');
+    const model = deploymentConfig('model');
+    $('#deploymentId').value = `${robot.config_id}--${model.config_id}`;
+    $('#deploymentName').value = `${robot.name} + ${model.name}`;
+  }
+
+  async function composeDeploymentRecipe() {
+    const robot = JSON.parse(JSON.stringify(deploymentConfig('robot')));
+    const taskPrompt = $('#deploymentTaskPrompt')?.value.trim() || '';
+    if (taskPrompt && robot.robot?.client) {
+      robot.robot.client.config = { ...(robot.robot.client.config || {}), task_prompt: taskPrompt };
+    }
+    const result = await api('/api/deploy/compose', {
+      method: 'POST',
+      body: JSON.stringify({
+        robot,
+        model: deploymentConfig('model'),
+        deployment_id: $('#deploymentId').value.trim() || null,
+        name: $('#deploymentName').value.trim() || null,
+      }),
+    });
+    $('#deploymentRecipe').value = JSON.stringify(result.recipe, null, 2);
+    renderDeploymentHosts(result.recipe);
+    return result.recipe;
+  }
+
+  async function refreshDeploymentComposition(showResult = false) {
     try {
-      const result = await api('/api/deploy/recipes');
-      select.innerHTML = '<option value="">—</option>' + (result.recipes || []).filter((item) => item.valid).map((item) =>
-        `<option value="${escapeAttr(item.deploymentId)}">${escapeHtml(item.name)} · ${escapeHtml(item.deploymentId)}</option>`
+      const recipe = await composeDeploymentRecipe();
+      if (showResult) setDeploymentResult(recipe, '本体与模型配置兼容，Recipe 已生成');
+      return recipe;
+    } catch (error) {
+      $('#deploymentRecipe').value = '';
+      if (showResult) setDeploymentResult({ error: error.message }, t('deployFailed'), true);
+      throw error;
+    }
+  }
+
+  async function refreshDeploymentOptions() {
+    const [robotResult, modelResult] = await Promise.all([
+      api('/api/deploy/configs/robot'),
+      api('/api/deploy/configs/model'),
+    ]);
+    const metadata = {
+      robot: (robotResult.configs || []).filter((item) => item.valid),
+      model: (modelResult.configs || []).filter((item) => item.valid),
+    };
+    if (!metadata.robot.length || !metadata.model.length) {
+      const examples = await api('/api/deploy/examples/component-configs');
+      for (const kind of ['robot', 'model']) {
+        if (metadata[kind].length) continue;
+        const config = examples[kind];
+        const id = `__example_${kind}__`;
+        state.deploymentConfigCache[kind].set(id, config);
+        metadata[kind] = [{ configId: id, name: `${config.name}（示例）`, valid: true }];
+      }
+    }
+    for (const kind of ['robot', 'model']) {
+      const select = $(kind === 'robot' ? '#deploymentRobotSelect' : '#deploymentModelSelect');
+      const previous = select.value;
+      select.innerHTML = metadata[kind].map((item) =>
+        `<option value="${escapeAttr(item.configId)}">${escapeHtml(item.name)} · ${escapeHtml(item.configId.replace(/^__example_|__$/g, ''))}</option>`
       ).join('');
-    } catch {}
-  }
-
-  async function saveDeploymentRecipe() {
-    try {
-      const result = await api('/api/deploy/recipes', { method: 'POST', body: JSON.stringify({ recipe: deploymentRecipe() }) });
-      await refreshSavedDeploymentRecipes();
-      $('#deploymentSavedRecipe').value = result.recipe.deploymentId;
-      setDeploymentResult(result, '配置已安全保存到本机');
-    } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
-  }
-
-  async function loadSavedDeploymentRecipe() {
-    const id = $('#deploymentSavedRecipe')?.value;
-    if (!id) return;
-    try {
-      const result = await api(`/api/deploy/recipes/${encodeURIComponent(id)}`);
-      writeDeploymentRecipe(result.recipe);
-      setDeploymentResult(result.recipe, '已打开保存的配置');
-    } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
-  }
-
-  async function deleteSavedDeploymentRecipe() {
-    const id = $('#deploymentSavedRecipe')?.value;
-    if (!id || !window.confirm(`确认删除部署配置 ${id}？`)) return;
-    try {
-      await api(`/api/deploy/recipes/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      await refreshSavedDeploymentRecipes();
-      setDeploymentResult({ deleted: id }, '配置已删除');
-    } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
-  }
-
-  function exportDeploymentRecipe() {
-    try {
-      const recipe = deploymentRecipe();
-      const blob = new Blob([`${JSON.stringify(recipe, null, 2)}\n`], { type: 'application/json' });
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = `${recipe.deployment_id || 'deployment'}.json`;
-      link.click();
-      window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
-    } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
-  }
-
-  async function loadDeploymentExample(name) {
-    try {
-      const result = await api(`/api/deploy/examples/${encodeURIComponent(name)}`);
-      writeDeploymentRecipe(result.recipe);
-      renderDeploymentHosts(result.recipe);
-      setDeploymentResult(result.recipe, t('deployTemplateLoaded'));
-    } catch (error) {
-      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
+      select.value = metadata[kind].some((item) => item.configId === previous) ? previous : metadata[kind][0].configId;
     }
+    await loadSelectedDeploymentConfigs();
   }
 
-  async function importDeploymentFile(event) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    try {
-      const recipe = JSON.parse(await file.text());
-      writeDeploymentRecipe(recipe);
-      renderDeploymentHosts(recipe);
-      setDeploymentResult(recipe, t('deployImported'));
-    } catch (error) {
-      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
-    } finally {
-      event.target.value = '';
-    }
+  async function selectedDeploymentConfig(kind) {
+    const select = $(kind === 'robot' ? '#deploymentRobotSelect' : '#deploymentModelSelect');
+    const id = select?.value;
+    if (!id) throw new Error(`没有可用的${kind === 'robot' ? '本体' : '模型'}配置`);
+    if (state.deploymentConfigCache[kind].has(id)) return state.deploymentConfigCache[kind].get(id);
+    const result = await api(`/api/deploy/configs/${kind}/${encodeURIComponent(id)}`);
+    state.deploymentConfigCache[kind].set(id, result.config);
+    return result.config;
+  }
+
+  async function loadSelectedDeploymentConfigs() {
+    if (state.deploymentSessionId) return;
+    const [robot, model] = await Promise.all([
+      selectedDeploymentConfig('robot'),
+      selectedDeploymentConfig('model'),
+    ]);
+    writeDeploymentConfig('robot', robot);
+    writeDeploymentConfig('model', model);
+    syncDeploymentCompositionIdentity();
+    await refreshDeploymentComposition(false);
+    setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', '未检测连接');
+    setDeploymentComponentStatus('#deploymentModelStatus', 'idle', '未启动');
+    state.deploymentRobotConnected = false;
+    syncDeploymentButtons(false);
   }
 
   function setDeploymentResult(payload, hint = '', error = false) {
@@ -341,18 +351,38 @@
     element.className = `deployment-state ${value || 'disconnected'}`;
   }
 
+  function setDeploymentComponentStatus(selector, status, text) {
+    const element = $(selector);
+    if (!element) return;
+    element.className = `deployment-component-status ${status}`;
+    element.innerHTML = `<i></i>${escapeHtml(text)}`;
+  }
+
   function syncDeploymentButtons(active, snapshot = null) {
-    $('#quickstartDeployment').disabled = active;
+    const modelReady = snapshot?.state === 'model_ready' && snapshot?.components?.model?.active;
+    const runningStack = ['starting', 'dry_run', 'running'].includes(snapshot?.state);
+    $('#prepareDeploymentModel').disabled = active;
+    $('#checkDeploymentRobot').disabled = active;
+    $('#quickstartDeployment').disabled = !modelReady;
     $('#stopDeployment').disabled = !active;
     $('#emergencyStopDeployment').disabled = !active;
     $('#startLiveDeployment').disabled = !active || snapshot?.state !== 'dry_run';
     $('#downloadDeploymentRecord').disabled = !active;
+    $('#deploymentRobotSelect').disabled = active;
+    $('#deploymentModelSelect').disabled = active;
+    $('#deploymentTaskPrompt').disabled = runningStack;
   }
 
   async function validateDeploymentRecipe() {
     try {
+      const robot = deploymentConfig('robot');
+      const model = deploymentConfig('model');
+      await Promise.all([robot, model].map((config) => api('/api/deploy/configs/validate', {
+        method: 'POST', body: JSON.stringify({ config })
+      })));
+      const recipe = await composeDeploymentRecipe();
       const result = await api('/api/deploy/recipes/validate', {
-        method: 'POST', body: JSON.stringify({ recipe: deploymentRecipe() })
+        method: 'POST', body: JSON.stringify({ recipe })
       });
       setDeploymentResult(result, t('deployValid'));
       renderDeploymentHosts(result.recipe);
@@ -364,8 +394,9 @@
   async function doctorDeployment() {
     setBusy(true, t('deployDoctorRunning'), t('deployDoctorWait'));
     try {
+      const recipe = await composeDeploymentRecipe();
       const result = await api('/api/deploy/doctor', {
-        method: 'POST', body: JSON.stringify({ recipe: deploymentRecipe() })
+        method: 'POST', body: JSON.stringify({ recipe })
       });
       setDeploymentResult(result, result.ok ? t('deployDoctorPassed') : t('deployDoctorFailed'), !result.ok);
     } catch (error) {
@@ -375,23 +406,75 @@
     }
   }
 
-  async function quickstartDeployment() {
-    setBusy(true, t('deployStarting'), t('deployStartingHint'));
+  async function checkDeploymentRobotConnection() {
+    const button = $('#checkDeploymentRobot');
+    button.disabled = true;
+    setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', '连接中');
     try {
-      const recipe = deploymentRecipe();
-      const snapshot = await api('/api/deploy/orchestrations', {
+      const result = await api('/api/deploy/robot-connection', {
+        method: 'POST', body: JSON.stringify({ config: deploymentConfig('robot') })
+      });
+      state.deploymentRobotConnected = Boolean(result.connected);
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', result.hostname ? `已连接 · ${result.hostname}` : '已连接');
+      return true;
+    } catch (error) {
+      state.deploymentRobotConnected = false;
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'error', '连接失败');
+      setDeploymentResult({ error: error.message }, '本体连接失败', true);
+      return false;
+    } finally {
+      button.disabled = Boolean(state.deploymentSessionId);
+    }
+  }
+
+  async function prepareDeploymentModel() {
+    setBusy(true, '正在准备并启动模型', '检测本体连接与模型运行环境，启动模型服务并等待健康检查。');
+    try {
+      if (!state.deploymentRobotConnected && !await checkDeploymentRobotConnection()) return;
+      const recipe = await composeDeploymentRecipe();
+      const snapshot = await api('/api/deploy/orchestrations/prepare-model', {
         method: 'POST', body: JSON.stringify({ recipe, mode: 'dry_run' })
       });
       state.deploymentSessionId = snapshot.orchestrationId;
-      state.deploymentRuntimeKind = 'recipe-v2';
+      state.deploymentRuntimeKind = 'recipe';
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, '部署编排已启动');
+      setDeploymentResult(snapshot, '正在检测本体并启动模型');
       startDeploymentPolling();
     } catch (error) {
       state.deploymentSessionId = null;
       state.deploymentRuntimeKind = null;
+      state.deploymentSnapshot = null;
+      state.deploymentRobotConnected = false;
       syncDeploymentButtons(false);
-      setDeploymentState('disconnected');
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'error', '连接失败');
+      setDeploymentComponentStatus('#deploymentModelStatus', 'error', '启动失败');
+      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function quickstartDeployment() {
+    const taskPrompt = $('#deploymentTaskPrompt')?.value.trim() || '';
+    if (!taskPrompt) {
+      setDeploymentResult({ error: '请先选择或填写任务 Prompt' }, '缺少任务 Prompt', true);
+      $('#deploymentTaskPrompt')?.focus();
+      return;
+    }
+    if (!state.deploymentSessionId || state.deploymentSnapshot?.state !== 'model_ready') {
+      setDeploymentResult({ error: '请先启动模型并等待模型就绪' }, '模型尚未就绪', true);
+      return;
+    }
+    setBusy(true, t('deployStarting'), t('deployStartingHint'));
+    try {
+      await refreshDeploymentComposition(false);
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/start-dry-run`, {
+        method: 'POST', body: JSON.stringify({ taskPrompt })
+      });
+      renderDeploymentSnapshot(snapshot);
+      setDeploymentResult(snapshot, 'Dry Run 已启动；不会发送真实动作');
+      startDeploymentPolling();
+    } catch (error) {
       setDeploymentResult({ error: error.message }, t('deployFailed'), true);
     } finally {
       setBusy(false);
@@ -416,6 +499,9 @@
       if (['fault', 'stopped', 'disconnected'].includes(snapshot.state)) {
         stopDeploymentPolling();
         setDeploymentResult(snapshot, snapshot.lastError || `部署已${snapshot.state}`, snapshot.state === 'fault');
+        state.deploymentSessionId = null;
+        state.deploymentRuntimeKind = null;
+        syncDeploymentButtons(false);
       }
     } catch (error) {
       stopDeploymentPolling();
@@ -435,7 +521,11 @@
     } finally {
       state.deploymentSessionId = null;
       state.deploymentRuntimeKind = null;
+      state.deploymentSnapshot = null;
+      state.deploymentRobotConnected = false;
       syncDeploymentButtons(false);
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', '未检测连接');
+      setDeploymentComponentStatus('#deploymentModelStatus', 'idle', '未启动');
     }
   }
 
@@ -475,9 +565,10 @@
 
   function renderDeploymentSnapshot(snapshot) {
     if (!snapshot) return;
+    state.deploymentSnapshot = snapshot;
     setDeploymentState(snapshot.state);
-    state.deploymentRuntimeKind = 'recipe-v2';
-    syncDeploymentButtons(!['disconnected', 'stopped'].includes(snapshot.state), snapshot);
+    state.deploymentRuntimeKind = 'recipe';
+    syncDeploymentButtons(!['disconnected', 'stopped', 'fault'].includes(snapshot.state), snapshot);
     const passed = (snapshot.steps || []).filter((item) => item.status === 'passed').length;
     const failed = (snapshot.steps || []).filter((item) => item.status === 'failed').length;
     $('#deployMetricSteps').textContent = passed;
@@ -485,6 +576,20 @@
     $('#deployMetricInference').textContent = snapshot.mode || '—';
     $('#deployMetricActions').textContent = Object.values(snapshot.components || {}).filter((item) => item.active).length;
     $('#deployMetricErrors').textContent = failed;
+    const precheck = (snapshot.steps || []).find((item) => item.name === 'precheck');
+    if (precheck?.status === 'passed') {
+      state.deploymentRobotConnected = true;
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', '已连接');
+    } else if (precheck?.status === 'failed' || snapshot.state === 'fault') {
+      state.deploymentRobotConnected = false;
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'error', '连接失败');
+    }
+    else if (snapshot.currentStep === 'precheck') setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', '连接中');
+    else setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', '未检测连接');
+    if (snapshot.components?.model?.active) setDeploymentComponentStatus('#deploymentModelStatus', 'ready', '模型已启动');
+    else if (snapshot.currentStep === 'model' || snapshot.currentStep === 'model_health') setDeploymentComponentStatus('#deploymentModelStatus', 'pending', '启动中');
+    else if (snapshot.state === 'fault') setDeploymentComponentStatus('#deploymentModelStatus', 'error', '启动失败');
+    else setDeploymentComponentStatus('#deploymentModelStatus', 'idle', '未启动');
     renderDeploymentComponents(snapshot.components || {});
     const output = $('#deploymentResult');
     if (output) output.textContent = JSON.stringify({
@@ -514,7 +619,7 @@
 
   async function onDeploymentComponentAction(event) {
     const button = event.target.closest('[data-component-action]');
-    if (!button || !state.deploymentSessionId || state.deploymentRuntimeKind !== 'recipe-v2') return;
+    if (!button || !state.deploymentSessionId || state.deploymentRuntimeKind !== 'recipe') return;
     const component = button.dataset.component;
     const action = button.dataset.componentAction;
     try {
@@ -548,7 +653,7 @@
     }
     container.innerHTML = hosts.map(([name, host]) => `<article class="deployment-host-card">
       <div class="deployment-host-head"><strong>${escapeHtml(name)}</strong><code>${escapeHtml(`${host.user}@${host.address}:${host.port || 22}`)}</code></div>
-      <div class="muted">认证：${escapeHtml(host.auth?.type || '未配置')} · systemd：${escapeHtml(host.service_manager || 'system')} · 启动编排时自动连接、固定 host key 并检测运行环境</div>
+      <div class="muted">连接：${escapeHtml(host.connection === 'local' ? 'Embodit 本机' : 'SSH')} · 认证：${escapeHtml(host.connection === 'local' ? '无需管理认证' : (host.auth?.type || '未配置'))} · systemd：${escapeHtml(host.service_manager || 'system')} · ${escapeHtml(host.connection === 'local' ? '模型命令由 Embodit 直接执行' : '启动编排时自动连接、固定 host key 并检测运行环境')}</div>
     </article>`).join('');
   }
 
@@ -573,6 +678,7 @@
 
   function refreshLocalizedUi() {
     window.EmbodyI18n?.applyStaticI18n();
+    renderQuarantineReasonOptions();
     if (state.dataset) {
       renderSummary();
       renderEpisodeList();
@@ -608,7 +714,9 @@
     } catch {}
     try { fillAugmentColorPresets(); syncAugmentFormVisibility(); } catch {}
     try {
-      if ($('#deploymentRecipe')?.value.trim()) renderDeploymentHosts(deploymentRecipe());
+      if ($('#deploymentRobotConfig')?.value.trim() && $('#deploymentModelConfig')?.value.trim()) {
+        refreshDeploymentComposition(false).catch(() => {});
+      }
     } catch {}
   }
 
@@ -630,7 +738,6 @@
     });
     $('#search').addEventListener('input', applyFilters);
     $('#stateFilter').addEventListener('change', applyFilters);
-    $('#interventionOnly').addEventListener('change', applyFilters);
     $('#episodeList').addEventListener('click', (event) => {
       const button = event.target.closest('[data-episode]');
       if (button) selectEpisode(Number(button.dataset.episode));
@@ -1152,7 +1259,7 @@
       return `<button class="episode ${cssDecision}${selected}" data-episode="${episode.episodeIndex}">
         <span class="episode-row"><strong>Episode ${episode.episodeIndex}</strong><i class="state-dot"></i></span>
         <span class="episode-task" data-tip="${escapeAttr(task)}">${escapeHtml(task.replace(/\n/g, ', '))}</span>
-        <span class="episode-meta">${episode.length} ${escapeHtml(t('framesUnit'))} · ${formatTime(episode.duration)}${episode.hasIntervention ? ` · <b>${escapeHtml(t('humanIntervention'))}</b>` : ''}</span>
+        <span class="episode-meta">${episode.length} ${escapeHtml(t('framesUnit'))} · ${formatTime(episode.duration)}</span>
         ${labelLine}
         ${qcLine}
         ${quarantineReasonLine}
@@ -1229,7 +1336,6 @@
       <div class="episode-facts">
         <span>${episode.length} ${escapeHtml(t('framesUnit'))}</span><span>${formatTime(episode.duration)}</span>
         <span>${escapeHtml(t('platformId'))} ${escapeHtml(episode.platformEpisodeId || episode.extras?.mcapName || '-')}</span>
-        ${episode.hasIntervention ? `<span class="warning">${escapeHtml(t('humanIntervention'))}</span>` : ''}
         ${labelFacts}
         ${qcFact}
         ${quarantineReasonFact}
@@ -1790,12 +1896,10 @@
   function applyFilters() {
     const query = $('#search').value.trim().toLowerCase();
     const decision = $('#stateFilter').value;
-    const interventionOnly = $('#interventionOnly').checked;
     state.filtered = state.dataset.episodes.filter((episode) => {
       const text = `${episode.episodeIndex} ${episode.platformEpisodeId || ''} ${(episode.tasks || []).join(' ')}`.toLowerCase();
       return (!query || text.includes(query))
-        && (decision === 'all' || getState(episode.episodeIndex) === decision)
-        && (!interventionOnly || episode.hasIntervention);
+        && (decision === 'all' || getState(episode.episodeIndex) === decision);
     });
     renderEpisodeList();
   }
@@ -1912,6 +2016,7 @@
     state.qcOverviewByEpisode = new Map();
     state.qcDetailByEpisode = new Map();
     state.qcActiveFindingId = null;
+    state.qcShowRejected = false;
     state.qcPlaybackEnd = null;
     state.qcPlaybackToken += 1;
     state.qcCurrentJob = null;
@@ -1998,15 +2103,57 @@
     return t('qcUnreviewed');
   }
 
+  function visibleQcFindings(findings = []) {
+    return state.qcShowRejected
+      ? findings
+      : findings.filter((finding) => finding.reviewStatus !== 'rejected');
+  }
+
+  function qcRejectedToggle(findings = []) {
+    const count = findings.filter((finding) => finding.reviewStatus === 'rejected').length;
+    if (!count) return '';
+    const label = state.qcShowRejected
+      ? t('qcHideRejected')
+      : t('qcShowRejected', { n: count });
+    return `<button class="qc-show-rejected" data-qc-toggle-rejected aria-pressed="${state.qcShowRejected}">${escapeHtml(label)}</button>`;
+  }
+
+  function updateQcOverviewFromDetail(episodeIndex, detail) {
+    const findings = (detail?.findings || []).filter(
+      (finding) => finding.reviewStatus !== 'rejected',
+    );
+    const grouped = new Map();
+    findings.forEach((finding) => {
+      const issueCode = qcFindingCode(finding);
+      const severity = qcFindingSeverity(finding);
+      const key = `${issueCode}\u0000${severity}`;
+      const current = grouped.get(key) || { issueCode, severity, count: 0 };
+      current.count += 1;
+      grouped.set(key, current);
+    });
+    const apply = (episode) => {
+      if (!episode || Number(episode.episodeIndex) !== Number(episodeIndex)) return;
+      episode.findingCount = findings.length;
+      episode.issues = Array.from(grouped.values());
+    };
+    apply(state.qcOverviewByEpisode.get(Number(episodeIndex)));
+    (state.qcPage?.episodes || []).forEach(apply);
+    renderEpisodeList();
+    renderEpisodeHeader();
+    renderQcEpisodeTable();
+  }
+
   async function saveQcFindingReview(findingId, reviewStatus) {
-    if (!findingId || !['confirmed', 'rejected'].includes(reviewStatus)) return;
+    if (!findingId || !['unreviewed', 'confirmed', 'rejected'].includes(reviewStatus)) return;
     const changed = [];
     state.qcDetailByEpisode.forEach((detail, episodeIndex) => {
       const finding = detail?.findings?.find((item) => item.findingId === findingId);
       if (!finding) return;
       changed.push({ episodeIndex, detail, finding, previous: finding.reviewStatus || 'unreviewed' });
       finding.reviewStatus = reviewStatus;
+      updateQcOverviewFromDetail(episodeIndex, detail);
     });
+    if (reviewStatus === 'rejected' && !state.qcShowRejected) state.qcActiveFindingId = null;
     const rerender = () => {
       if (changed.some((item) => item.episodeIndex === state.currentEpisode)) renderQcInlineEvidence();
       const selected = changed.find((item) => item.episodeIndex === state.qcSelectedEpisode);
@@ -2017,9 +2164,15 @@
       await api(`/api/qc/scans/${encodeURIComponent(state.autoFilterJobId)}/findings/${encodeURIComponent(findingId)}/review`, {
         method: 'POST', body: JSON.stringify({ reviewStatus }),
       });
+      state.qcSummary = await api(`/api/qc/scans/${encodeURIComponent(state.autoFilterJobId)}/summary`);
+      renderQcSummary();
+      await queryQcEpisodes(state.qcOffset);
       showToast(t('qcReviewSaved', { status: qcFindingReviewLabel(reviewStatus) }));
     } catch (error) {
-      changed.forEach((item) => { item.finding.reviewStatus = item.previous; });
+      changed.forEach((item) => {
+        item.finding.reviewStatus = item.previous;
+        updateQcOverviewFromDetail(item.episodeIndex, item.detail);
+      });
       rerender();
       showToast(error.message, true);
     }
@@ -2037,7 +2190,7 @@
       return;
     }
     const duration = Math.max(0.001, Number(episode.duration || 0));
-    host.innerHTML = findings.map((finding) => {
+    host.innerHTML = visibleQcFindings(findings).map((finding) => {
       const { start, end } = qcFindingBounds(finding);
       if (start == null) return '';
       const safeStart = Math.max(0, Math.min(duration, start));
@@ -2076,7 +2229,8 @@
       return;
     }
     const episode = detail.episode || {};
-    const findings = detail.findings || [];
+    const allFindings = detail.findings || [];
+    const findings = visibleQcFindings(allFindings);
     const intervals = findings.filter((finding) => qcFindingBounds(finding).start != null);
     const whole = findings.length - intervals.length;
     if (state.qcActiveFindingId && !findings.some((finding) => finding.findingId === state.qcActiveFindingId)) {
@@ -2102,12 +2256,15 @@
       const confidence = Math.round(Number(selected.confidence || 0) * 100);
       const where = qcFindingWhere(selected);
       const reviewStatus = selected.reviewStatus || 'unreviewed';
+      const reviewActions = reviewStatus === 'rejected'
+        ? `<button class="qc-review-choice" data-qc-inline-review="unreviewed" data-finding="${escapeAttr(selected.findingId)}">${escapeHtml(t('qcRestoreRejected'))}</button>`
+        : `<button class="qc-review-choice confirmed${reviewStatus === 'confirmed' ? ' active' : ''}" data-qc-inline-review="confirmed" data-finding="${escapeAttr(selected.findingId)}" aria-pressed="${reviewStatus === 'confirmed'}">${escapeHtml(t('qcConfirmIssue'))}</button>
+          <button class="qc-review-choice rejected" data-qc-inline-review="rejected" data-finding="${escapeAttr(selected.findingId)}" aria-pressed="false">${escapeHtml(t('qcRejectIssue'))}</button>`;
       selectedHtml = `<div class="qc-evidence-detail">
         <div><p>${escapeHtml(selected.explanation || qcFindingCode(selected))}</p><div class="qc-evidence-detail-meta">${escapeHtml(t('qcInlineConfidence', { n: confidence }))}${where ? ` · ${escapeHtml(where)}` : ''} · ${escapeHtml(qcFindingSeverity(selected))}</div></div>
         <div class="qc-evidence-detail-actions">
           ${start == null ? '' : `<button class="primary" data-qc-inline-play data-finding="${escapeAttr(selected.findingId)}" data-start="${start}" data-end="${end ?? start}">▶ ${escapeHtml(t('qcInlinePlay'))}</button>`}
-          <button class="qc-review-choice confirmed${reviewStatus === 'confirmed' ? ' active' : ''}" data-qc-inline-review="confirmed" data-finding="${escapeAttr(selected.findingId)}" aria-pressed="${reviewStatus === 'confirmed'}">${escapeHtml(t('qcConfirmIssue'))}</button>
-          <button class="qc-review-choice rejected${reviewStatus === 'rejected' ? ' active' : ''}" data-qc-inline-review="rejected" data-finding="${escapeAttr(selected.findingId)}" aria-pressed="${reviewStatus === 'rejected'}">${escapeHtml(t('qcRejectIssue'))}</button>
+          ${reviewActions}
           <span class="qc-review-state review-${escapeAttr(reviewStatus)}">${escapeHtml(qcFindingReviewLabel(reviewStatus))}</span>
         </div>
         <details class="qc-evidence-raw"><summary>${escapeHtml(t('qcMetrics'))}</summary><pre>${escapeHtml(JSON.stringify({ metrics: selected.metrics, threshold: selected.threshold }, null, 2))}</pre></details>
@@ -2115,10 +2272,19 @@
     }
     const countText = intervals.length ? t('qcInlineSegments', { n: intervals.length }) : t('qcInlineClean');
     const wholeText = whole ? ` · ${t('qcInlineWholeIssues', { n: whole })}` : '';
-    panel.innerHTML = `<div class="qc-evidence-head"><div><div class="qc-evidence-title"><strong>${escapeHtml(t('qcInlineTitle'))}</strong><span>${escapeHtml(countText + wholeText)}</span><span class="qc-status ${escapeAttr(episode.integrityStatus || '')}">${escapeHtml(episode.integrityStatus === 'invalid' ? t('qcInvalid') : t('qcValid'))}</span></div><div class="qc-evidence-hint">${escapeHtml(t('qcInlineHint'))}</div></div><div class="qc-evidence-score"><span>${escapeHtml(t('qualityScore'))} <b>${Number(episode.qualityScore || 0).toFixed(1)}</b></span><span>${escapeHtml(t('qcAverageUsable'))} <b>${Number(episode.usableRatio || 0).toFixed(1)}%</b></span></div></div>${cards ? `<div class="qc-evidence-cards">${cards}</div>` : ''}${selectedHtml}`;
+    panel.innerHTML = `<div class="qc-evidence-head"><div><div class="qc-evidence-title"><strong>${escapeHtml(t('qcInlineTitle'))}</strong><span>${escapeHtml(countText + wholeText)}</span><span class="qc-status ${escapeAttr(episode.integrityStatus || '')}">${escapeHtml(episode.integrityStatus === 'invalid' ? t('qcInvalid') : t('qcValid'))}</span>${qcRejectedToggle(allFindings)}</div><div class="qc-evidence-hint">${escapeHtml(t('qcInlineHint'))}</div></div><div class="qc-evidence-score"><span>${escapeHtml(t('qualityScore'))} <b>${Number(episode.qualityScore || 0).toFixed(1)}</b></span><span>${escapeHtml(t('qcAverageUsable'))} <b>${Number(episode.usableRatio || 0).toFixed(1)}%</b></span></div></div>${cards ? `<div class="qc-evidence-cards">${cards}</div>` : ''}${selectedHtml}`;
   }
 
   async function onQcInlineClick(event) {
+    const toggleRejected = event.target.closest('[data-qc-toggle-rejected]');
+    if (toggleRejected) {
+      state.qcShowRejected = !state.qcShowRejected;
+      if (!state.qcShowRejected) state.qcActiveFindingId = null;
+      renderQcInlineEvidence();
+      const selectedDetail = state.qcDetailByEpisode.get(state.qcSelectedEpisode);
+      if (selectedDetail) renderQcEpisodeDetail(selectedDetail);
+      return;
+    }
     const open = event.target.closest('[data-open-qc]');
     if (open) return openAutoFilterDialog();
     const select = event.target.closest('[data-qc-select-finding]');
@@ -2341,6 +2507,7 @@
 
   async function loadQcReport(scanId) {
     state.autoFilterJobId = scanId;
+    state.qcShowRejected = false;
     const summary = await api(`/api/qc/scans/${encodeURIComponent(scanId)}/summary`);
     if (state.autoFilterJobId !== scanId) return;
     state.qcSummary = summary;
@@ -2477,7 +2644,8 @@
   function renderQcEpisodeDetail(detail) {
     const episode = detail.episode;
     const decision = effectiveQcDecision(episode);
-    const findings = detail.findings || [];
+    const allFindings = detail.findings || [];
+    const findings = visibleQcFindings(allFindings);
     const detectorSkips = (detail.detectors || []).filter((item) => item.status === 'skipped' || item.status === 'failed');
     const findingHtml = findings.length ? findings.map((finding) => {
       const start = finding.adjustedStartS ?? finding.startS;
@@ -2487,6 +2655,10 @@
       const where = [finding.cameraKey, finding.signalKey].filter(Boolean).join(' · ');
       const interval = start == null ? t('qcWholeEpisode') : `${Number(start).toFixed(2)}s – ${Number(end ?? start).toFixed(2)}s`;
       const reviewStatus = finding.reviewStatus || 'unreviewed';
+      const reviewActions = reviewStatus === 'rejected'
+        ? `<button class="qc-review-choice" data-qc-review="unreviewed" data-finding="${escapeAttr(finding.findingId)}">${escapeHtml(t('qcRestoreRejected'))}</button>`
+        : `<button class="qc-review-choice confirmed${reviewStatus === 'confirmed' ? ' active' : ''}" data-qc-review="confirmed" data-finding="${escapeAttr(finding.findingId)}" aria-pressed="${reviewStatus === 'confirmed'}">${escapeHtml(t('qcConfirmIssue'))}</button>
+          <button class="qc-review-choice rejected" data-qc-review="rejected" data-finding="${escapeAttr(finding.findingId)}" aria-pressed="false">${escapeHtml(t('qcRejectIssue'))}</button>`;
       return `<article class="qc-finding ${escapeAttr(severity)}">
         <header class="qc-finding-head"><strong>${escapeHtml(code)}</strong><span>${escapeHtml(severity)} · ${Math.round(Number(finding.confidence || 0) * 100)}%</span></header>
         <div class="qc-finding-meta">${escapeHtml(interval)}${where ? ` · ${escapeHtml(where)}` : ''}</div>
@@ -2494,8 +2666,7 @@
         <details><summary>${escapeHtml(t('qcMetrics'))}</summary><pre>${escapeHtml(JSON.stringify({ metrics: finding.metrics, threshold: finding.threshold }, null, 2))}</pre></details>
         <footer class="qc-finding-actions">
           ${start == null ? '' : `<button data-qc-seek="${Number(start)}" data-qc-seek-episode="${episode.episodeIndex}">${escapeHtml(t('qcViewEvidence'))}</button>`}
-          <button class="qc-review-choice confirmed${reviewStatus === 'confirmed' ? ' active' : ''}" data-qc-review="confirmed" data-finding="${escapeAttr(finding.findingId)}" aria-pressed="${reviewStatus === 'confirmed'}">${escapeHtml(t('qcConfirmIssue'))}</button>
-          <button class="qc-review-choice rejected${reviewStatus === 'rejected' ? ' active' : ''}" data-qc-review="rejected" data-finding="${escapeAttr(finding.findingId)}" aria-pressed="${reviewStatus === 'rejected'}">${escapeHtml(t('qcRejectIssue'))}</button>
+          ${reviewActions}
           <span class="qc-review-state review-${escapeAttr(reviewStatus)}">${escapeHtml(qcFindingReviewLabel(reviewStatus))}</span>
         </footer>
       </article>`;
@@ -2510,10 +2681,19 @@
     <div class="qc-detail-metrics"><div><strong>${Number(episode.qualityScore).toFixed(1)}</strong><span>${escapeHtml(t('qualityScore'))}</span></div><div><strong>${Number(episode.usableRatio).toFixed(1)}%</strong><span>${escapeHtml(t('qcAverageUsable'))}</span></div><div><strong>${Number(episode.coverage).toFixed(1)}%</strong><span>${escapeHtml(t('qcAverageCoverage'))}</span></div></div>
     <div class="qc-manual-decision"><span>${escapeHtml(t('qcManualDecision'))}: <b>${escapeHtml(stateLabel(decision))}</b></span>
       <button data-qc-decision="pass">${escapeHtml(t('filterPass'))}</button><button data-qc-decision="review">${escapeHtml(t('filterReview'))}</button><button data-qc-decision="quarantine">${escapeHtml(t('filterQuarantine'))}</button>
-    </div>${skipHtml}<div class="qc-findings"><h4>${escapeHtml(t('qcFindings'))} (${findings.length})</h4>${findingHtml}</div>`;
+    </div>${skipHtml}<div class="qc-findings"><h4>${escapeHtml(t('qcFindings'))} (${findings.length}) ${qcRejectedToggle(allFindings)}</h4>${findingHtml}</div>`;
   }
 
   async function onQcDetailClick(event) {
+    const toggleRejected = event.target.closest('[data-qc-toggle-rejected]');
+    if (toggleRejected) {
+      state.qcShowRejected = !state.qcShowRejected;
+      if (!state.qcShowRejected) state.qcActiveFindingId = null;
+      const detail = state.qcDetailByEpisode.get(state.qcSelectedEpisode);
+      if (detail) renderQcEpisodeDetail(detail);
+      renderQcInlineEvidence();
+      return;
+    }
     const seek = event.target.closest('[data-qc-seek]');
     if (seek) {
       const episodeIndex = Number(seek.dataset.qcSeekEpisode);
@@ -4360,13 +4540,46 @@
     return out;
   }
 
-  const QUARANTINE_REASON_KEYS = new Set([
-    'task_failed', 'unsafe_collision', 'human_intervention', 'poor_execution', 'sensor_data', 'other',
-  ]);
-
   function normalizeQuarantineReason(reason) {
     const value = String(reason || '').trim();
-    return QUARANTINE_REASON_KEYS.has(value) ? value : '';
+    return value.length <= 128 ? value : '';
+  }
+
+  function normalizeQuarantineReasonOptions(options) {
+    const seen = new Set();
+    return (Array.isArray(options) ? options : []).flatMap((option) => {
+      const id = normalizeQuarantineReason(option?.id);
+      const zh = String(option?.label?.zh || '').trim();
+      const en = String(option?.label?.en || zh).trim();
+      if (!id || !zh || seen.has(id)) return [];
+      seen.add(id);
+      return [{ id, label: { zh, en: en || zh }, enabled: option.enabled !== false }];
+    });
+  }
+
+  function quarantineReasonOption(reason) {
+    return state.quarantineReasonOptions.find((option) => option.id === reason);
+  }
+
+  function renderQuarantineReasonOptions() {
+    const select = $('#quarantineReason');
+    if (!select) return;
+    const selected = select.value;
+    const lang = window.EmbodyI18n?.getLang?.() || 'zh';
+    select.replaceChildren();
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = t('quarantineReasonNone');
+    select.appendChild(placeholder);
+    state.quarantineReasonOptions.forEach((reason) => {
+      const option = document.createElement('option');
+      option.value = reason.id;
+      option.textContent = reason.label[lang] || reason.label.zh || reason.id;
+      option.disabled = !reason.enabled;
+      if (!reason.enabled) option.textContent += t('quarantineReasonDisabled');
+      select.appendChild(option);
+    });
+    if (Array.from(select.options).some((option) => option.value === selected)) select.value = selected;
   }
 
   function normalizeQuarantineReasons(reasons) {
@@ -4379,15 +4592,9 @@
   }
 
   function quarantineReasonLabel(reason) {
-    const labels = {
-      task_failed: 'quarantineReasonTaskFailed',
-      unsafe_collision: 'quarantineReasonUnsafeCollision',
-      human_intervention: 'quarantineReasonHumanIntervention',
-      poor_execution: 'quarantineReasonPoorExecution',
-      sensor_data: 'quarantineReasonSensorData',
-      other: 'quarantineReasonOther',
-    };
-    return labels[reason] ? t(labels[reason]) : reason;
+    const option = quarantineReasonOption(reason);
+    const lang = window.EmbodyI18n?.getLang?.() || 'zh';
+    return option?.label?.[lang] || option?.label?.zh || reason;
   }
 
   function getState(index) { return normalizeDecision(state.states[index] || 'review'); }
@@ -4483,9 +4690,7 @@
   function onEnterReview() {
     if (layout.headerMode === 'open') return;
     clearTimeout(headerCollapseTimer);
-    headerCollapseTimer = setTimeout(() => {
-      if (!$('#review').classList.contains('hidden')) setHeaderCollapsed(true);
-    }, 1600);
+    setHeaderCollapsed(true);
   }
   function onLeaveReview() {
     clearTimeout(headerCollapseTimer);
@@ -4539,6 +4744,8 @@
 
   function initLayout() {
     const workspace = document.querySelector('.review-workspace');
+    const deploymentWorkspace = document.querySelector('.deployment-layout');
+    const deploymentSidebar = document.querySelector('.deployment-config-pane');
     const strip = $('#videoStrip');
     const stripWrap = document.querySelector('.strip-wrap');
     const columnHandle = $('#splitColumns');
@@ -4567,6 +4774,28 @@
       done: () => {
         const inline = workspace.style.getPropertyValue('--sidebar-w');
         layout.sidebarW = inline ? Math.round(sidebarWidth()) : null;
+        saveLayout();
+      }
+    });
+
+    // Deployment operation sidebar width --------------------------------
+    const deploymentSidebarWidth = () => deploymentSidebar.getBoundingClientRect().width;
+    if (layout.deploymentSidebarW) {
+      deploymentWorkspace.style.setProperty('--deployment-sidebar-w', `${layout.deploymentSidebarW}px`);
+    }
+    bindSplitter($('#splitDeploymentSidebar'), {
+      axis: 'x',
+      get: deploymentSidebarWidth,
+      min: () => 320,
+      max: () => Math.max(380, deploymentWorkspace.getBoundingClientRect().width - 520),
+      set: (value) => deploymentWorkspace.style.setProperty('--deployment-sidebar-w', `${Math.round(value)}px`),
+      reset: () => {
+        deploymentWorkspace.style.removeProperty('--deployment-sidebar-w');
+        layout.deploymentSidebarW = null;
+      },
+      done: () => {
+        const inline = deploymentWorkspace.style.getPropertyValue('--deployment-sidebar-w');
+        layout.deploymentSidebarW = inline ? Math.round(deploymentSidebarWidth()) : null;
         saveLayout();
       }
     });

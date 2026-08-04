@@ -1,14 +1,15 @@
-"""OpenSSH transport for Recipe v2, including non-interactive password auth."""
+"""OpenSSH transport for Recipe deployments, including non-interactive password auth."""
 
 from __future__ import annotations
 
-import os
 import hashlib
+import os
 import shlex
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from .recipe import RecipeHost
 
@@ -21,10 +22,51 @@ class RemoteResult:
     timed_out: bool = False
 
 
+class CommandRunner(Protocol):
+    def run(
+        self,
+        args: list[str],
+        *,
+        timeout: float = 30,
+        input_data: bytes | None = None,
+    ) -> RemoteResult: ...
+
+
+class LocalCommandRunner:
+    """Run model-host commands directly on the Embodit machine."""
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        timeout: float = 30,
+        input_data: bytes | None = None,
+    ) -> RemoteResult:
+        try:
+            completed = subprocess.run(
+                args,
+                input=input_data,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
+            return RemoteResult(
+                completed.returncode,
+                completed.stdout.decode("utf-8", errors="replace"),
+                completed.stderr.decode("utf-8", errors="replace"),
+            )
+        except subprocess.TimeoutExpired as error:
+            return RemoteResult(124, _decode(error.stdout), _decode(error.stderr), timed_out=True)
+        except OSError as error:
+            return RemoteResult(127, "", str(error))
+
+
 class RecipeSshRunner:
     """Execute argv-based commands without placing passwords in argv or logs."""
 
     def __init__(self, host: RecipeHost, known_hosts: Path, askpass_root: Path):
+        if host.connection != "ssh":
+            raise ValueError("本地模型主机应使用 LocalCommandRunner")
         self.host = host
         self.known_hosts = known_hosts.expanduser().resolve()
         self.known_hosts.parent.mkdir(parents=True, exist_ok=True)
@@ -86,8 +128,11 @@ class RecipeSshRunner:
             f"ControlPath={control_path}",
         ]
         environment = os.environ.copy()
-        if self.host.auth.type == "key":
-            identity = Path(self.host.auth.identity_file or "").expanduser().resolve()
+        auth = self.host.auth
+        if auth is None:
+            raise ValueError("SSH 主机缺少 auth")
+        if auth.type == "key":
+            identity = Path(auth.identity_file or "").expanduser().resolve()
             if not identity.is_file():
                 raise ValueError(f"SSH identity_file 不存在：{identity}")
             command.extend(
@@ -101,7 +146,7 @@ class RecipeSshRunner:
                 ]
             )
         else:
-            password = self.host.auth.resolved_password()
+            password = auth.resolved_password()
             environment.update(
                 {
                     "SSH_ASKPASS": str(self._askpass_helper()),
@@ -129,6 +174,9 @@ class RecipeSshRunner:
         timeout: float = 30,
         input_data: bytes | None = None,
     ) -> RemoteResult:
+        auth = self.host.auth
+        if auth is None:
+            raise ValueError("SSH 主机缺少 auth")
         base, environment = self.base_command()
         remote_command = shlex.join(args)
         try:
@@ -139,7 +187,7 @@ class RecipeSshRunner:
                 check=False,
                 timeout=timeout,
                 env=environment,
-                start_new_session=self.host.auth.type != "key",
+                start_new_session=auth.type != "key",
             )
             return RemoteResult(
                 completed.returncode,

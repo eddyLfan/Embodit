@@ -3,6 +3,8 @@
 /.augment_previews
 /.augment_cache
 /.embodit_cache
+/.embodit/
+/config/local/
 
 # Local runtime state and secrets
 .env
@@ -11,14 +13,10 @@
 *.log
 *.pid
 *.pid.lock
-service.pid
-service.url
-service.log
 .pytest_cache/
 __pycache__/
 *.pyc
 .venv/
-config/token
 
 # Developer tool and editor artifacts
 .mypy_cache/

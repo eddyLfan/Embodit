@@ -45,8 +45,8 @@ Embodit 的开发动机，就是把这些高频但容易出错的工作沉淀成
 | 数采结果接入 | 打开 LeRobot v2.1/v3、RoboMimic HDF5、MCAP，同步查看 Episode、相机、state 和 action | 快速确认本体究竟采到了什么 |
 | 数据质检 | 确定性的完整性、视频、运动和夹爪检测，提供时间区间证据与人工复核 | 可审计的 `pass` / `review` / `quarantine` 判定 |
 | 训练集准备 | 筛选、标注、合并、增强、转换和带保真报告的导出 | 可复现地交给现有训练流水线 |
-| 模型接入 | 加载用户 Python 入口与 Checkpoint，自动生成内部推理服务 | 普通用户不再编写 `/health`、`/infer` 服务 |
-| 真机部署测试 | 管理双机 SSH、隧道、ROS Bringup、readiness、上电、初始位姿和 Robot Client | 用可复现的一键 Dry Run 代替多终端手工操作 |
+| 模型接入 | OpenPI、LeRobot、StarVLA 只给 Checkpoint 即用；同时支持自定义 Python 入口 | 普通用户不再编写 `/health`、`/infer` 服务 |
+| 真机部署测试 | 管理 Embodit 同机/独立模型端、本体 SSH、隧道、ROS Bringup、readiness、上电、初始位姿和 Robot Client | 用可复现的一键 Dry Run 代替多终端手工操作 |
 | 安全迭代 | Live 显式确认、本体端动作限位、watchdog、日志、停止与逆序回滚 | 将真机失败转化为下一轮数据依据 |
 
 ### 两个功能层，一条完整工作流
@@ -54,11 +54,11 @@ Embodit 的开发动机，就是把这些高频但容易出错的工作沉淀成
 | 功能层 | 核心能力 | 详细文档 |
 |---|---|---|
 | **数据层** | 同步回放、自动质检、人工复核、标签、筛选、转换、严格合并、视觉增强和保真导出 | [阅读数据层指南 →](docs/data/README.zh-CN.md) |
-| **真机部署层** | Recipe v2、模型托管、SSH 隧道、ROS readiness、本体生命周期、初始位姿、Dry Run、Live、监控与回滚 | [阅读真机部署指南 →](docs/deployment/README.zh-CN.md) |
+| **真机部署层** | 本体/模型配置分离与自由组合、本机/SSH 模型托管、Recipe、SSH 隧道、ROS readiness、本体生命周期、Dry Run、Live、监控与回滚 | [阅读真机部署指南 →](docs/deployment/README.zh-CN.md) |
 
 自动质检是确定性、配置带版本的规则系统。Hard-invalid 条件、视觉/运动阈值、评分公式、筛选规则和人工覆盖关系都可以查看和修改，而不是隐藏在一个黑盒分数中。真机启动同样由 readiness 驱动：工具检查真实的模型 health、隧道 health、ROS graph/type/rate/freshness、实测初始位姿和首次完整推理，不使用固定等待时间假设组件已经启动。
 
-标准模型接入只需要用户提供模型服务器上的 Python `entrypoint` 和 Checkpoint，模型类实现 `load(checkpoint)`、`predict(observations)`；内部传输、健康检查、序列化、进程托管和本体侧连接由 Embodit 处理。
+OpenPI、LeRobot、StarVLA 在固定子仓库和独立环境一次性准备完成后，只需选择 Provider 并给定 Checkpoint；自定义模型仍可提供 Python `entrypoint`，实现 `load(checkpoint)`、`predict(observations)`。内部传输、健康检查、序列化、进程托管和本体侧连接由 Embodit 处理。
 
 ## 工具页面展示
 
@@ -103,7 +103,7 @@ Embodit 的开发动机，就是把这些高频但容易出错的工作沉淀成
   </tr>
 </table>
 
-真机部署工作台仍在持续开发，因此暂不放置界面截图，待页面与流程稳定后再补充。Recipe v2 的设计、当前实现、配置方式和安全边界见[真机部署指南](docs/deployment/README.zh-CN.md)。
+真机部署工作台仍在持续开发，因此暂不放置界面截图，待页面与流程稳定后再补充。Recipe 的设计、当前实现、配置方式和安全边界见[真机部署指南](docs/deployment/README.zh-CN.md)。
 
 ## Quick start
 
@@ -125,9 +125,10 @@ bash embodit.sh status
 bash embodit.sh logs -f
 bash embodit.sh stop
 
-# 校验真机 Recipe 并启动 Dry Run
-bash embodit.sh recipe-validate config/deployment.recipe-v2.example.json
-bash embodit.sh recipe-run config/deployment.recipe-v2.example.json --mode dry_run
+# 组合本体/模型配置，校验并启动 Dry Run
+bash embodit.sh recipe-compose config/deployment/robot.example.json config/deployment/models/python.example.json --output /tmp/deployment.json
+bash embodit.sh recipe-validate /tmp/deployment.json
+bash embodit.sh recipe-run /tmp/deployment.json --mode dry_run
 ```
 
 局域网访问：
@@ -141,15 +142,17 @@ EMBODY_HOST=0.0.0.0 EMBODY_PUBLIC_HOST=<工作电脑IP> \
 
 1. 按照[数据层指南](docs/data/README.zh-CN.md)完成扫描、复核和训练集导出。
 2. 使用现有训练框架训练并得到 Checkpoint。
-3. 实现最小模型适配器，根据[真机部署指南](docs/deployment/README.zh-CN.md)配置 Recipe v2。
+3. 选择 OpenPI、LeRobot、StarVLA 的 Checkpoint 即用 Provider，或实现自定义 Python 适配器；根据[真机部署指南](docs/deployment/README.zh-CN.md)分别配置本体与模型并组合测试。
 4. 完成 Dry Run 后，再显式确认进入 Live。
 
 ## 更新日志
 
 ### 2026-08-04
 
-- 真机部署层收敛到 Recipe v2，并删除旧部署路径。
+- 将真机配置拆为可独立保存、自由组合的本体 Config 与模型 Config，运行时统一生成 Recipe。
+- 真机部署层收敛到 Recipe，并删除旧部署路径。
 - 增加 Embodit 托管的 Python Model Provider 和标准 ROS2 Robot Client。
+- 增加固定版本的 OpenPI、LeRobot、StarVLA 子仓库、Checkpoint 即用适配器与模型配置模板。
 - 完成模型、SSH 隧道、ROS、初始位姿和 Client 的编排、监控与逆序回滚。
 - 增加严格同格式数据集合并，以及带保真结论的转换与导出。
 - 以中英文明确记录质检筛选、评分、部署 readiness 和动作安全标准。
@@ -169,7 +172,7 @@ EMBODY_HOST=0.0.0.0 EMBODY_PUBLIC_HOST=<工作电脑IP> \
 - 新数据格式：在 `backend/datasets/` 实现并注册统一接口；
 - 新质检规则：在 `backend/qc/detectors/` 增加带版本的 Detector，保持 issue code 和证据稳定；
 - 新转换或增强：保留能力检查、预览和保真报告；
-- 新模型：为 Python Provider 实现 `load(checkpoint)` 和 `predict(observations)`；
+- 新模型族：增加固定上游版本、许可证/引用记录、Checkpoint 适配器、配置模板和测试；自定义模型可为 Python Provider 实现 `load(checkpoint)` 和 `predict(observations)`；
 - 新机器人 SDK：优先实现暴露带类型 topic、service、action 的薄 ROS Bridge。
 
 提交修改前执行：

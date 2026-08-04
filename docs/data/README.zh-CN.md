@@ -22,6 +22,8 @@ EMBODIT_SANDBOX=1 bash embodit.sh start /allowed/root
 
 选择 Episode 后，工作台同步相机流、state/action 信号、任务和主时间轴。标注写入 `labels.jsonl`、`*.labels.jsonl` 或 `*.review.json` 等 sidecar，不修改原始媒体和表格。生成的媒体预览位于 `.embodit_cache/media/`，可重新生成。
 
+“不合格原因”的唯一配置入口是 [`../../config/data/review.json`](../../config/data/review.json)。直接编辑 `quarantineReasons` 数组即可：调整数组顺序会改变下拉顺序，修改 `label.zh/en` 会改显示名称，追加对象会新增原因。`id` 会写入审核进度，使用后应保持不变；不再使用的项请设为 `"enabled": false`，这样历史记录仍能正确显示。保存配置后刷新网页即可生效，无需重启服务。也可通过 `EMBODIT_REVIEW_CONFIG=/path/to/review.json` 使用外部配置文件。
+
 ## 3. 自动质检具体做什么
 
 质检是一套确定性、带版本的规则流水线，不是学习得到的“好/坏”黑盒分类器。每条 finding 都记录稳定 issue code、检测器版本、严重度、置信度、阈值、实测证据，以及适用时的时间区间。最终生效的完整配置会写入 SQLite 报告。
@@ -31,10 +33,10 @@ EMBODIT_SANDBOX=1 bash embodit.sh start /allowed/root
 | 档位 | 视觉/冻结采样 | 默认并行度 | 适用场景 |
 |---|---|---|---|
 | `fast` | 关闭视觉质量与相机抖动；冻结检测 3 fps、宽 128 | 4 Episode / 2 相机 | 首轮结构和完整性筛查 |
-| `standard` | 冻结 5 fps/160 px，视觉 4 fps/320 px，抖动 2 fps/320 px | 2 / 2 | 日常默认扫描 |
-| `deep` | 冻结 10 fps/240 px，视觉 8 fps/480 px，抖动 4 fps/480 px | 2 / 2 | 最终审计或疑难视觉问题 |
+| `standard` | 冻结 5 fps/160 px，视觉 4 fps/320 px，抖动 5 fps/320 px | 2 / 2 | 日常默认扫描 |
+| `deep` | 冻结 10 fps/240 px，视觉 8 fps/480 px，抖动 8 fps/480 px | 2 / 2 | 最终审计或疑难视觉问题 |
 
-所有档位都保留完整性解码。实际 Episode × 相机嵌套并行度还会受可用 CPU 数量限制。可编辑的完整默认值见 [`../../config/qc.example.json`](../../config/qc.example.json)。
+所有档位都保留完整性解码。实际 Episode × 相机嵌套并行度还会受可用 CPU 数量限制。可编辑的完整默认值见 [`../../config/data/qc.example.json`](../../config/data/qc.example.json)。
 
 ## 4. 默认检测标准
 
@@ -49,7 +51,7 @@ EMBODIT_SANDBOX=1 bash embodit.sh start /allowed/root
 - 信号长度与 Episode 长度偏差超过 `max(2 帧, 期望长度的 10%)`，包括 action/state 相互长度不兼容（`integrity/signal_length_mismatch`、`integrity/action_state_length_mismatch`）；
 - 相机少于 1 路，或缺少配置中指定的相机 key/pattern（`integrity/missing_required_camera`、`integrity/missing_required_camera_pattern`）；
 - 相机无法打开/解码、内容为空，或成功解码比例低于 90%（`integrity/video_source_unavailable`、`integrity/video_decode_error`、`integrity/empty_video`、`integrity/video_frame_count_mismatch`）；
-- 冻结画面累计达到 Episode 时长的 50%（`integrity/video_frozen`）。
+- 有 action/state 运动交叉证据的冻结画面累计达到 Episode 时长的 50%（`integrity/video_frozen`）。无运动信号时只送人工复核，不自动 hard-invalid。
 
 Hard-invalid Episode 会单独进入 `invalidEpisodes`，不会进入正常 selected 导出集合，避免高分或宽泛筛选意外放入结构上不可用的数据。
 
@@ -57,11 +59,11 @@ Hard-invalid Episode 会单独进入 `invalidEpisodes`，不会进入正常 sele
 
 | Issue code | 默认标准 | 严重度 |
 |---|---|---|
-| `visual/frozen` | 平均像素差 ≤0.75，连续至少 2 秒 | `error`；累计 ≥Episode 50% 时变为 `integrity/video_frozen`、hard `fatal` |
+| `visual/frozen` | 平均像素差 ≤0.75、变化像素占比 ≤1%，连续至少 2 秒；存在 action/state 时还要求区间内归一化运动量程 ≥2% | `error`；有跨模态运动证据且累计 ≥Episode 50% 时变为 `integrity/video_frozen`、hard `fatal` |
 | `visual/dark` | 灰度均值 <40，连续至少 0.5 秒 | `warning` |
 | `visual/overexposed` | 灰度均值 >245，连续至少 0.5 秒 | `warning` |
 | `visual/blur` | Laplacian 方差 <35，连续至少 0.5 秒 | `warning` |
-| `visual/camera_shake` | 光流全局向量变化 >4，且一致运动比例 ≥0.45 | `error` |
+| `visual/camera_shake` | KLT 特征跟踪 + RANSAC 相似变换的全局运动变化 >4；至少 12 个内点、内点率 ≥0.5、4×4 网格覆盖 ≥0.15，连续至少 2 次变化 | `error` |
 
 相距不超过 0.25 秒的视觉区间会合并。静态相机可以显式指定；列表为空时，名称含 `base`、`head`、`main`、`front`、`overhead` 的相机会成为候选，含 `wrist`、`hand`、`eef` 的相机会排除。命名不符合本体实际时必须覆盖该启发式规则。
 
@@ -69,7 +71,7 @@ Hard-invalid Episode 会单独进入 `invalidEpisodes`，不会进入正常 sele
 
 | Issue code | 默认标准 | 严重度 |
 |---|---|---|
-| `motion/jitter` | 同一非夹爪维度在 1 帧内同时满足加速度 robust-Z >8、jerk robust-Z >8、P99−P1 信号量程 ≥0.001、加速度/量程比 >0.15、jerk/量程比 >0.3，持续 ≥0.08 秒 | `error` |
+| `motion/jitter` | 同一非夹爪维度在 1 帧内同时满足加速度 robust-Z >8、jerk robust-Z >8、P99−P1 信号量程 ≥0.001、加速度/量程比 >0.15、jerk/量程比 >0.3；0.4 秒短窗还必须有至少 1 次反向和 ≥0.5 的超额行程比，持续 ≥0.08 秒 | `error` |
 | `motion/stationary` | 最大逐帧变化 ≤0.0005，连续至少 3 秒 | `warning` |
 | `motion/near_zero_episode` | Episode 内最大信号量程 <0.01 | `error` |
 | `manipulation/gripper_chatter` | 单次变化 ≥0.2 视为 transition，平均 >4 次/秒 | `error` |
@@ -78,6 +80,8 @@ Hard-invalid Episode 会单独进入 `invalidEpisodes`，不会进入正常 sele
 抖动默认分析 `action`；缺少 action 时回退到第一个可用连续信号。包含 `gripper` 的维度不参与运动抖动。夹爪规则只分析名称含 `gripper`、`finger` 或 `jaw` 的维度；识别不到时检测器记为 skipped，覆盖率会下降。
 
 运动和夹爪阈值使用数据集原生数值单位。关节弧度、归一化 action、笛卡尔米制和平二值夹爪显然需要不同阈值；批量导出前必须用有代表性的好/坏 Episode 校准。
+
+标准依据、成熟工具对比、分层准入规则和标定流程见 [`QC_STANDARD.zh-CN.md`](QC_STANDARD.zh-CN.md)。
 
 ## 5. 评分与自动判定
 
@@ -101,7 +105,7 @@ Warning 在三个阈值仍满足时可以通过；只要存在 error，即使区
 
 筛选支持完整性状态、生效判定、最低质量/可用/覆盖率、issue code、任务文本或 Episode 索引搜索，以及按索引、分数、覆盖率和 finding 数排序。
 
-生效判定优先使用 `manualDecision`，没有人工决定时使用 `autoDecision`。对单条 finding 执行 `confirmed`、`rejected`、`modified` 会记录审计信息和调整后的证据，但当前**不会重新计算**已保存的自动分数。要改变 Episode 是否按判定被选中，应设置 Episode 级人工决定；清除人工决定后恢复自动结果。
+生效判定优先使用 `manualDecision`，没有人工决定时使用 `autoDecision`。对单条 finding 执行 `confirmed`、`rejected`、`modified` 会记录审计信息和调整后的证据，但当前**不会重新计算**已保存的自动分数。标记为 `rejected` 的误报默认从时间轴、问题卡片、有效问题数和 issue 筛选中隐藏；原始 finding 与复核记录仍保留，可通过“查看已隐藏误报”恢复查看或撤销误报标记。要改变 Episode 是否按判定被选中，应设置 Episode 级人工决定；清除人工决定后恢复自动结果。
 
 推荐工作流程：
 
@@ -133,7 +137,7 @@ QC 只负责暴露可测异常，不能判断任务语义是否成功、行为�
 | MCAP → LeRobot/HDF5 | `partial` | 解码选定流，可能丢弃无关 topic/标定信息 |
 | LeRobot/HDF5 → MCAP | `partial` | 依据数据字段合成 topic 和时间戳 |
 
-报告记录源/目标格式、Episode/Frame 数、字段映射、已知损失和警告。配置示例见 [`../../config/convert.example.json`](../../config/convert.example.json)。
+报告记录源/目标格式、Episode/Frame 数、字段映射、已知损失和警告。配置示例见 [`../../config/data/convert.example.json`](../../config/data/convert.example.json)。
 
 ## 9. 严格合并标准
 
@@ -151,7 +155,7 @@ export AUGMENT_SAM3_CHECKPOINT=/path/to/sam3.pt
 bash embodit.sh start /path/to/datasets
 ```
 
-依赖见 [`../../config/augment-worker-requirements.txt`](../../config/augment-worker-requirements.txt) 和 [`../../third_party/README.md`](../../third_party/README.md)。增强保留未修改字段、时间戳、Episode 边界和原始数据类型，并生成处理清单。批量写出前应先验证单帧和视频预览。
+Worker 核心依赖统一声明在 [`../../pyproject.toml`](../../pyproject.toml)；PyTorch 需按宿主机 CUDA 版本单独安装，SAM3 的安装方式见 [`../../third_party/README.md`](../../third_party/README.md)。增强保留未修改字段、时间戳、Episode 边界和原始数据类型，并生成处理清单。批量写出前应先验证单帧和视频预览。
 
 ## 11. 缓存清理与数据安全
 

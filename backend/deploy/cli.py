@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rescue/CI entry point for Recipe v2 deployments."""
+"""Rescue/CI entry point for Recipe deployments."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 import settings
 from deploy.orchestrator import DeploymentOrchestration, OrchestrationState
-from deploy.recipe import load_recipe, redact_recipe
+from deploy.recipe import ModelConfig, RobotConfig, compose_recipe, load_deployment_config, load_recipe, redact_recipe
 
 
 def print_json(value: object) -> None:
@@ -26,8 +26,14 @@ def print_json(value: object) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="embodit-recipe")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    validate = subparsers.add_parser("validate", help="校验 Recipe v2")
+    validate = subparsers.add_parser("validate", help="校验 Recipe")
     validate.add_argument("recipe")
+    compose = subparsers.add_parser("compose", help="组合本体与模型配置并生成 Recipe")
+    compose.add_argument("robot_config")
+    compose.add_argument("model_config")
+    compose.add_argument("--deployment-id", default=None)
+    compose.add_argument("--name", default=None)
+    compose.add_argument("--output", default=None, help="写入 JSON；省略时输出到 stdout")
     run = subparsers.add_parser("run", help="启动并监控部署")
     run.add_argument("recipe")
     run.add_argument("--mode", choices=("dry_run", "live"), default=None)
@@ -38,6 +44,30 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
+        if args.command == "compose":
+            robot = load_deployment_config(args.robot_config)
+            model = load_deployment_config(args.model_config)
+            if not isinstance(robot, RobotConfig):
+                raise ValueError("第一个文件必须是 kind=robot 的本体配置")
+            if not isinstance(model, ModelConfig):
+                raise ValueError("第二个文件必须是 kind=model 的模型配置")
+            recipe = compose_recipe(
+                robot,
+                model,
+                deployment_id=args.deployment_id,
+                name=args.name,
+            )
+            payload = recipe.model_dump(mode="json")
+            if args.output:
+                output = Path(args.output).expanduser().resolve()
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                output.chmod(0o600)
+                print_json({"written": str(output), "deploymentId": recipe.deployment_id})
+            else:
+                print_json(payload)
+            return
+
         recipe = load_recipe(args.recipe)
         if args.command == "validate":
             print_json({"valid": True, "recipe": redact_recipe(recipe.model_dump(mode="json"))})

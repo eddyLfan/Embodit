@@ -22,6 +22,36 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+MODEL_PROVIDER_CATALOG = [
+    {
+        "id": "openpi",
+        "name": "OpenPI",
+        "checkpointOnly": True,
+        "source": "https://github.com/Physical-Intelligence/openpi",
+        "path": "third_party/models/openpi",
+        "revision": "15a9616a00943ada6c20a0f158e3adb39df2ccac",
+        "license": "Apache-2.0 (Gemma components may have additional terms)",
+    },
+    {
+        "id": "lerobot",
+        "name": "LeRobot",
+        "checkpointOnly": True,
+        "source": "https://github.com/huggingface/lerobot",
+        "path": "third_party/models/lerobot",
+        "revision": "f66e5128ecb2456e8c54a63d15404fa59c16aebc",
+        "license": "Apache-2.0",
+    },
+    {
+        "id": "starvla",
+        "name": "StarVLA",
+        "checkpointOnly": True,
+        "source": "https://github.com/starVLA/starVLA",
+        "path": "third_party/models/starvla",
+        "revision": "312fac890ab75b7651d2bc4f8f8c8dbb5e055184",
+        "license": "MIT",
+    },
+]
+
 from convert.pipeline import convert_dataset  # noqa: E402
 from convert.registry import list_conversion_targets, pair_capability  # noqa: E402
 from convert.jobs import (  # noqa: E402
@@ -50,6 +80,7 @@ from augment.jobs import (  # noqa: E402
     write_job as write_augment_job,
 )
 import settings  # noqa: E402
+from review_config import review_config_payload  # noqa: E402
 
 from augment.paths import DEFAULT_PREVIEW_DIR  # noqa: E402
 from datasets.detect import dataset_brief, detect_format, list_entries  # noqa: E402
@@ -61,8 +92,15 @@ from datasets.export import (  # noqa: E402
 from datasets.registry import open_dataset  # noqa: E402
 from datasets.view import FORMAT_LABELS, SUPPORTED_FORMATS  # noqa: E402
 from deploy.orchestrator import OrchestrationRegistry  # noqa: E402
-from deploy.recipe import parse_recipe as parse_deployment_recipe, redact_recipe  # noqa: E402
-from deploy.store import RecipeStore  # noqa: E402
+from deploy.recipe import (  # noqa: E402
+    compose_recipe as compose_deployment_recipe,
+    parse_deployment_config,
+    parse_recipe as parse_deployment_recipe,
+    redact_recipe,
+    split_recipe as split_deployment_recipe,
+)
+from deploy.store import DeploymentConfigStore, RecipeStore  # noqa: E402
+from deploy.transport import RecipeSshRunner, require_remote_ok  # noqa: E402
 from merge.pipeline import preflight_merge  # noqa: E402
 from labels.store import (  # noqa: E402
     default_labels_path,
@@ -208,6 +246,18 @@ class DeploymentRecipeRequest(BaseModel):
     recipe: dict[str, Any]
 
 
+class DeploymentConfigRequest(BaseModel):
+    config: dict[str, Any]
+
+
+class DeploymentComposeRequest(BaseModel):
+    robot: dict[str, Any]
+    model: dict[str, Any]
+    deployment_id: str | None = None
+    name: str | None = None
+    runtime: dict[str, Any] | None = None
+
+
 class DeploymentConfirmationRequest(BaseModel):
     confirmation: str
 
@@ -219,6 +269,10 @@ class DeploymentEmergencyStopRequest(BaseModel):
 class DeploymentOrchestrationStartRequest(BaseModel):
     recipe: dict[str, Any]
     mode: str | None = None
+
+
+class DeploymentDryRunRequest(BaseModel):
+    taskPrompt: str = Field(min_length=1, max_length=2000)
 
 
 class DeploymentOrchestrationLogsRequest(BaseModel):
@@ -233,6 +287,10 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     qc_jobs_dir = default_qc_jobs_dir()
     deploy_root = settings.CACHE_DIR / "deploy"
     deployment_recipes = RecipeStore(deploy_root / "recipes")
+    deployment_configs = {
+        kind: DeploymentConfigStore(deploy_root / "configs", kind)
+        for kind in ("robot", "model")
+    }
     deployment_orchestrations = OrchestrationRegistry(deploy_root / "orchestrations")
 
     @asynccontextmanager
@@ -327,6 +385,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             "supportedFormats": list(SUPPORTED_FORMATS),
             "formatLabels": FORMAT_LABELS,
             "autoFilter": {"enabled": True, "status": "ready"},
+            "review": review_config_payload(settings.REVIEW_CONFIG_PATH),
         }
 
     @app.get("/api/list", dependencies=[Depends(authorize)])
@@ -1028,6 +1087,90 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         payload = redact_recipe(recipe.model_dump(mode="json"))
         return {"valid": True, "recipe": payload, "version": 2}
 
+    @app.post("/api/deploy/configs/validate", dependencies=[Depends(authorize)])
+    def validate_deployment_config(request: DeploymentConfigRequest) -> dict[str, Any]:
+        try:
+            config = parse_deployment_config(request.config)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "valid": True,
+            "kind": config.kind,
+            "config": redact_recipe(config.model_dump(mode="json")),
+            "version": config.version,
+        }
+
+    @app.post("/api/deploy/compose", dependencies=[Depends(authorize)])
+    def compose_deployment(request: DeploymentComposeRequest) -> dict[str, Any]:
+        try:
+            recipe = compose_deployment_recipe(
+                request.robot,
+                request.model,
+                deployment_id=request.deployment_id,
+                name=request.name,
+                runtime=request.runtime,
+            )
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "valid": True,
+            "recipe": recipe.model_dump(mode="json"),
+            "robotConfigId": request.robot.get("config_id"),
+            "modelConfigId": request.model.get("config_id"),
+            "version": 2,
+        }
+
+    @app.post("/api/deploy/recipes/split", dependencies=[Depends(authorize)])
+    def split_deployment(request: DeploymentRecipeRequest) -> dict[str, Any]:
+        try:
+            robot, model = split_deployment_recipe(request.recipe)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "robot": robot.model_dump(mode="json"),
+            "model": model.model_dump(mode="json"),
+        }
+
+    @app.get("/api/deploy/configs/{kind}", dependencies=[Depends(authorize)])
+    def list_deployment_configs(kind: str) -> dict[str, Any]:
+        store = deployment_configs.get(kind)
+        if store is None:
+            raise HTTPException(status_code=404, detail="部署配置类型不存在")
+        configs = store.list()
+        return {"kind": kind, "configs": configs, "count": len(configs)}
+
+    @app.post("/api/deploy/configs/{kind}", dependencies=[Depends(authorize)])
+    def save_deployment_config(kind: str, request: DeploymentConfigRequest) -> dict[str, Any]:
+        store = deployment_configs.get(kind)
+        if store is None:
+            raise HTTPException(status_code=404, detail="部署配置类型不存在")
+        try:
+            return {"saved": True, "config": store.save(request.config)}
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/deploy/configs/{kind}/{config_id}", dependencies=[Depends(authorize)])
+    def get_deployment_config(kind: str, config_id: str) -> dict[str, Any]:
+        store = deployment_configs.get(kind)
+        if store is None:
+            raise HTTPException(status_code=404, detail="部署配置类型不存在")
+        try:
+            return {"config": store.get(config_id), "kind": kind, "version": 1}
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.delete("/api/deploy/configs/{kind}/{config_id}", dependencies=[Depends(authorize)])
+    def delete_deployment_config(kind: str, config_id: str) -> dict[str, Any]:
+        store = deployment_configs.get(kind)
+        if store is None:
+            raise HTTPException(status_code=404, detail="部署配置类型不存在")
+        try:
+            return {"deleted": store.delete(config_id), "kind": kind, "configId": config_id}
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @app.get("/api/deploy/recipes", dependencies=[Depends(authorize)])
     def list_deployment_recipes() -> dict[str, Any]:
         recipes = deployment_recipes.list()
@@ -1061,12 +1204,18 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     def deployment_capabilities() -> dict[str, Any]:
         return {
             "recipeVersion": 2,
-            "modelProviders": ["python", "external"],
+            "componentConfigVersion": 1,
+            "componentConfigKinds": ["robot", "model"],
+            "modelProviders": ["python", "openpi", "lerobot", "starvla", "external"],
+            "checkpointModelProviders": [item["id"] for item in MODEL_PROVIDER_CATALOG],
             "robotClients": ["ros2_standard", "custom"],
             "features": {
                 "recipeOrchestration": True,
+                "independentRobotModelConfigs": True,
+                "composableDeployment": True,
                 "managedSshTunnel": True,
                 "remoteSystemd": True,
+                "localModelHost": True,
                 "rosReadiness": True,
                 "continuousLoop": True,
                 "recording": True,
@@ -1075,6 +1224,10 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
                 "emergencyStop": True,
             },
         }
+
+    @app.get("/api/deploy/model-catalog", dependencies=[Depends(authorize)])
+    def deployment_model_catalog() -> dict[str, Any]:
+        return {"models": MODEL_PROVIDER_CATALOG, "count": len(MODEL_PROVIDER_CATALOG)}
 
     @app.post("/api/deploy/doctor", dependencies=[Depends(authorize)])
     def deployment_doctor(request: DeploymentRecipeRequest) -> dict[str, Any]:
@@ -1086,23 +1239,63 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
                 "recipeVersion": 2,
                 "summary": {"passed": 5, "warnings": 0, "failed": 0},
                 "checks": [
-                    {"code": "recipe.schema", "status": "pass", "message": "Recipe v2 schema 有效", "details": {}},
+                    {"code": "recipe.schema", "status": "pass", "message": "Recipe schema 有效", "details": {}},
                     {"code": "recipe.topology", "status": "pass", "message": "模型、本体与隧道主机引用有效", "details": {}},
                     {"code": "recipe.model", "status": "pass", "message": "模型 Provider 与 Checkpoint 配置有效", "details": {}},
                     {"code": "recipe.ros", "status": "pass", "message": "ROS 环境与 readiness 契约已配置", "details": {}},
                     {"code": "recipe.rollback", "status": "pass", "message": "停止与自动回滚策略有效", "details": {}},
                 ],
-                "note": "远端 SSH、systemd、模型、隧道和 ROS 动态检查将在启动编排中按顺序执行",
+                "note": "SSH/本地执行、systemd、模型、隧道和 ROS 动态检查将在启动编排中按顺序执行",
+            }
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/deploy/robot-connection", dependencies=[Depends(authorize)])
+    def check_deployment_robot_connection(request: DeploymentConfigRequest) -> dict[str, Any]:
+        try:
+            config = parse_deployment_config(request.config)
+            if config.kind != "robot":
+                raise ValueError("连接检测仅接受本体配置")
+            check_root = deploy_root / "connection-checks" / config.config_id
+            runner = RecipeSshRunner(config.host, check_root / "known_hosts", check_root / "askpass")
+            result = require_remote_ok(
+                runner.run(
+                    ["python3", "-c", "import platform; print(platform.node())"],
+                    timeout=config.host.connect_timeout_s + 5,
+                ),
+                "连接本体",
+            )
+            return {
+                "connected": True,
+                "configId": config.config_id,
+                "host": config.host.address,
+                "hostname": result.stdout.strip(),
             }
         except Exception as error:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/api/deploy/examples/{name}", dependencies=[Depends(authorize)])
     def deployment_example(name: str) -> dict[str, Any]:
-        if name != "recipe-v2":
+        if name not in {"recipe", "robot-config", "model-config", "component-configs"}:
             raise HTTPException(status_code=404, detail="部署示例不存在")
-        path = ROOT.parent / "config" / "deployment.recipe-v2.example.json"
+        path = settings.DEPLOYMENT_CONFIG_DIR / "recipe.example.json"
         recipe = json.loads(path.read_text(encoding="utf-8"))
+        if name != "recipe":
+            robot = json.loads(
+                (settings.DEPLOYMENT_CONFIG_DIR / "robot.example.json").read_text(encoding="utf-8")
+            )
+            model = json.loads(
+                (settings.DEPLOYMENT_CONFIG_DIR / "models" / "python.example.json").read_text(encoding="utf-8")
+            )
+            values = {
+                "robot-config": robot,
+                "model-config": model,
+                "component-configs": {
+                    "robot": robot,
+                    "model": model,
+                },
+            }
+            return {"name": name, "config": values[name]} if name != "component-configs" else {"name": name, **values[name]}
         return {"name": name, "recipe": recipe}
 
     @app.get("/api/deploy/orchestrations", dependencies=[Depends(authorize)])
@@ -1118,12 +1311,35 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         except Exception as error:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(error)) from error
 
+    @app.post("/api/deploy/orchestrations/prepare-model", dependencies=[Depends(authorize)])
+    def prepare_deployment_model(request: DeploymentOrchestrationStartRequest) -> dict[str, Any]:
+        try:
+            item = deployment_orchestrations.create(request.recipe, mode="dry_run")
+            return item.prepare_model()
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @app.get("/api/deploy/orchestrations/{orchestration_id}", dependencies=[Depends(authorize)])
     def get_deployment_orchestration(orchestration_id: str) -> dict[str, Any]:
         try:
             return deployment_orchestrations.get(orchestration_id).snapshot()
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/start-dry-run",
+        dependencies=[Depends(authorize)],
+    )
+    def start_deployment_dry_run(
+        orchestration_id: str,
+        request: DeploymentDryRunRequest,
+    ) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).start(task_prompt=request.taskPrompt)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post(
         "/api/deploy/orchestrations/{orchestration_id}/arm-challenge",

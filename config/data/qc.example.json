@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "profile": "standard",
   "requirements": {
     "action": true,
@@ -16,8 +16,12 @@
       "enabled": true,
       "minimumDecodedRatio": 0.9,
       "freezePixelDelta": 0.75,
+      "freezeChangedPixelThreshold": 0.0,
+      "freezeMaximumChangedRatio": 0.01,
       "freezeMinimumSeconds": 2.0,
       "freezeSampleFps": 5.0,
+      "freezeMinimumMotionRangeRatio": 0.02,
+      "freezeHardRatio": 0.5,
       "resizeWidth": 160
     },
     "motion": {
@@ -29,6 +33,9 @@
       "minimumAccelerationRangeRatio": 0.15,
       "minimumJerkRangeRatio": 0.3,
       "derivativeAlignmentFrames": 1,
+      "jitterWindowSeconds": 0.4,
+      "minimumJitterReversals": 1,
+      "minimumJitterExcessTravelRatio": 0.5,
       "minimumAnomalySeconds": 0.08,
       "mergeGapSeconds": 0.15,
       "stationaryDelta": 0.0005,
@@ -49,10 +56,15 @@
     "cameraShake": {
       "enabled": true,
       "staticCameraKeys": [],
-      "sampleFps": 2.0,
+      "sampleFps": 5.0,
       "resizeWidth": 320,
       "jitterThreshold": 4.0,
-      "uniformMotionRatio": 0.45
+      "uniformMotionRatio": 0.45,
+      "minimumTrackedPoints": 12,
+      "minimumInlierRatio": 0.5,
+      "minimumSpatialCoverage": 0.15,
+      "minimumShakeChanges": 2,
+      "mergeGapSeconds": 0.2
     },
     "gripper": {
       "enabled": true,

@@ -9,7 +9,7 @@ from typing import Any
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "version": 3,
+    "version": 4,
     "profile": "standard",
     "requirements": {
         "action": True,
@@ -26,8 +26,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": True,
             "minimumDecodedRatio": 0.9,
             "freezePixelDelta": 0.75,
+            "freezeChangedPixelThreshold": 0.0,
+            "freezeMaximumChangedRatio": 0.01,
             "freezeMinimumSeconds": 2.0,
             "freezeSampleFps": 5.0,
+            "freezeMinimumMotionRangeRatio": 0.02,
+            "freezeHardRatio": 0.5,
             "resizeWidth": 160,
         },
         "motion": {
@@ -40,6 +44,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "minimumAccelerationRangeRatio": 0.15,
             "minimumJerkRangeRatio": 0.3,
             "derivativeAlignmentFrames": 1,
+            "jitterWindowSeconds": 0.4,
+            "minimumJitterReversals": 1,
+            "minimumJitterExcessTravelRatio": 0.5,
             "minimumAnomalySeconds": 0.08,
             "mergeGapSeconds": 0.15,
             "stationaryDelta": 0.0005,
@@ -59,10 +66,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cameraShake": {
             "enabled": True,
             "staticCameraKeys": [],
-            "sampleFps": 2.0,
+            "sampleFps": 5.0,
             "resizeWidth": 320,
             "jitterThreshold": 4.0,
             "uniformMotionRatio": 0.45,
+            "minimumTrackedPoints": 12,
+            "minimumInlierRatio": 0.5,
+            "minimumSpatialCoverage": 0.15,
+            "minimumShakeChanges": 2,
+            "mergeGapSeconds": 0.2,
         },
         "gripper": {
             "enabled": True,
@@ -103,7 +115,7 @@ PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
         "detectors": {
             "videoIntegrity": {"freezeSampleFps": 10.0, "resizeWidth": 240},
             "visualQuality": {"sampleFps": 8.0, "resizeWidth": 480},
-            "cameraShake": {"sampleFps": 4.0, "resizeWidth": 480},
+            "cameraShake": {"sampleFps": 8.0, "resizeWidth": 480},
         },
         "runtime": {"episodeWorkers": 2, "cameraWorkers": 2},
     },
@@ -150,12 +162,41 @@ def merge_config(override: dict[str, Any] | None = None) -> dict[str, Any]:
         "minimumDimensionRange",
         "minimumAccelerationRangeRatio",
         "minimumJerkRangeRatio",
+        "jitterWindowSeconds",
+        "minimumJitterExcessTravelRatio",
     ):
         motion[key] = max(0.0, float(motion[key]))
     motion["derivativeAlignmentFrames"] = min(
         5,
         max(0, int(motion.get("derivativeAlignmentFrames", 1))),
     )
+    motion["minimumJitterReversals"] = max(
+        0,
+        int(motion.get("minimumJitterReversals", 1)),
+    )
+    video = config["detectors"]["videoIntegrity"]
+    for key in (
+        "freezePixelDelta",
+        "freezeChangedPixelThreshold",
+        "freezeMinimumSeconds",
+        "freezeSampleFps",
+        "freezeMinimumMotionRangeRatio",
+    ):
+        video[key] = max(0.0, float(video[key]))
+    for key in ("freezeMaximumChangedRatio", "freezeHardRatio"):
+        video[key] = min(1.0, max(0.0, float(video[key])))
+    shake = config["detectors"]["cameraShake"]
+    for key in (
+        "sampleFps",
+        "jitterThreshold",
+        "minimumSpatialCoverage",
+        "mergeGapSeconds",
+    ):
+        shake[key] = max(0.0, float(shake[key]))
+    for key in ("uniformMotionRatio", "minimumInlierRatio"):
+        shake[key] = min(1.0, max(0.0, float(shake[key])))
+    shake["minimumTrackedPoints"] = max(3, int(shake.get("minimumTrackedPoints", 12)))
+    shake["minimumShakeChanges"] = max(1, int(shake.get("minimumShakeChanges", 2)))
     return config
 
 def config_hash(config: dict[str, Any]) -> str:

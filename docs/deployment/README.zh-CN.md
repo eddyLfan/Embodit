@@ -2,7 +2,7 @@
 
 [English](README.md) · **中文**
 
-Recipe v2 面向一个明确拓扑：工作电脑通过 SSH 管理模型服务器和本体；本体建立到模型服务器的 SSH Local Forward；ROS、本体生命周期操作、初始位姿和 Robot Client 全部在本体端运行。Embodit 是控制面，不进入实时观测/动作数据链路。
+配置管理采用“本体配置 + 模型配置”的组合方式：两部分独立保存、版本化和复用，测试时各选择一份，Embodit 再生成运行所需的 Recipe。模型既可以位于独立 SSH 主机，也可以直接位于运行 Embodit 的机器；本体建立到模型端的 SSH Local Forward，ROS、本体生命周期操作、初始位姿和 Robot Client 全部在本体端运行。Embodit 是控制面，不进入实时观测/动作数据链路。
 
 ## 1. 运行架构
 
@@ -12,6 +12,16 @@ Workstation [Embodit]
   └─ SSH → Robot Host [SSH Tunnel + ROS Bringup + Robot Client]
                          └─ localhost:8000 → Model Host:8000
 ```
+
+Embodit 与模型端同机时，模型管理链路改为本地执行，不需要“本机 SSH 回连本机”；实时数据链路保持不变：
+
+```text
+Embodit + Local Model [Inference Service :8000]
+  └─ SSH → Robot Host [SSH Tunnel + ROS Bringup + Robot Client]
+                         └─ localhost:8000 → Embodit Host:8000
+```
+
+本体仍通过部署专用密钥连接模型端 SSH 服务来建立受限端口转发。因此 `host.address`/`port` 必须是本体可访问的 Embodit 地址和 SSH 端口；`host.user` 必须与 Embodit 进程的运行用户一致。模型进程、文件、systemd unit 和日志都归该用户管理。
 
 远端长期进程使用 systemd transient unit 托管：
 
@@ -28,18 +38,44 @@ embodit-client-<deployment-id>.service
 
 | 用户/本体集成方提供 | Embodit 提供 |
 |---|---|
-| SSH 可达的模型/本体主机、凭据、ROS setup 路径 | SSH 执行、主机校验、进程托管、日志、顺序启动与回滚 |
-| Python 模型入口和 Checkpoint，或高级外部推理服务 | Model Runner、localhost HTTP 协议、健康检查、Tensor/JSON 归一化 |
+| SSH 可达的本体，以及独立模型主机或 Embodit 本机地址、ROS setup 路径 | 本地/SSH 执行、主机校验、进程托管、日志、顺序启动与回滚 |
+| 常用模型 Provider 与 Checkpoint，或自定义 Python 入口/高级外部服务 | OpenPI/LeRobot/StarVLA 适配器、Model Runner、localhost HTTP 协议、健康检查、Tensor/JSON 归一化 |
 | ROS topic/service/action 映射和本体专用限位 | graph/type/rate/freshness readiness 与内置 ROS2 Client 校验 |
 | 厂商驱动/Bridge、硬件限位、急停、安全上下电/hold/stop 行为 | Dry Run、短时 Live challenge、goal 取消、配置的 hold/stop/power-off 调用 |
 
 Embodit 无法自动推断安全关节限位、初始位姿、控制频率或生命周期服务语义。这些值必须来自厂商资料，并在可触达硬件急停、低速条件下验证。软件 stop 不能替代经过认证的硬件安全系统。
 
-## 3. Recipe 配置
+## 3. 分离配置与自由组合
 
-复制 [`../../config/deployment.recipe-v2.example.json`](../../config/deployment.recipe-v2.example.json)。主要部分为：
+网页工作台默认管理两类组件配置：
 
-- `hosts.model`、`hosts.robot`：地址、端口、用户、认证、host-key 策略、system/user service manager；
+- 本体配置（`version: 1, kind: robot`）：本体 SSH、ROS、Bringup、readiness、上下电/hold/stop、初始位姿、Robot Client、安全限位、本体侧 tunnel 和退出策略；
+- 模型配置（`version: 1, kind: model`）：模型端的本地/SSH 连接、Provider、Checkpoint、运行环境和模型端点；只有自定义 `python` Provider 需要入口；
+- 组合信息：仅包含本次运行的 `deployment_id` 和名称。同一份本体配置可以依次搭配多个模型，同一模型也可以在多个本体上做兼容性测试。
+
+可直接复制 [`../../config/deployment/robot.example.json`](../../config/deployment/robot.example.json) 和 [`../../config/deployment/models/python.example.json`](../../config/deployment/models/python.example.json) 开始配置；常用模型另有 [OpenPI](../../config/deployment/models/openpi.example.json)、[LeRobot](../../config/deployment/models/lerobot.example.json) 和 [StarVLA](../../config/deployment/models/starvla.example.json) 模板。
+
+两类配置内部不需要管理 `robot` / `model` 主机引用。组合时 Embodit 自动建立规范别名、把本体 tunnel 接到所选模型端点，并执行完整 Recipe 交叉校验。保存目录按类型隔离，配置文件和目录权限仍分别为 `0600`、`0700`。
+
+```json
+{
+  "version": 1,
+  "kind": "model",
+  "config_id": "my-vla",
+  "name": "My VLA",
+  "host": {"connection": "local", "address": "192.168.10.10", "user": "root", "service_manager": "system"},
+  "model": {"provider": "python", "entrypoint": "my_vla:MyVLA", "checkpoint": "/root/checkpoints/my-vla", "workdir": "/root/vla"},
+  "endpoint": {"bind": "127.0.0.1", "port": 8000}
+}
+```
+
+工作台可导入单个本体/模型配置、包含两者的组合包，也能导入旧的完整 Recipe 并自动拆分。导出组合会同时保留两份源配置和生成后的 Recipe，便于复现测试。
+
+### 3.1 完整 Recipe
+
+底层编排器继续使用 [`../../config/deployment/recipe.example.json`](../../config/deployment/recipe.example.json) 所示的完整 Recipe。主要部分为：
+
+- `hosts.model`、`hosts.robot`：管理连接、地址、端口、用户、认证、host-key 策略、system/user service manager；模型端支持 `connection: local`，本体端必须为 `ssh`；
 - `model`：Python 入口、Checkpoint、解释器、工作目录、环境，或高级外部命令；
 - `tunnel`：本体监听地址/端口、模型目标、SSH keepalive 与重启策略；
 - `robot.ros`：ROS 1/2、setup、Domain ID/Master URI、RMW；
@@ -58,9 +94,42 @@ Embodit 无法自动推断安全关节限位、初始位姿、控制频率或生
 {"type":"key","identity_file":"/home/user/.ssh/id_ed25519"}
 ```
 
+`connection` 省略时默认是 `ssh`，与旧配置完全兼容。模型与 Embodit 同机时使用：
+
+```json
+{
+  "connection": "local",
+  "address": "192.168.10.10",
+  "port": 22,
+  "user": "embodit",
+  "service_manager": "user"
+}
+```
+
+本地连接不配置 `auth`；这里的地址、端口和用户仍供本体建立模型隧道使用。`service_manager: user` 不需要系统级 systemd 权限；若使用 `system`，启动 Embodit 的用户必须有管理 system unit 的权限。
+
 保存的 Recipe 文件和目录权限分别为 `0600`、`0700`。密码不会进入 SSH argv、编排日志或下载的 manifest。配置文件中的密码仍属于秘密，应仅本地保存、限制权限并排除出 Git。
 
-## 4. 最简模型接口
+## 4. Checkpoint 即用模型
+
+模型主机一次性初始化固定版本的子仓库并按各上游说明创建独立环境后，OpenPI、LeRobot 和 StarVLA 部署只需选择 Provider、填写 Checkpoint；无需 `entrypoint`、启动命令、`/health` 或 `/infer`：
+
+```json
+{
+  "model": {
+    "provider": "lerobot",
+    "checkpoint": "/root/checkpoints/lerobot-policy",
+    "workdir": "/root/Embodit",
+    "python_executable": "/root/miniconda3/envs/lerobot/bin/python"
+  }
+}
+```
+
+网页中的“常用模型 + Checkpoint”栏可生成这部分配置。`workdir` 指向模型主机上的 Embodit checkout，适配器会从其 `third_party/models/<provider>` 固定 gitlink 加载上游代码。若 checkout 在别处，可设置绝对 `source_path`。第三方来源、固定 commit、许可证边界、初始化和升级审查流程见 [`../../third_party/README.md`](../../third_party/README.md)。
+
+Checkpoint 必须包含对应上游正常推理所需的元数据：LeRobot 需要完整 `save_pretrained` 目录；StarVLA 需要模型配置与归一化统计；OpenPI 官方目录通常可推断训练 config，自训练或重命名目录需补充 `load_kwargs.config_name`。这三项是 checkpoint 格式信息，不需要用户实现代码入口。
+
+### 4.1 自定义 Python 模型接口
 
 使用默认 `python` provider 时，用户只需在模型服务器提供模型类和 Checkpoint：
 
@@ -120,14 +189,14 @@ Recipe 示例：
 
 首次启动时 Embodit 会：
 
-1. 使用配置的工作电脑凭据登录模型服务器和本体；
+1. 使用配置的工作电脑凭据登录本体；模型为独立主机时登录模型服务器，为本机时直接执行；
 2. 在本体 `~/.embodit/deployments/<id>/keys/` 生成部署专用 tunnel key；
-3. 通过工作电脑到模型服务器的管理连接安装公钥；
+3. 通过模型管理连接安装公钥；本机模型直接写入当前用户，独立模型通过 SSH 写入；
 4. 将该 authorized key 限制为只能转发 Recipe 声明的模型端口；
 5. 在本体写入部署专用 `known_hosts`；
 6. 使用 `ExitOnForwardFailure` 和配置的 keepalive 启动 SSH。
 
-因此用户只需配置工作电脑能够访问的两端凭据，不再手工安装“本体 → 模型服务器”密钥。
+因此远端场景只需配置工作电脑能够访问的两端凭据；本机模型不需要管理连接凭据。两种场景都不再手工安装“本体 → 模型服务器”密钥。
 
 ## 6. 精确启动与 readiness 标准
 
@@ -136,7 +205,7 @@ Recipe 示例：
 ```text
 SSH/systemd 预检
 → 协调隧道凭据
-→ 启动 Model Runner 并加载 entrypoint/checkpoint
+→ 启动 Model Runner 并通过 Provider 加载 checkpoint
 → 模型直连 health
 → 本体侧 SSH 隧道
 → 经本体 localhost 隧道检查模型 health
@@ -153,7 +222,7 @@ Readiness 是契约，不是固定 sleep：
 
 | 检查 | 通过标准 |
 |---|---|
-| SSH/systemd | 两端接受配置的登录方式，且能够管理 transient unit |
+| 连接/systemd | SSH 主机接受配置的登录方式；本地模型用户与 Embodit 运行用户一致；各端能够管理 transient unit |
 | Python 模型 | 模型加载后 Runner `/health` 返回 2xx，且不报告 `ready:false`/`ok:false` |
 | 隧道 | 通过 `robot localhost:<local_port>` 能完成相同模型 health |
 | ROS node | 所有配置的 node 名准确出现在 graph 中 |
@@ -197,11 +266,16 @@ Live 需要网页输入 60 秒内有效的 challenge 短语。Embodit 使用 `EM
 bash embodit.sh start
 ```
 
-进入“真机部署”，加载“双机 SSH + ROS 自动部署（v2）”示例，修改并保存 JSON，点击“一键预检并 Dry Run”。页面展示步骤状态、组件状态、日志、受控组件重启、Live 确认和急停。
+进入“真机部署”，分别打开或编辑一份本体配置和一份模型配置；两边任意组合后，点击“校验配置”或“一键预检并 Dry Run”。页面会展示生成的 Recipe、步骤状态、组件状态、日志、受控组件重启、Live 确认和急停。旧 Recipe 可以直接导入，工作台会自动拆成两份配置。
 
 CLI/救援命令：
 
 ```bash
+bash embodit.sh recipe-compose \
+  config/deployment/robot.example.json \
+  config/deployment/models/python.example.json \
+  --deployment-id robot-a--my-vla \
+  --output /tmp/robot-a--my-vla.json
 bash embodit.sh recipe-validate config/my-robot.json
 bash embodit.sh recipe-run config/my-robot.json --mode dry_run
 bash embodit.sh recipe-run config/my-robot.json --mode live
@@ -223,6 +297,11 @@ bash embodit.sh recipe-stop config/my-robot.json --emergency
 GET/POST    /api/deploy/recipes
 GET/DELETE  /api/deploy/recipes/{id}
 POST        /api/deploy/recipes/validate
+POST        /api/deploy/recipes/split
+GET/POST    /api/deploy/configs/{robot|model}
+GET/DELETE  /api/deploy/configs/{robot|model}/{id}
+POST        /api/deploy/configs/validate
+POST        /api/deploy/compose
 POST        /api/deploy/doctor
 POST        /api/deploy/orchestrations
 GET         /api/deploy/orchestrations/{id}
@@ -235,4 +314,4 @@ POST        /api/deploy/orchestrations/{id}/components/{component}/restart
 GET         /api/deploy/orchestrations/{id}/manifest
 ```
 
-Recipe v2 和上述 Orchestration API 是项目唯一支持的真机部署协议。
+本体/模型 Config 是配置管理接口；组合产物 Recipe 和上述 Orchestration API 仍是唯一运行协议。

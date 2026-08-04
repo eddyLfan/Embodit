@@ -22,6 +22,8 @@ Embodit currently recognizes LeRobot v2.1, LeRobot v3, RoboMimic HDF5, and MCAP.
 
 After selecting an episode, the workspace synchronizes camera streams, state/action signals, tasks, and the primary timeline. Labels are stored in sidecars such as `labels.jsonl`, `*.labels.jsonl`, or `*.review.json`; the original media and tables remain unchanged. Generated media previews are stored under `.embodit_cache/media/` and can be regenerated.
 
+The single source of truth for the **rejection reason** dropdown is [`../../config/data/review.json`](../../config/data/review.json). Reorder the `quarantineReasons` array to reorder the dropdown, edit `label.zh/en` to rename an option, or append an object to add one. An `id` is persisted in review progress and should remain stable after use; set `"enabled": false` instead of deleting an old option so historical records keep their label. Save the file and refresh the browser—no service restart is needed. Set `EMBODIT_REVIEW_CONFIG=/path/to/review.json` to use an external config file.
+
 ## 3. What automatic QC does
 
 QC is a deterministic, versioned rule pipeline rather than a learned “good/bad” classifier. Every finding records a stable issue code, detector version, severity, confidence, threshold, measured evidence, and—when applicable—a time interval. The complete effective configuration is embedded in the SQLite report.
@@ -31,10 +33,10 @@ The three profiles change scan cost, not the meaning of the output:
 | Profile | Visual/freeze sampling | Parallelism default | Intended use |
 |---|---|---|---|
 | `fast` | Disables visual-quality and camera-shake checks; freeze sampling 3 fps at width 128 | 4 episodes / 2 cameras | First-pass structural and integrity screening |
-| `standard` | Freeze 5 fps/160 px, visual 4 fps/320 px, shake 2 fps/320 px | 2 / 2 | Default daily scan |
-| `deep` | Freeze 10 fps/240 px, visual 8 fps/480 px, shake 4 fps/480 px | 2 / 2 | Final audit or difficult visual cases |
+| `standard` | Freeze 5 fps/160 px, visual 4 fps/320 px, shake 5 fps/320 px | 2 / 2 | Default daily scan |
+| `deep` | Freeze 10 fps/240 px, visual 8 fps/480 px, shake 8 fps/480 px | 2 / 2 | Final audit or difficult visual cases |
 
-Integrity decoding is retained in every profile. Actual nested episode × camera concurrency is capped by the available CPU count. The editable, complete default values are in [`../../config/qc.example.json`](../../config/qc.example.json).
+Integrity decoding is retained in every profile. Actual nested episode × camera concurrency is capped by the available CPU count. The editable, complete default values are in [`../../config/data/qc.example.json`](../../config/data/qc.example.json).
 
 ## 4. Default detection standards
 
@@ -49,7 +51,7 @@ An episode is marked `invalid` and automatically `quarantine` when any hard-inva
 - signal length differs from episode length beyond `max(2 frames, 10% of expected length)`, including incompatible action/state lengths (`integrity/signal_length_mismatch`, `integrity/action_state_length_mismatch`);
 - fewer than one camera is present, or a configured required camera key/pattern is absent (`integrity/missing_required_camera`, `integrity/missing_required_camera_pattern`);
 - a camera cannot be opened/decoded, is empty, or has a decoded ratio below 90% (`integrity/video_source_unavailable`, `integrity/video_decode_error`, `integrity/empty_video`, `integrity/video_frame_count_mismatch`);
-- frozen content occupies at least 50% of the episode (`integrity/video_frozen`).
+- frozen content with action/state motion evidence occupies at least 50% of the episode (`integrity/video_frozen`). Without motion signals it is sent to review instead of becoming hard-invalid.
 
 Hard-invalid episodes are separated as `invalidEpisodes` and do not enter the normal selected export set. This prevents a score or a broad filter from silently admitting structurally unusable data.
 
@@ -57,11 +59,11 @@ Hard-invalid episodes are separated as `invalidEpisodes` and do not enter the no
 
 | Issue code | Default standard | Severity |
 |---|---|---|
-| `visual/frozen` | Mean pixel delta ≤ 0.75 for at least 2 s | `error`; becomes `integrity/video_frozen`, hard `fatal`, at ≥50% of episode |
+| `visual/frozen` | Mean pixel delta ≤0.75 and changed-pixel ratio ≤1% for at least 2 s; when action/state exists, normalized in-window motion range must also be ≥2% | `error`; becomes hard `integrity/video_frozen` at ≥50% only with cross-modal motion evidence |
 | `visual/dark` | Grayscale mean < 40 for at least 0.5 s | `warning` |
 | `visual/overexposed` | Grayscale mean > 245 for at least 0.5 s | `warning` |
 | `visual/blur` | Laplacian variance < 35 for at least 0.5 s | `warning` |
-| `visual/camera_shake` | Optical-flow global-vector change > 4 and uniform-motion ratio ≥ 0.45 | `error` |
+| `visual/camera_shake` | KLT tracking plus a RANSAC similarity transform: global-motion change >4, at least 12 inliers, inlier ratio ≥0.5, 4×4 grid coverage ≥0.15, and at least two consecutive changes | `error` |
 
 Adjacent visual intervals within 0.25 s are merged. Static cameras can be listed explicitly. If the list is empty, names containing `base`, `head`, `main`, `front`, or `overhead` are candidates, while `wrist`, `hand`, and `eef` cameras are excluded. This naming heuristic must be overridden when it does not match the robot.
 
@@ -69,7 +71,7 @@ Adjacent visual intervals within 0.25 s are merged. Static cameras can be listed
 
 | Issue code | Default standard | Severity |
 |---|---|---|
-| `motion/jitter` | In the same non-gripper dimension: acceleration robust-Z > 8 and jerk robust-Z > 8 within 1 frame, P99−P1 signal range ≥ 0.001, acceleration/range ratio > 0.15, jerk/range ratio > 0.3; persists ≥0.08 s | `error` |
+| `motion/jitter` | In the same non-gripper dimension: acceleration robust-Z >8 and jerk robust-Z >8 within one frame, P99−P1 range ≥0.001, acceleration/range >0.15, jerk/range >0.3; a 0.4 s window must also contain a reversal and excess-travel ratio ≥0.5; persists ≥0.08 s | `error` |
 | `motion/stationary` | Maximum per-frame delta ≤ 0.0005 for at least 3 s | `warning` |
 | `motion/near_zero_episode` | Maximum signal range < 0.01 over the episode | `error` |
 | `manipulation/gripper_chatter` | A gripper transition is delta ≥ 0.2; average rate > 4 transitions/s | `error` |
@@ -101,7 +103,7 @@ Warnings can still pass if all thresholds remain satisfied. An error always requ
 
 Filters support integrity status, effective decision, minimum quality/usable/coverage, issue codes, task text/index search, and sorting by episode index, scores, coverage, or finding count.
 
-The effective decision is `manualDecision` when one exists, otherwise `autoDecision`. Reviewing an individual finding as `confirmed`, `rejected`, or `modified` records audit metadata and adjusted evidence, but currently does **not** recalculate the stored automatic scores. To change whether an episode is selected by decision, set its episode-level manual decision. Clearing that decision returns filtering to the automatic result.
+The effective decision is `manualDecision` when one exists, otherwise `autoDecision`. Reviewing an individual finding as `confirmed`, `rejected`, or `modified` records audit metadata and adjusted evidence, but currently does **not** recalculate the stored automatic scores. Findings marked `rejected` are hidden by default from the timeline, finding cards, effective finding counts, and issue filters; the original finding and review audit remain available through **Show hidden false positives**, where the rejection can also be undone. To change whether an episode is selected by decision, set its episode-level manual decision. Clearing that decision returns filtering to the automatic result.
 
 Recommended operating procedure:
 
@@ -133,7 +135,7 @@ Conversion fidelity is reported explicitly:
 | MCAP → LeRobot/HDF5 | `partial` | Selected streams decoded; unrelated topics/calibration may be dropped |
 | LeRobot/HDF5 → MCAP | `partial` | Topics and timestamps are synthesized from dataset fields |
 
-The report records source/target formats, episode/frame counts, field mapping, known losses, and warnings. Configuration example: [`../../config/convert.example.json`](../../config/convert.example.json).
+The report records source/target formats, episode/frame counts, field mapping, known losses, and warnings. Configuration example: [`../../config/data/convert.example.json`](../../config/data/convert.example.json).
 
 ## 9. Strict merge standard
 
@@ -151,7 +153,7 @@ export AUGMENT_SAM3_CHECKPOINT=/path/to/sam3.pt
 bash embodit.sh start /path/to/datasets
 ```
 
-See [`../../config/augment-worker-requirements.txt`](../../config/augment-worker-requirements.txt) and [`../../third_party/README.md`](../../third_party/README.md). Augmentation preserves unmodified fields, timestamps, episode boundaries, and original data types, and emits a processing manifest. Always validate a single-frame and video preview before batch output.
+Core worker dependencies are declared once in [`../../pyproject.toml`](../../pyproject.toml). Install PyTorch for the host CUDA version and SAM3 separately as described in [`../../third_party/README.md`](../../third_party/README.md). Augmentation preserves unmodified fields, timestamps, episode boundaries, and original data types, and emits a processing manifest. Always validate a single-frame and video preview before batch output.
 
 ## 11. Cache cleanup and data safety
 

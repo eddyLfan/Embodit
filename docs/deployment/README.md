@@ -2,7 +2,7 @@
 
 **English** · [中文](README.zh-CN.md)
 
-Recipe v2 targets one explicit topology: the workstation manages a model host and a robot host over SSH; the robot host creates an SSH Local Forward to the model host; ROS, hardware lifecycle operations, initial pose, and the Robot Client run on the robot host. Embodit is the control plane and is not in the real-time observation/action data path.
+Configuration management uses independently saved robot and model configs. Select one of each for a test and Embodit composes the runtime Recipe. The model can run on an independent SSH host or directly on the Embodit machine. The robot creates an SSH Local Forward to the model endpoint; ROS, hardware lifecycle operations, initial pose, and the Robot Client run on the robot host. Embodit is the control plane and is not in the real-time observation/action data path.
 
 ## 1. Runtime topology
 
@@ -12,6 +12,16 @@ Workstation [Embodit]
   └─ SSH → Robot Host [SSH Tunnel + ROS Bringup + Robot Client]
                          └─ localhost:8000 → Model Host:8000
 ```
+
+When Embodit and the model share a machine, model management runs locally and does not SSH back into the same host:
+
+```text
+Embodit + Local Model [Inference Service :8000]
+  └─ SSH → Robot Host [SSH Tunnel + ROS Bringup + Robot Client]
+                         └─ localhost:8000 → Embodit Host:8000
+```
+
+The robot still uses a deployment key and the model-side SSH server for restricted port forwarding. `host.address`/`port` must therefore be reachable from the robot, and `host.user` must match the account running Embodit.
 
 Long-running remote processes are managed as systemd transient units:
 
@@ -28,18 +38,44 @@ A brief workstation disconnect does not directly terminate them. Tunnel and proc
 
 | User/robot integrator supplies | Embodit supplies |
 |---|---|
-| SSH-reachable model and robot hosts, credentials, ROS setup paths | SSH execution, host validation, process supervision, logs, ordered startup and rollback |
-| A Python model entrypoint and checkpoint, or an advanced external service | Model Runner, localhost HTTP protocol, health checks, tensor/JSON normalization |
+| An SSH-reachable robot plus either a separate model host or the Embodit machine address, and ROS setup paths | Local/SSH execution, host validation, process supervision, logs, ordered startup and rollback |
+| A common model provider and checkpoint, or a custom Python entrypoint/advanced external service | OpenPI/LeRobot/StarVLA adapters, Model Runner, localhost HTTP protocol, health checks, tensor/JSON normalization |
 | ROS topic/service/action mapping and robot-specific limits | Graph/type/rate/freshness readiness and built-in ROS2 Client validation |
 | Vendor driver/bridge, hardware limits, e-stop, safe power/hold/stop behavior | Dry Run, short-lived Live challenge, goal cancellation, configured hold/stop/power-off calls |
 
 Embodit cannot infer safe joint limits, initial poses, controller rates, or lifecycle service semantics. Those values must come from the robot manufacturer and be validated at low speed with hardware e-stop access. A software stop is not a replacement for a certified hardware safety system.
 
-## 3. Recipe configuration
+## 3. Separate, composable configuration
 
-Copy [`../../config/deployment.recipe-v2.example.json`](../../config/deployment.recipe-v2.example.json). Its principal sections are:
+The deployment workspace manages two component types:
 
-- `hosts.model`, `hosts.robot`: address, port, user, authentication, host-key policy, system/user service manager;
+- robot config (`version: 1, kind: robot`): robot SSH, ROS, bringup/readiness, lifecycle operations, initial pose, Robot Client, safety limits, the robot side of the tunnel, and exit policy;
+- model config (`version: 1, kind: model`): local/SSH model connection, provider, checkpoint, environment, and endpoint; only custom `python` providers need an entrypoint;
+- composition metadata: only the run-specific deployment ID and name. A robot can be tested with multiple models, and a model can be reused across multiple robots.
+
+Start from [`../../config/deployment/robot.example.json`](../../config/deployment/robot.example.json) and [`../../config/deployment/models/python.example.json`](../../config/deployment/models/python.example.json). Provider templates are also available for [OpenPI](../../config/deployment/models/openpi.example.json), [LeRobot](../../config/deployment/models/lerobot.example.json), and [StarVLA](../../config/deployment/models/starvla.example.json).
+
+Component configs do not manage internal `robot` / `model` host references. Composition creates canonical aliases, connects the robot tunnel to the selected model endpoint, and runs full Recipe validation. Storage is separated by config type and retains `0600` file / `0700` directory permissions.
+
+```json
+{
+  "version": 1,
+  "kind": "model",
+  "config_id": "my-vla",
+  "name": "My VLA",
+  "host": {"connection": "local", "address": "192.168.10.10", "user": "root", "service_manager": "system"},
+  "model": {"provider": "python", "entrypoint": "my_vla:MyVLA", "checkpoint": "/root/checkpoints/my-vla", "workdir": "/root/vla"},
+  "endpoint": {"bind": "127.0.0.1", "port": 8000}
+}
+```
+
+The UI imports individual component configs, bundles containing both, and legacy full Recipe documents (which it splits automatically). A bundle export preserves both source configs and the generated recipe for reproducibility.
+
+### 3.1 Full Recipe
+
+The runtime orchestrator continues to consume the full Recipe shown in [`../../config/deployment/recipe.example.json`](../../config/deployment/recipe.example.json). Its principal sections are:
+
+- `hosts.model`, `hosts.robot`: management connection, address, port, user, authentication, host-key policy, and system/user service manager; models support `connection: local`, while robots currently require `ssh`;
 - `model`: Python entrypoint, checkpoint, interpreter, working directory, environment, or an advanced external command;
 - `tunnel`: robot-local listening address/port, model-side target, SSH keepalive and restart policy;
 - `robot.ros`: ROS 1/2, setup scripts, Domain ID/Master URI, RMW;
@@ -58,9 +94,42 @@ Authentication may be managed directly in the Recipe or through an environment v
 {"type":"key","identity_file":"/home/user/.ssh/id_ed25519"}
 ```
 
+Omitting `connection` defaults to `ssh`, preserving existing configs. For a model on the Embodit machine use:
+
+```json
+{
+  "connection": "local",
+  "address": "192.168.10.10",
+  "port": 22,
+  "user": "embodit",
+  "service_manager": "user"
+}
+```
+
+Local connections omit `auth`; the address, port, and user are still used by the robot-side model tunnel. `service_manager: user` avoids system-unit privileges. With `system`, the Embodit account must be allowed to manage system units.
+
 Stored Recipe files and directories use `0600` and `0700` permissions. Passwords are not placed in SSH argv, orchestration logs, or the downloaded manifest. A password in a config file is still a secret: keep the file local, permission-restricted, and out of Git.
 
-## 4. Minimal model interface
+## 4. Checkpoint-only model providers
+
+After the model host initializes the pinned submodules once and creates an isolated environment according to each upstream project, OpenPI, LeRobot, and StarVLA deployments need only a provider and checkpoint. No `entrypoint`, launch command, `/health`, or `/infer` implementation is required:
+
+```json
+{
+  "model": {
+    "provider": "lerobot",
+    "checkpoint": "/root/checkpoints/lerobot-policy",
+    "workdir": "/root/Embodit",
+    "python_executable": "/root/miniconda3/envs/lerobot/bin/python"
+  }
+}
+```
+
+The UI's common-model/checkpoint row generates this configuration. `workdir` points to the Embodit checkout on the model host, and the adapter loads upstream code through the pinned `third_party/models/<provider>` gitlink. Set an absolute `source_path` for a checkout in another location. See [`../../third_party/README.md`](../../third_party/README.md) for sources, pinned commits, license boundaries, initialization, and reviewed upgrades.
+
+The checkpoint must contain the metadata its upstream runtime requires: a complete LeRobot `save_pretrained` directory, StarVLA model config and normalization statistics, or the matching OpenPI training config. Official OpenPI directory names are normally inferred; renamed/custom checkpoints set `load_kwargs.config_name`. These are checkpoint-format details, not user entrypoint code.
+
+### 4.1 Custom Python model interface
 
 With the default `python` provider, the user supplies only a model class and checkpoint on the model host:
 
@@ -120,14 +189,14 @@ Set `provider: external` only for an already managed service. In that mode the u
 
 On first start, Embodit:
 
-1. logs into the model and robot hosts using the configured workstation credentials;
+1. logs into the robot and, for a remote model, the model host; a local model is managed directly;
 2. creates a deployment-specific tunnel key under `~/.embodit/deployments/<id>/keys/` on the robot;
-3. installs its public key in the model account through the workstation management connection;
+3. installs the public key through model management: directly for a local model or over SSH for a remote model;
 4. restricts that authorized key to forwarding the Recipe’s model port;
 5. writes deployment-specific `known_hosts` on the robot;
 6. starts SSH with `ExitOnForwardFailure` and configured keepalives.
 
-The user therefore configures only workstation-accessible credentials; no manual robot-to-model key installation is required.
+Remote deployments need workstation-accessible credentials for both endpoints; a local model needs no management credentials. Neither topology requires manual robot-to-model key installation.
 
 ## 6. Exact startup and readiness standard
 
@@ -136,7 +205,7 @@ The startup state machine is fixed:
 ```text
 SSH/systemd preflight
 → coordinate tunnel credentials
-→ start Model Runner and load entrypoint/checkpoint
+→ start Model Runner and load checkpoint through its provider
 → direct model health
 → start robot-side SSH tunnel
 → model health through robot-local tunnel
@@ -153,8 +222,8 @@ Readiness is a contract, not a delay:
 
 | Check | Pass standard |
 |---|---|
-| SSH/systemd | Both hosts accept the configured login and can manage transient units |
-| Python model | Runner `/health` returns 2xx and does not report `ready:false`/`ok:false` after model load |
+| Connection/systemd | SSH hosts accept configured logins; a local model user matches the Embodit process account; each endpoint can manage transient units |
+| Managed model | Runner `/health` returns 2xx and does not report `ready:false`/`ok:false` after provider checkpoint load |
 | Tunnel | The same model health succeeds through `robot localhost:<local_port>` |
 | ROS node | Every configured node name appears exactly in the graph |
 | Topic/service/action | Every configured name exists with the exact configured type |
@@ -197,11 +266,16 @@ On startup failure or monitored component failure, `auto_rollback` stops compone
 bash embodit.sh start
 ```
 
-Open “Robot deployment”, load the “dual-host SSH + ROS automated deployment (v2)” example, edit/save the JSON, then select “Preflight and Dry Run”. The UI exposes step state, component state, logs, controlled component restart, Live confirmation, and emergency stop.
+Open “Robot deployment”, select or edit one robot config and one model config, then choose “Validate” or “Preflight and Dry Run”. The UI shows the generated Recipe, step state, component state, logs, controlled component restart, Live confirmation, and emergency stop. Existing Recipe files can be imported and are split automatically.
 
 CLI and rescue commands:
 
 ```bash
+bash embodit.sh recipe-compose \
+  config/deployment/robot.example.json \
+  config/deployment/models/python.example.json \
+  --deployment-id robot-a--my-vla \
+  --output /tmp/robot-a--my-vla.json
 bash embodit.sh recipe-validate config/my-robot.json
 bash embodit.sh recipe-run config/my-robot.json --mode dry_run
 bash embodit.sh recipe-run config/my-robot.json --mode live
@@ -223,6 +297,11 @@ Changing robot SDKs should normally change only the Recipe and a thin ROS Bridge
 GET/POST    /api/deploy/recipes
 GET/DELETE  /api/deploy/recipes/{id}
 POST        /api/deploy/recipes/validate
+POST        /api/deploy/recipes/split
+GET/POST    /api/deploy/configs/{robot|model}
+GET/DELETE  /api/deploy/configs/{robot|model}/{id}
+POST        /api/deploy/configs/validate
+POST        /api/deploy/compose
 POST        /api/deploy/doctor
 POST        /api/deploy/orchestrations
 GET         /api/deploy/orchestrations/{id}
@@ -235,4 +314,4 @@ POST        /api/deploy/orchestrations/{id}/components/{component}/restart
 GET         /api/deploy/orchestrations/{id}/manifest
 ```
 
-Recipe v2 and this Orchestration API are the only supported real-robot deployment protocol.
+Robot/model Config is the configuration-management interface. The composed Recipe and this Orchestration API remain the only runtime protocol.

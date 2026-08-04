@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generic ROS2 robot-side runtime asset for Embodit Recipe v2.
+"""Generic ROS2 robot-side runtime asset for Embodit Recipe deployments.
 
 The process runs on the robot host.  It reads standard ROS2 observations,
 calls the model through the robot-local SSH tunnel, validates actions locally,
@@ -133,13 +133,17 @@ class RobotClient:
     def infer(self, observations: dict[str, Any]) -> tuple[list[list[float]], float]:
         model = self.config["model"]
         endpoint = model["endpoint"].rstrip("/") + model.get("infer_path", "/infer")
+        request_observations = dict(observations)
+        task_prompt = str(self.config.get("task_prompt") or "").strip()
+        if task_prompt:
+            request_observations["prompt"] = task_prompt
         payload = {
             "protocolVersion": 2,
             "deploymentId": self.config.get("deployment_id"),
             "mode": self.mode,
             "sequence": self.sequence,
             "capturedMonotonicNs": time.monotonic_ns(),
-            "observations": observations,
+            "observations": request_observations,
         }
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         headers = {"Content-Type": "application/json", "Accept": "application/json"}

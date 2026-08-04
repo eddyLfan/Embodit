@@ -3,9 +3,29 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PID_FILE="${SCRIPT_DIR}/service.pid"
-URL_FILE="${SCRIPT_DIR}/service.url"
-LOG_FILE="${SCRIPT_DIR}/service.log"
+STATE_DIR="${EMBODIT_STATE_DIR:-${SCRIPT_DIR}/.embodit}"
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+migrate_state_file() {
+  local legacy_path="$1"
+  local state_path="$2"
+  if [[ ! -e "$state_path" && -e "$legacy_path" ]]; then
+    mv "$legacy_path" "$state_path"
+  fi
+}
+
+# Keep upgrades compatible with the former root/config runtime layout.
+migrate_state_file "${SCRIPT_DIR}/service.pid" "${STATE_DIR}/service.pid"
+migrate_state_file "${SCRIPT_DIR}/service.url" "${STATE_DIR}/service.url"
+migrate_state_file "${SCRIPT_DIR}/service.log" "${STATE_DIR}/service.log"
+migrate_state_file "${SCRIPT_DIR}/config/token" "${STATE_DIR}/token"
+
+PID_FILE="${STATE_DIR}/service.pid"
+URL_FILE="${STATE_DIR}/service.url"
+LOG_FILE="${STATE_DIR}/service.log"
+TOKEN_FILE="${STATE_DIR}/token"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
   BOLD="$(tput bold)"
@@ -37,9 +57,10 @@ Commands:
   logs [LINES]         Show recent logs (default: 50 lines)
   logs -f              Follow the service log
   clean [MODE]         Clean managed files: expired (default), --cache, or --all
-  recipe-validate FILE Validate a Recipe v2 deployment
-  recipe-run FILE      Start and monitor a Recipe v2 deployment
-  recipe-stop FILE     Stop services declared by a Recipe v2 deployment
+  recipe-compose ROBOT MODEL  Compose robot/model configs into a Recipe
+  recipe-validate FILE Validate a deployment Recipe
+  recipe-run FILE      Start and monitor a deployment Recipe
+  recipe-stop FILE     Stop services declared by a deployment Recipe
   help                 Show this help
 
 Examples:
@@ -50,13 +71,15 @@ Examples:
   bash embodit.sh stop
   bash embodit.sh clean --dry-run
   bash embodit.sh clean --cache
-  bash embodit.sh recipe-validate config/deployment.recipe-v2.example.json
-  bash embodit.sh recipe-run config/deployment.recipe-v2.example.json --mode dry_run
-  bash embodit.sh recipe-stop config/deployment.recipe-v2.example.json
+  bash embodit.sh recipe-compose config/deployment/robot.example.json config/deployment/models/python.example.json --output /tmp/my-deployment.json
+  bash embodit.sh recipe-validate config/deployment/recipe.example.json
+  bash embodit.sh recipe-run config/deployment/recipe.example.json --mode dry_run
+  bash embodit.sh recipe-stop config/deployment/recipe.example.json
 
 Optional env vars: EMBODY_ROOT, EMBODY_HOST, EMBODY_PORT,
   EMBODY_PUBLIC_HOST, EMBODY_TOKEN, EMBODY_PROXY, EMBODIT_SANDBOX,
-  EMBODIT_CACHE_DIR, AUGMENT_PYTHON, AUGMENT_SAM3_CHECKPOINT
+  EMBODIT_CACHE_DIR, EMBODIT_STATE_DIR, EMBODIT_REVIEW_CONFIG,
+  AUGMENT_PYTHON, AUGMENT_SAM3_CHECKPOINT
 EOF
 }
 
@@ -91,7 +114,6 @@ start_service() {
   local port="${EMBODY_PORT:-${LEROBOT_PORT:-8765}}"
   local proxy="${EMBODY_PROXY:-${LEROBOT_PROXY:-}}"
   local public_host="${EMBODY_PUBLIC_HOST:-${LEROBOT_PUBLIC_HOST:-localhost}}"
-  local token_file="${SCRIPT_DIR}/config/token"
   local token url pid start_ts
 
   if [[ -z "$data_root" ]]; then
@@ -145,15 +167,14 @@ PY
   fi
 
   token="${EMBODY_TOKEN:-${LEROBOT_TOKEN:-}}"
-  if [[ -z "$token" && -s "$token_file" ]]; then
-    token="$(head -n1 "$token_file" | tr -d '[:space:]')"
+  if [[ -z "$token" && -s "$TOKEN_FILE" ]]; then
+    token="$(head -n1 "$TOKEN_FILE" | tr -d '[:space:]')"
   fi
   if [[ -z "$token" ]]; then
     token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
   fi
-  mkdir -p "${SCRIPT_DIR}/config"
-  printf '%s\n' "$token" >"$token_file"
-  chmod 600 "$token_file"
+  printf '%s\n' "$token" >"$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
   url="http://${public_host}:${port}/?token=${token}"
 
   if [[ -n "$proxy" ]]; then
@@ -370,7 +391,7 @@ run_recipe_cli() {
   local subcommand="$1"
   shift
   if (( $# < 1 )); then
-    fail "recipe-${subcommand} requires a Recipe v2 path."
+    fail "recipe-${subcommand} requires a Recipe path."
     return 2
   fi
   if [[ -x "${SCRIPT_DIR}/.venv/bin/python" ]]; then
@@ -407,6 +428,7 @@ case "$command" in
   status) show_status "$@" ;;
   logs|log) show_logs "$@" ;;
   clean) clean_cache "$@" ;;
+  recipe-compose) run_recipe_cli compose "$@" ;;
   recipe-validate) run_recipe_cli validate "$@" ;;
   recipe-run) run_recipe_cli run "$@" ;;
   recipe-stop) run_recipe_cli stop "$@" ;;
