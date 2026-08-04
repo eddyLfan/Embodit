@@ -1,44 +1,109 @@
 <div align="center">
   <img src="images/Embodit_logo.png" alt="Embodit" width="180">
   <h1>Embodit</h1>
-  <p>An integrated toolkit for embodied-AI data workflows and real-robot deployment</p>
+  <p><strong>Close the loop from real-robot data to model deployment.</strong></p>
+  <p>A local toolkit for embodied-AI dataset workflows and repeatable, safety-first robot testing.</p>
   <p><strong>English</strong> · <a href="README.zh-CN.md">中文</a></p>
+  <p>
+    <a href="docs/data/README.md">Data guide</a> ·
+    <a href="docs/deployment/README.md">Deployment guide</a> ·
+    <a href="docs/architecture.md">Architecture</a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+">
+    <img src="https://img.shields.io/badge/ROS-1%20%7C%202-22314E?logo=ros&logoColor=white" alt="ROS 1 and 2">
+    <img src="https://img.shields.io/badge/Data-LeRobot%20%7C%20HDF5%20%7C%20MCAP-0EA5E9" alt="Supported data formats">
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-F4C430" alt="MIT License"></a>
+  </p>
 </div>
 
 ## Why we built Embodit
 
-Embodied-AI projects repeatedly lose time to two kinds of infrastructure work. The first is browsing, validating, annotating, converting, merging, and augmenting datasets. The second is real-robot bring-up: logging into the inference server and robot, starting services, creating SSH tunnels, checking ROS, powering on, and launching the inference client.
+The hardest part of real-robot model development is often not a single algorithm. It is repeatedly completing the whole engineering loop:
 
-These procedures often live in temporary scripts, shell history, and individual experience. They are difficult to reproduce, unstable across sessions, and costly to adapt to the next robot. Embodit turns them into inspectable, reusable, safety-first workflows: a data loop from issue discovery to clean export, and a deployment loop from configuration through Dry Run, Live operation, and fault rollback.
+```mermaid
+flowchart LR
+    A["Collect data<br/>on the robot"] --> B["Browse and<br/>quality-check"]
+    B --> C["Review, filter,<br/>and export"]
+    C --> D["Train the model<br/>(your training stack)"]
+    D --> E["Connect model<br/>and checkpoint"]
+    E --> F["Dry Run and<br/>Live robot test"]
+    F --> G["Find failures and<br/>collect new data"]
+    G --> B
+```
 
-## What the toolkit provides
+In practice, this loop is fragmented. Data inspection has its own scripts; quality decisions live in personal experience; training inputs are prepared manually; and every robot test begins with many SSH sessions, process commands, tunnels, ROS checks, power-on steps, and client launches. Small changes to the robot SDK or network often make the process unstable again.
 
-Embodit has two clearly separated layers:
+Embodit was built to turn that repeated work into one inspectable workflow. It helps teams move from collected data to a trustworthy training subset, accept the resulting checkpoint with a minimal Python interface, and reproduce the same robot deployment and test procedure on the next iteration.
 
-| Layer | Purpose | Detailed guide |
+> Embodit connects the loop around model training. It does not replace your data-collection SDK, training framework, or hardware safety system.
+
+## What Embodit does in the loop
+
+| Stage | What Embodit provides | Result |
 |---|---|---|
-| Data layer | Multi-format browsing, synchronized playback, automatic QC, human review, labels, filtering, conversion, merge, visual augmentation, and fidelity-aware export | [Data layer guide](docs/data/README.md) |
-| Real-robot deployment layer | Dual-host SSH, model loading, tunneling, ROS bring-up, power-on, initial pose, inference client, Dry Run, Live confirmation, logs, and rollback | [Deployment layer guide](docs/deployment/README.md) |
+| Data collection handoff | Open LeRobot v2.1/v3, RoboMimic HDF5, and MCAP; inspect episodes, cameras, state, and action together | Quickly verify what the robot actually recorded |
+| Quality control | Deterministic integrity, video, motion, and gripper checks with interval evidence and human review | Auditable `pass` / `review` / `quarantine` decisions |
+| Training-set preparation | Filter, label, merge, augment, convert, and export with explicit fidelity reports | A reproducible dataset for your training pipeline |
+| Model handoff | Load a user Python entrypoint and checkpoint; generate the internal inference service automatically | No custom `/health` or `/infer` server for the normal path |
+| Real-robot test | Manage dual-host SSH, tunnel, ROS bring-up, readiness, power, initial pose, and Robot Client | Repeatable one-click Dry Run instead of terminal choreography |
+| Safe iteration | Explicit Live confirmation, local action limits, watchdog, logs, stop, and reverse rollback | Failures become evidence for the next data iteration |
 
-The deployment layer now has one supported architecture: Recipe v2. For the default Python model provider, users supply a remote Python `entrypoint` and checkpoint, while their model class implements only `load()` and `predict()`. Embodit generates the internal HTTP service, health checks, and process supervision.
+### Two layers, one workflow
 
-Automatic QC is deterministic and configuration-versioned: the detailed guide documents its hard-invalid rules, default visual/motion thresholds, score formulas, pass/review/quarantine decisions, and manual-override behavior. The deployment guide likewise defines exact ROS readiness and robot-side action-safety checks instead of treating startup as a fixed delay.
+| Layer | Key capabilities | Detailed guide |
+|---|---|---|
+| **Data layer** | Synchronized playback, automatic QC, review, labels, filtering, conversion, strict merge, visual augmentation, fidelity-aware export | [Read the data guide →](docs/data/README.md) |
+| **Real-robot deployment layer** | Recipe v2, managed model loading, SSH tunnel, ROS readiness, lifecycle operations, initial pose, Dry Run, Live, monitoring and rollback | [Read the deployment guide →](docs/deployment/README.md) |
 
-## UI preview
+Automatic QC is rule-based and configuration-versioned. Its hard-invalid conditions, visual/motion thresholds, scoring formula, selection rules, and manual overrides are documented—not hidden behind an opaque score. Robot startup is also readiness-driven: Embodit checks actual model health, tunnel health, ROS graph/types/rates/freshness, measured initial pose, and the first complete inference instead of waiting for fixed delays.
 
-### Dataset overview and synchronized playback
+For the standard model path, users provide a remote Python `entrypoint` and checkpoint. The model class only needs `load(checkpoint)` and `predict(observations)`; Embodit owns the private transport, health checks, serialization, process supervision, and robot-side connection.
 
-![Embodit dataset overview](images/overview.png)
+## Interface preview
 
-### Annotation and interval review
+### Inspect what the robot recorded
 
-![Embodit annotation workspace](images/annotation.png)
+<p align="center">
+  <img src="images/datasets_overview.png" alt="Embodit dataset overview with synchronized robot cameras" width="100%">
+</p>
 
-### Data augmentation
+<p align="center"><em>Browse episodes and replay synchronized multi-camera observations.</em></p>
 
-![Embodit data augmentation](images/augmentation.png)
+<p align="center">
+  <img src="images/datasets_action_prompt.png" alt="Embodit action trajectory inspection" width="100%">
+</p>
 
-The real-robot deployment workspace is available from the top-right “Robot deployment” entry. It provides Recipe editing, Dry Run, component status, logs, Live confirmation, and emergency stop.
+<p align="center"><em>Inspect prompts and normalized action trajectories dimension by dimension.</em></p>
+
+### Turn quality findings into a training subset
+
+<p align="center">
+  <img src="images/datasets_autoqc.png" alt="Embodit automatic QC filtering and finding review" width="100%">
+</p>
+
+<p align="center"><em>Filter by measured quality, usable duration, integrity, and issue evidence; then review decisions before export.</em></p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="images/datasets_anntate.png" alt="Embodit episode and interval annotation"></td>
+    <td width="50%"><img src="images/datasets_argument.png" alt="Embodit visual augmentation comparison"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Episode and interval labels</strong><br>Record task outcome, quality, tags, notes, and precise ranges.</td>
+    <td align="center"><strong>Preview-gated augmentation</strong><br>Compare source and result videos before batch output.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="images/datasets_convert.png" alt="Embodit fidelity-aware dataset conversion"></td>
+    <td width="50%"><img src="images/datasets_merge.png" alt="Embodit strict dataset merge preflight"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Fidelity-aware conversion</strong><br>See what is preserved or rebuilt before starting a background job.</td>
+    <td align="center"><strong>Strict dataset merge</strong><br>Check format, FPS, robot, camera fields, and native schemas first.</td>
+  </tr>
+</table>
+
+The real-robot deployment workspace is still under active development, so its screenshot is intentionally omitted until the interface and workflow stabilize. Its Recipe v2 design, current behavior, configuration, and safety boundary are documented in the [deployment guide](docs/deployment/README.md).
 
 ## Quick start
 
@@ -48,19 +113,19 @@ Requirements: Linux, Python 3.10+, and [uv](https://docs.astral.sh/uv/).
 git clone https://github.com/eddyLfan/Embodit.git
 cd Embodit
 
-# Synchronize the environment and start the service.
-# Without DATA_ROOT, Embodit browses the current directory.
+# Start the local data workspace.
 bash embodit.sh start /path/to/datasets
 ```
 
-The terminal prints an access URL containing a temporary token. Common commands:
+The terminal prints a local URL with a temporary access token. Omitting the dataset path uses the current directory.
 
 ```bash
+# Service management
 bash embodit.sh status
 bash embodit.sh logs -f
 bash embodit.sh stop
 
-# Validate and start a real-robot deployment Recipe
+# Validate and start a real-robot Dry Run
 bash embodit.sh recipe-validate config/deployment.recipe-v2.example.json
 bash embodit.sh recipe-run config/deployment.recipe-v2.example.json --mode dry_run
 ```
@@ -72,33 +137,40 @@ EMBODY_HOST=0.0.0.0 EMBODY_PUBLIC_HOST=<workstation-ip> \
   bash embodit.sh start /path/to/datasets
 ```
 
-Read the [data layer guide](docs/data/README.md) before processing datasets and the complete [deployment layer guide](docs/deployment/README.md) before connecting a physical robot.
+Next steps:
+
+1. Follow the [data guide](docs/data/README.md) to scan, review, and export a training subset.
+2. Train with your existing framework and produce a checkpoint.
+3. Implement the minimal model adapter and configure Recipe v2 using the [deployment guide](docs/deployment/README.md).
+4. Complete Dry Run before explicitly enabling Live operation.
 
 ## Changelog
 
 ### 2026-08-04
 
-- Consolidated real-robot deployment on Recipe v2 and removed Profile v1, the legacy Gateway, Mock/SDK Policy flows, and Session APIs.
-- Added an Embodit-managed Python model provider; regular users no longer implement `/health` or `/infer`.
-- Completed orchestration, monitoring, and reverse rollback for the model, SSH tunnel, ROS, initial pose, and robot client.
-- Consolidated deployment persistence and CLI entry points, and moved remotely uploaded runtime assets into `backend/deploy/assets/`.
-- Reorganized documentation into the main README, data layer guide, deployment layer guide, and architecture guide.
-- Documented the exact QC/filtering, conversion fidelity, merge compatibility, deployment readiness, and action-safety standards in both English and Chinese.
+- Consolidated real-robot deployment on Recipe v2 and removed legacy deployment paths.
+- Added an Embodit-managed Python model provider and standard ROS2 Robot Client.
+- Completed model, SSH tunnel, ROS, initial-pose, Client monitoring, and reverse rollback orchestration.
+- Added strict same-format dataset merge and fidelity-aware conversion/export behavior.
+- Documented exact QC filtering, scoring, deployment readiness, and action-safety standards in English and Chinese.
+- Reorganized the project and documentation around the data-to-robot iteration loop.
 
 ### 2026-08-03
 
-- Added dataset merge, automatic QC, interval evidence, review filtering, and augmentation-preview workflows.
-- Added unified browsing and conversion support for LeRobot, RoboMimic HDF5, and MCAP datasets.
+- Added automatic QC, interval evidence, human review filtering, and augmentation previews.
+- Added unified browsing and conversion for LeRobot, RoboMimic HDF5, and MCAP.
 
 ## Development and contributing
 
-See the [architecture guide](docs/architecture.md) for module boundaries and extension points. Preferred extension paths:
+Contributions of all sizes are welcome. If you would like to participate long term and join the contributor team, open an Issue or contact the maintainer with a short introduction to your interests and intended area of contribution.
 
-- New dataset format: implement and register the shared dataset interface in `backend/datasets/`.
-- New QC rule: add a detector under `backend/qc/detectors/` while keeping the finding schema stable.
-- New augmentation: add the pure algorithm and worker integration in `backend/augment/`, preserving preview and output-fidelity checks.
-- New model: implement `load(checkpoint)` and `predict(observations)` and use the Python provider.
-- New robot SDK: prefer a thin ROS bridge exposing standard topics, services, and actions instead of changing the deployment control plane.
+See the [architecture guide](docs/architecture.md) for module boundaries and extension points:
+
+- new dataset format: implement and register the common interface in `backend/datasets/`;
+- new QC rule: add a versioned detector under `backend/qc/detectors/` with stable issue codes and evidence;
+- new conversion or augmentation: preserve capability checks, preview, and fidelity reporting;
+- new model: implement `load(checkpoint)` and `predict(observations)` for the Python provider;
+- new robot SDK: prefer a thin ROS Bridge exposing typed topics, services, and actions.
 
 Before submitting changes:
 
@@ -109,7 +181,7 @@ bash -n embodit.sh
 git diff --check
 ```
 
-Keep implementation, tests, and documentation in the same change. Any feature capable of issuing physical actions must preserve Dry Run, explicit Live confirmation, limits, watchdog behavior, hold/stop operations, and failure rollback.
+Keep implementation, tests, and documentation in the same change. Features capable of issuing physical actions must preserve Dry Run, explicit Live confirmation, local limits, watchdog behavior, hold/stop operations, and failure rollback.
 
 ## License
 

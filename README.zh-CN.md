@@ -1,44 +1,109 @@
 <div align="center">
   <img src="images/Embodit_logo.png" alt="Embodit" width="180">
   <h1>Embodit</h1>
-  <p>面向具身智能数据闭环与真机部署的一体化工具</p>
+  <p><strong>打通从真机数据到模型部署的完整循环。</strong></p>
+  <p>面向具身智能数据处理与可复现、安全优先真机测试的本地工具。</p>
   <p><a href="README.md">English</a> · <strong>中文</strong></p>
+  <p>
+    <a href="docs/data/README.zh-CN.md">数据层指南</a> ·
+    <a href="docs/deployment/README.zh-CN.md">真机部署指南</a> ·
+    <a href="docs/architecture.md">项目架构</a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+">
+    <img src="https://img.shields.io/badge/ROS-1%20%7C%202-22314E?logo=ros&logoColor=white" alt="ROS 1 and 2">
+    <img src="https://img.shields.io/badge/Data-LeRobot%20%7C%20HDF5%20%7C%20MCAP-0EA5E9" alt="支持的数据格式">
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-F4C430" alt="MIT License"></a>
+  </p>
 </div>
 
 ## 我们为什么制作这个工具
 
-具身智能项目常常被两类重复工作拖慢：一类是数据集浏览、质检、标注、转换、合并和增强；另一类是真机调试时反复登录模型服务器与机器人、启动服务、建立 SSH 隧道、检查 ROS、上电并运行推理客户端。
+真机模型开发最困难的往往不是某一个算法，而是反复跑通整条工程链路：
 
-这些工作通常散落在临时脚本、终端历史和个人经验中，流程不稳定、难以复现，也很难迁移到下一台机器人。Embodit 希望把它们沉淀成一套可检查、可复用、默认安全的工作流：数据侧形成从发现问题到导出数据的闭环，部署侧形成从配置到 Dry Run、Live 和故障回滚的闭环。
+```mermaid
+flowchart LR
+    A["真机数采"] --> B["浏览与<br/>自动质检"]
+    B --> C["人工复核、筛选<br/>与训练集导出"]
+    C --> D["模型训练<br/>（使用现有训练框架）"]
+    D --> E["接入模型<br/>与 Checkpoint"]
+    E --> F["Dry Run 与<br/>真机 Live 测试"]
+    F --> G["发现问题并<br/>补充新数据"]
+    G --> B
+```
 
-## 工具简要介绍
+现实中，这条链路通常是割裂的：数据浏览依赖一套临时脚本，质量判断依赖个人经验，训练输入需要人工整理；每次真机测试又要打开多个 SSH 终端，依次启动模型、隧道、ROS、本体和客户端。机器人 SDK、网络或节点稍有变化，流程就可能再次失效。
 
-Embodit 由两个边界清晰的功能层组成：
+Embodit 的开发动机，就是把这些高频但容易出错的工作沉淀成一个可以检查、复用和自动执行的闭环：从真机采集结果中得到可信训练数据，让训练完成的 Checkpoint 以最小接口接入，再稳定复现同一套真机部署与测试流程，并将失败样本重新带回下一轮数据迭代。
 
-| 功能层 | 解决的问题 | 详细文档 |
+> Embodit 负责连接模型训练前后的工程链路，不替代本体数采 SDK、模型训练框架或硬件安全系统。
+
+## Embodit 如何帮助这条循环链路
+
+| 环节 | Embodit 提供的能力 | 得到的结果 |
 |---|---|---|
-| 数据层 | 多格式浏览、同步回放、自动质检、人工复核、标签、筛选、转换、合并、视觉增强与保真导出 | [数据层详细指南](docs/data/README.zh-CN.md) |
-| 真机部署层 | 双机 SSH、模型加载、隧道、ROS Bringup、上电、初始位姿、推理客户端、Dry Run、Live、日志与回滚 | [真机部署层详细指南](docs/deployment/README.zh-CN.md) |
+| 数采结果接入 | 打开 LeRobot v2.1/v3、RoboMimic HDF5、MCAP，同步查看 Episode、相机、state 和 action | 快速确认本体究竟采到了什么 |
+| 数据质检 | 确定性的完整性、视频、运动和夹爪检测，提供时间区间证据与人工复核 | 可审计的 `pass` / `review` / `quarantine` 判定 |
+| 训练集准备 | 筛选、标注、合并、增强、转换和带保真报告的导出 | 可复现地交给现有训练流水线 |
+| 模型接入 | 加载用户 Python 入口与 Checkpoint，自动生成内部推理服务 | 普通用户不再编写 `/health`、`/infer` 服务 |
+| 真机部署测试 | 管理双机 SSH、隧道、ROS Bringup、readiness、上电、初始位姿和 Robot Client | 用可复现的一键 Dry Run 代替多终端手工操作 |
+| 安全迭代 | Live 显式确认、本体端动作限位、watchdog、日志、停止与逆序回滚 | 将真机失败转化为下一轮数据依据 |
 
-当前真机部署只保留最终版 Recipe v2。模型默认只需提供远端 Python `entrypoint` 和 Checkpoint，用户类实现 `load()`、`predict()`；内部 HTTP 服务、健康检查和进程托管由 Embodit 自动完成。
+### 两个功能层，一条完整工作流
 
-自动质检是确定性、配置带版本的规则系统：详细指南明确列出 hard-invalid 规则、视觉/运动默认阈值、评分公式、pass/review/quarantine 判定和人工覆盖关系。部署指南同样给出精确的 ROS readiness 与本体端动作安全校验，不用固定等待时间代替就绪判断。
+| 功能层 | 核心能力 | 详细文档 |
+|---|---|---|
+| **数据层** | 同步回放、自动质检、人工复核、标签、筛选、转换、严格合并、视觉增强和保真导出 | [阅读数据层指南 →](docs/data/README.zh-CN.md) |
+| **真机部署层** | Recipe v2、模型托管、SSH 隧道、ROS readiness、本体生命周期、初始位姿、Dry Run、Live、监控与回滚 | [阅读真机部署指南 →](docs/deployment/README.zh-CN.md) |
 
-## 工具简要页面展示
+自动质检是确定性、配置带版本的规则系统。Hard-invalid 条件、视觉/运动阈值、评分公式、筛选规则和人工覆盖关系都可以查看和修改，而不是隐藏在一个黑盒分数中。真机启动同样由 readiness 驱动：工具检查真实的模型 health、隧道 health、ROS graph/type/rate/freshness、实测初始位姿和首次完整推理，不使用固定等待时间假设组件已经启动。
 
-### 数据集概览与同步回放
+标准模型接入只需要用户提供模型服务器上的 Python `entrypoint` 和 Checkpoint，模型类实现 `load(checkpoint)`、`predict(observations)`；内部传输、健康检查、序列化、进程托管和本体侧连接由 Embodit 处理。
 
-![Embodit 数据集概览](images/overview.png)
+## 工具页面展示
 
-### 标注与区间复核
+### 查看本体实际采集到的内容
 
-![Embodit 标注工作台](images/annotation.png)
+<p align="center">
+  <img src="images/datasets_overview.png" alt="Embodit 数据集概览与多相机同步回放" width="100%">
+</p>
 
-### 数据增强
+<p align="center"><em>浏览 Episode，同步回放本体多相机观测。</em></p>
 
-![Embodit 数据增强](images/augmentation.png)
+<p align="center">
+  <img src="images/datasets_action_prompt.png" alt="Embodit Action 轨迹检查" width="100%">
+</p>
 
-真机部署工作台位于页面右上角“真机部署”，用于编辑 Recipe、启动 Dry Run、观察组件状态、查看日志、切换 Live 和触发急停。
+<p align="center"><em>结合任务 Prompt，逐维查看归一化 Action 轨迹。</em></p>
+
+### 将质量问题转化为可信训练集
+
+<p align="center">
+  <img src="images/datasets_autoqc.png" alt="Embodit 自动质检筛选与问题复核" width="100%">
+</p>
+
+<p align="center"><em>按质量分、可用时长、完整性和问题证据筛选，人工确认后再导出。</em></p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="images/datasets_anntate.png" alt="Embodit Episode 与区间标注"></td>
+    <td width="50%"><img src="images/datasets_argument.png" alt="Embodit 视觉增强对比"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Episode 与区间标注</strong><br>记录任务结果、质量、标签、备注和精确时间段。</td>
+    <td align="center"><strong>预览确认后增强</strong><br>批量写出前先比较原始视频和处理结果。</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="images/datasets_convert.png" alt="Embodit 带保真说明的数据转换"></td>
+    <td width="50%"><img src="images/datasets_merge.png" alt="Embodit 严格数据集合并预检"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>带保真说明的格式转换</strong><br>后台任务开始前明确哪些内容会保留或重建。</td>
+    <td align="center"><strong>严格数据集合并</strong><br>先检查格式、FPS、本体、相机字段和原生 Schema。</td>
+  </tr>
+</table>
+
+真机部署工作台仍在持续开发，因此暂不放置界面截图，待页面与流程稳定后再补充。Recipe v2 的设计、当前实现、配置方式和安全边界见[真机部署指南](docs/deployment/README.zh-CN.md)。
 
 ## Quick start
 
@@ -48,56 +113,64 @@ Embodit 由两个边界清晰的功能层组成：
 git clone https://github.com/eddyLfan/Embodit.git
 cd Embodit
 
-# 同步环境并启动；不传 DATA_ROOT 时浏览当前目录
+# 启动本地数据工作台
 bash embodit.sh start /path/to/datasets
 ```
 
-终端会输出带临时 Token 的访问地址。常用命令：
+终端会输出带临时访问 Token 的本地地址。不传数据路径时使用当前目录。
 
 ```bash
+# 服务管理
 bash embodit.sh status
 bash embodit.sh logs -f
 bash embodit.sh stop
 
-# 真机部署配置校验与启动
+# 校验真机 Recipe 并启动 Dry Run
 bash embodit.sh recipe-validate config/deployment.recipe-v2.example.json
 bash embodit.sh recipe-run config/deployment.recipe-v2.example.json --mode dry_run
 ```
 
-局域网使用：
+局域网访问：
 
 ```bash
 EMBODY_HOST=0.0.0.0 EMBODY_PUBLIC_HOST=<工作电脑IP> \
   bash embodit.sh start /path/to/datasets
 ```
 
-开始处理数据前阅读[数据层详细指南](docs/data/README.zh-CN.md)；连接真实机器人前完整阅读[真机部署层详细指南](docs/deployment/README.zh-CN.md)。
+推荐的下一步：
+
+1. 按照[数据层指南](docs/data/README.zh-CN.md)完成扫描、复核和训练集导出。
+2. 使用现有训练框架训练并得到 Checkpoint。
+3. 实现最小模型适配器，根据[真机部署指南](docs/deployment/README.zh-CN.md)配置 Recipe v2。
+4. 完成 Dry Run 后，再显式确认进入 Live。
 
 ## 更新日志
 
 ### 2026-08-04
 
-- 真机部署层收敛到 Recipe v2，删除 Profile v1、旧 Gateway、Mock/SDK Policy 和旧 Session API。
-- 新增 Embodit 托管的 Python Model Provider，普通用户不再实现 `/health`、`/infer`。
-- 完成模型、SSH 隧道、ROS、初始位姿、Robot Client 的自动编排、监控与逆序回滚。
-- 合并部署配置存储与 CLI，将远端运行时资产归入 `backend/deploy/assets/`。
-- 重组项目文档为主 README、数据层指南和真机部署层指南。
-- 以中英文补充质检/筛选、转换保真、合并兼容、部署 readiness 和动作安全的精确标准。
+- 真机部署层收敛到 Recipe v2，并删除旧部署路径。
+- 增加 Embodit 托管的 Python Model Provider 和标准 ROS2 Robot Client。
+- 完成模型、SSH 隧道、ROS、初始位姿和 Client 的编排、监控与逆序回滚。
+- 增加严格同格式数据集合并，以及带保真结论的转换与导出。
+- 以中英文明确记录质检筛选、评分、部署 readiness 和动作安全标准。
+- 围绕“数据到真机”的迭代闭环重新组织项目和文档。
 
 ### 2026-08-03
 
-- 增加数据集合并、自动质检、区间证据、复核筛选和增强预览闭环。
-- 增加 LeRobot、RoboMimic HDF5、MCAP 的统一浏览与转换能力。
+- 增加自动质检、时间区间证据、人工复核筛选和增强预览。
+- 增加 LeRobot、RoboMimic HDF5、MCAP 的统一浏览与转换。
 
 ## 二次开发、共建说明
 
-项目架构与模块职责见[开发架构说明](docs/architecture.md)。推荐扩展方式：
+欢迎任何形式的功能完善、问题修复和文档贡献。如果希望长期参与项目并加入 Contributor 团队，欢迎通过 Issue 或直接联系项目维护者提出申请，并简要介绍感兴趣的方向与计划参与的内容。
 
-- 新数据格式：实现 `backend/datasets/` 中的统一数据集接口并注册。
-- 新质检规则：在 `backend/qc/detectors/` 增加 Detector，保持输出 schema 稳定。
-- 新增强算法：在 `backend/augment/` 增加纯算法与 worker 接入，保留预览和输出保真检查。
-- 新模型：提供 `load(checkpoint)`、`predict(observations)`，优先使用 Python Provider。
-- 新机器人 SDK：优先实现薄 ROS Bridge，向上暴露标准 topic/service/action，避免修改部署控制面。
+项目模块边界和扩展点见[开发架构说明](docs/architecture.md)：
+
+- 新数据格式：在 `backend/datasets/` 实现并注册统一接口；
+- 新质检规则：在 `backend/qc/detectors/` 增加带版本的 Detector，保持 issue code 和证据稳定；
+- 新转换或增强：保留能力检查、预览和保真报告；
+- 新模型：为 Python Provider 实现 `load(checkpoint)` 和 `predict(observations)`；
+- 新机器人 SDK：优先实现暴露带类型 topic、service、action 的薄 ROS Bridge。
 
 提交修改前执行：
 
@@ -108,7 +181,7 @@ bash -n embodit.sh
 git diff --check
 ```
 
-请将功能修改、测试和文档放在同一变更中；涉及真实动作的功能必须保留 Dry Run、显式 Live 确认、限位、watchdog、hold/stop 和失败回滚。
+请将功能、测试和文档放在同一变更中。涉及真实动作的功能必须保留 Dry Run、显式 Live 确认、本体端限位、watchdog、hold/stop 和失败回滚。
 
 ## License
 
