@@ -228,13 +228,16 @@ def test_hdf5_images_to_v21_preserves_camera(tmp_path: Path):
     assert len(videos) == 2
 
 
-def test_convert_to_mcap_requires_camera_loss_ack(tmp_path: Path):
+def test_convert_to_mcap_preserves_camera_as_compressed_image(tmp_path: Path):
     pytest.importorskip("mcap")
     src = _write_hdf5_with_images(tmp_path / "src.hdf5")
     out = tmp_path / "out.mcap"
-    with pytest.raises(ValueError, match="allow_camera_loss"):
-        convert_dataset(src, out, target_format=FORMAT_MCAP)
-    result = convert_dataset(
-        src, tmp_path / "out2.mcap", target_format=FORMAT_MCAP, mapping={"allow_camera_loss": True}
-    )
+    result = convert_dataset(src, out, target_format=FORMAT_MCAP)
     assert Path(result["output"]).is_file()
+    adapter = open_dataset(out)
+    view = adapter.inspect()
+    assert view.episodes[0].cameras
+    camera = next(iter(view.episodes[0].cameras.values()))
+    frames = list(adapter.iter_topic_frames(view.episodes[0], camera.topic))
+    assert len(frames) == 6
+    assert frames[0].shape == (32, 32, 3)
