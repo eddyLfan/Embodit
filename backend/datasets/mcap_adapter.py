@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import shutil
 import struct
 import subprocess
@@ -18,6 +19,7 @@ import numpy as np
 
 from .base import DatasetAdapter, DatasetWriter
 from .detect import collect_mcap_files
+from .media import decode_mp4_frames, normalize_frame_uint8
 from .view import FORMAT_MCAP, CameraRef, DatasetView, EpisodeView
 
 _video_locks: dict[str, threading.Lock] = {}
@@ -198,6 +200,96 @@ def _decode_compressed_image(data: bytes) -> tuple[bytes, str] | None:
         else:
             fmt = "bin"
     return bytes(payload), fmt
+
+
+def _protobuf_varint(value: int) -> bytes:
+    value = int(value)
+    if value < 0:
+        raise ValueError("protobuf varint 不能为负数")
+    output = bytearray()
+    while value > 0x7F:
+        output.append((value & 0x7F) | 0x80)
+        value >>= 7
+    output.append(value)
+    return bytes(output)
+
+
+def _protobuf_bytes(field_number: int, value: bytes | str) -> bytes:
+    payload = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+    return _protobuf_varint((field_number << 3) | 2) + _protobuf_varint(len(payload)) + payload
+
+
+def _protobuf_enum(field_number: int, value: int) -> bytes:
+    return _protobuf_varint(field_number << 3) + _protobuf_varint(value)
+
+
+def _foxglove_compressed_image_descriptor() -> bytes:
+    """Return the protobuf FileDescriptorSet for foxglove.CompressedImage."""
+
+    def field(name: str, number: int, field_type: int, type_name: str = "") -> bytes:
+        # google.protobuf.FieldDescriptorProto: optional scalar field.
+        value = b"".join(
+            (
+                _protobuf_bytes(1, name),
+                _protobuf_enum(3, number),
+                _protobuf_enum(4, 1),
+                _protobuf_enum(5, field_type),
+            )
+        )
+        return value + (_protobuf_bytes(6, type_name) if type_name else b"")
+
+    timestamp_descriptor = _protobuf_bytes(1, "Timestamp")
+    timestamp_descriptor += _protobuf_bytes(2, field("seconds", 1, 3))  # TYPE_INT64
+    timestamp_descriptor += _protobuf_bytes(2, field("nanos", 2, 5))  # TYPE_INT32
+    timestamp_file = b"".join(
+        (
+            _protobuf_bytes(1, "google/protobuf/timestamp.proto"),
+            _protobuf_bytes(2, "google.protobuf"),
+            _protobuf_bytes(4, timestamp_descriptor),
+            _protobuf_bytes(12, "proto3"),
+        )
+    )
+    descriptor = _protobuf_bytes(1, "CompressedImage")
+    descriptor += _protobuf_bytes(2, field("timestamp", 1, 11, ".google.protobuf.Timestamp"))
+    descriptor += _protobuf_bytes(2, field("data", 2, 12))  # TYPE_BYTES
+    descriptor += _protobuf_bytes(2, field("format", 3, 9))  # TYPE_STRING
+    descriptor += _protobuf_bytes(2, field("frame_id", 4, 9))
+    file_descriptor = b"".join(
+        (
+            _protobuf_bytes(1, "foxglove/CompressedImage.proto"),
+            _protobuf_bytes(2, "foxglove"),
+            _protobuf_bytes(3, "google/protobuf/timestamp.proto"),
+            _protobuf_bytes(4, descriptor),
+            _protobuf_bytes(12, "proto3"),
+        )
+    )
+    return _protobuf_bytes(1, timestamp_file) + _protobuf_bytes(1, file_descriptor)
+
+
+def _encode_jpeg_compressed_image(
+    frame: np.ndarray,
+    camera: str,
+    quality: int,
+    timestamp_ns: int,
+) -> bytes:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.fromarray(normalize_frame_uint8(frame), mode="RGB").save(
+        buffer,
+        format="JPEG",
+        quality=max(1, min(int(quality), 100)),
+    )
+    seconds, nanos = divmod(int(timestamp_ns), 1_000_000_000)
+    timestamp = _protobuf_enum(1, seconds) + _protobuf_enum(2, nanos)
+    return b"".join(
+        (
+            _protobuf_bytes(1, timestamp),
+            _protobuf_bytes(2, buffer.getvalue()),
+            _protobuf_bytes(3, "jpeg"),
+            _protobuf_bytes(4, camera),
+        )
+    )
 
 
 def _topic_key(topic: str) -> str:
@@ -988,6 +1080,10 @@ class McapWriter(DatasetWriter):
         mapping = mapping or {}
         state_topic = mapping.get("state_topic", "/observation/state")
         action_topic = mapping.get("action_topic", "/action")
+        camera_topics = mapping.get("camera_topics") or {}
+        if not isinstance(camera_topics, dict):
+            raise ValueError("camera_topics 必须是 camera key 到 MCAP topic 的对象")
+        jpeg_quality = int(mapping.get("mcap_image_quality") or 90)
         fps = float(meta.get("fps") or mapping.get("fps") or 30.0)
         gap_ns = int(3.0 * 1e9)
 
@@ -1009,6 +1105,25 @@ class McapWriter(DatasetWriter):
                 message_encoding="raw",
                 schema_id=schema_id,
             )
+            image_schema_id = writer.register_schema(
+                name="foxglove.CompressedImage",
+                encoding="protobuf",
+                data=_foxglove_compressed_image_descriptor(),
+            )
+            image_channels: dict[str, int] = {}
+
+            def image_channel(camera: str) -> int:
+                if camera not in image_channels:
+                    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", camera).strip("_") or "camera"
+                    topic = str(camera_topics.get(camera) or f"/camera/{safe}/compressed")
+                    image_channels[camera] = writer.register_channel(
+                        topic=topic,
+                        message_encoding="protobuf",
+                        schema_id=image_schema_id,
+                        metadata={"camera": camera, "format": "jpeg"},
+                    )
+                return image_channels[camera]
+
             cursor_ns = 0
             total_episodes = 0
             total_frames = 0
@@ -1022,6 +1137,12 @@ class McapWriter(DatasetWriter):
                 if action is not None:
                     action = np.asarray(action, dtype=np.float64)
                     length = length or int(action.shape[0])
+                camera_streams: dict[str, Any] = {
+                    str(camera): iter(frames)
+                    for camera, frames in (ep.get("images") or {}).items()
+                }
+                for camera, path in (ep.get("video_paths") or {}).items():
+                    camera_streams[str(camera)] = iter(decode_mp4_frames(Path(path)))
                 dt_ns = int(1e9 / fps) if fps > 0 else 33_000_000
                 for i in range(length):
                     t = cursor_ns + i * dt_ns
@@ -1037,6 +1158,19 @@ class McapWriter(DatasetWriter):
                             channel_id=action_ch,
                             log_time=t,
                             data=np.asarray(action[i], dtype=np.float64).tobytes(),
+                            publish_time=t,
+                        )
+                    for camera, frames in camera_streams.items():
+                        try:
+                            frame = next(frames)
+                        except StopIteration as error:
+                            raise ValueError(
+                                f"episode {ep.get('episode_index')} 相机 {camera} 少于声明的 {length} 帧"
+                            ) from error
+                        writer.add_message(
+                            channel_id=image_channel(camera),
+                            log_time=t,
+                            data=_encode_jpeg_compressed_image(frame, camera, jpeg_quality, t),
                             publish_time=t,
                         )
                 cursor_ns += length * dt_ns + gap_ns

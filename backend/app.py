@@ -91,7 +91,7 @@ from datasets.export import (  # noqa: E402
 )
 from datasets.registry import open_dataset  # noqa: E402
 from datasets.view import FORMAT_LABELS, SUPPORTED_FORMATS  # noqa: E402
-from deploy.orchestrator import OrchestrationRegistry  # noqa: E402
+from deploy.orchestrator import DeploymentOrchestration, OrchestrationRegistry  # noqa: E402
 from deploy.recipe import (  # noqa: E402
     compose_recipe as compose_deployment_recipe,
     parse_deployment_config,
@@ -335,7 +335,8 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
 
     def sandboxed(raw: str | Path, *, what: str = "路径") -> Path:
         """Resolve a client-supplied path; confine to browse_root only when
-        EMBODIT_SANDBOX=1 is set (off by default so any directory can be used)."""
+        EMBODIT_SANDBOX=1 is set. ``embodit.sh`` enables it automatically for
+        non-loopback listeners; direct app launches may opt in explicitly."""
         resolved = Path(raw).expanduser().resolve()
         if settings.SANDBOX_PATHS and not is_inside(browse_root, resolved):
             raise HTTPException(status_code=403, detail=f"{what}超出允许的根目录：{browse_root}")
@@ -403,6 +404,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             "browseRoot": str(browse_root),
             "supportedFormats": list(SUPPORTED_FORMATS),
             "formatLabels": FORMAT_LABELS,
+            "pathSandbox": {"enabled": settings.SANDBOX_PATHS, "root": str(browse_root)},
             "autoFilter": {"enabled": True, "status": "ready"},
             "review": review_config_payload(settings.REVIEW_CONFIG_PATH),
         }
@@ -744,8 +746,8 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         if not dataset.exists():
             raise HTTPException(status_code=404, detail=f"源路径不存在：{dataset}")
         aug_type = request.augType if request.augType in {"brightness", "color"} else "brightness"
-        capabilities = capabilities_payload() if aug_type == "color" else None
-        if capabilities is not None and not capabilities[aug_type]["available"]:
+        capabilities = capabilities_payload()
+        if not capabilities[aug_type]["available"]:
             raise HTTPException(
                 status_code=400,
                 detail=capabilities[aug_type].get("reason") or f"{aug_type} 增强不可用",
@@ -1252,20 +1254,8 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     def deployment_doctor(request: DeploymentRecipeRequest) -> dict[str, Any]:
         try:
             recipe = parse_deployment_recipe(request.recipe)
-            return {
-                "ok": True,
-                "deploymentId": recipe.deployment_id,
-                "recipeVersion": 2,
-                "summary": {"passed": 5, "warnings": 0, "failed": 0},
-                "checks": [
-                    {"code": "recipe.schema", "status": "pass", "message": "Recipe schema 有效", "details": {}},
-                    {"code": "recipe.topology", "status": "pass", "message": "模型、本体与隧道主机引用有效", "details": {}},
-                    {"code": "recipe.model", "status": "pass", "message": "模型 Provider 与 Checkpoint 配置有效", "details": {}},
-                    {"code": "recipe.ros", "status": "pass", "message": "ROS 环境与 readiness 契约已配置", "details": {}},
-                    {"code": "recipe.rollback", "status": "pass", "message": "停止与自动回滚策略有效", "details": {}},
-                ],
-                "note": "SSH/本地执行、systemd、模型、隧道和 ROS 动态检查将在启动编排中按顺序执行",
-            }
+            doctor = DeploymentOrchestration(recipe, deploy_root / "preflight" / recipe.deployment_id)
+            return doctor.read_only_preflight()
         except Exception as error:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -1649,6 +1639,19 @@ def main() -> None:
     parser.add_argument("--browse-root", type=Path, default=Path.cwd())
     parser.add_argument("--token", required=True)
     args = parser.parse_args()
+    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
+    if "EMBODIT_SANDBOX" not in os.environ and args.host not in loopback_hosts:
+        settings.SANDBOX_PATHS = True
+        print(
+            f"path guard enabled automatically for non-loopback listener {args.host}",
+            file=sys.stderr,
+        )
+    elif not settings.SANDBOX_PATHS and args.host not in loopback_hosts:
+        print(
+            "WARNING: path guard is explicitly disabled on a non-loopback listener; "
+            "authenticated clients can access paths allowed by the service account",
+            file=sys.stderr,
+        )
     # Migrate old cache folders and apply bounded retention once per service
     # start. Maintenance failures should not make datasets unavailable.
     try:

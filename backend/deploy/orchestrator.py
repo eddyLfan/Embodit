@@ -540,6 +540,217 @@ class DeploymentOrchestration:
         self._model_home = self.model_manager.home()
         self._robot_home = self.robot_manager.home()
 
+    def read_only_preflight(self) -> dict[str, Any]:
+        """Probe deployment prerequisites without starting or changing services.
+
+        The runtime startup path remains authoritative and repeats all safety-
+        critical checks.  This method is intentionally limited to SSH/local
+        command execution, filesystem inspection, systemd queries, and ROS
+        graph reads when the graph is already available.
+        """
+        checks: list[dict[str, Any]] = []
+
+        def add(code: str, status: str, message: str, **details: Any) -> None:
+            checks.append(
+                {
+                    "code": code,
+                    "status": status,
+                    "message": message,
+                    "details": details,
+                }
+            )
+
+        add("recipe.schema", "pass", "Recipe schema 有效", version=self.recipe.version)
+
+        probe = (
+            "import json,os,platform,pwd,shutil; "
+            "print(json.dumps({'hostname':platform.node(),'python':platform.python_version(),"
+            "'user':pwd.getpwuid(os.geteuid()).pw_name,'home':os.path.expanduser('~'),"
+            "'systemctl':shutil.which('systemctl'),'systemd_run':shutil.which('systemd-run'),"
+            "'ssh':shutil.which('ssh'),'ssh_keygen':shutil.which('ssh-keygen'),"
+            "'ssh_keyscan':shutil.which('ssh-keyscan')}))"
+        )
+        reachable: set[str] = set()
+        for name, runner in self._runners.items():
+            host = self.recipe.hosts[name]
+            try:
+                result = require_remote_ok(
+                    runner.run(["python3", "-c", probe], timeout=host.connect_timeout_s + 5),
+                    f"探测主机 {name}",
+                )
+                info = json.loads(result.stdout)
+                missing = [key for key in ("systemctl", "systemd_run") if not info.get(key)]
+                if name == self.robot_host_name:
+                    missing.extend(
+                        key for key in ("ssh", "ssh_keygen", "ssh_keyscan") if not info.get(key)
+                    )
+                if host.connection == "local" and info.get("user") != host.user:
+                    raise RuntimeError(
+                        f"配置用户 {host.user} 与 Embodit 运行用户 {info.get('user')} 不一致"
+                    )
+                if missing:
+                    raise RuntimeError("缺少命令：" + ", ".join(missing))
+                reachable.add(name)
+                add(
+                    f"host.{name}.connectivity",
+                    "pass",
+                    f"主机 {name} 可达",
+                    connection=host.connection,
+                    hostname=info.get("hostname"),
+                    python=info.get("python"),
+                    user=info.get("user"),
+                )
+            except Exception as error:  # noqa: BLE001
+                add(
+                    f"host.{name}.connectivity",
+                    "fail",
+                    f"主机 {name} 连接或基础命令检查失败",
+                    error=str(error),
+                )
+
+        for name in sorted(reachable):
+            manager = self._managers[name]
+            try:
+                command = [
+                    *manager.systemctl,
+                    "list-units",
+                    "--type=service",
+                    "--state=running",
+                    "--no-legend",
+                    "--no-pager",
+                ]
+                require_remote_ok(manager.runner.run(command, timeout=10), f"检查主机 {name} systemd")
+                add(
+                    f"host.{name}.systemd",
+                    "pass",
+                    f"主机 {name} 可读取 {self.recipe.hosts[name].service_manager} systemd manager",
+                )
+            except Exception as error:  # noqa: BLE001
+                add(
+                    f"host.{name}.systemd",
+                    "fail",
+                    f"主机 {name} 无法访问配置的 systemd manager",
+                    error=str(error),
+                )
+
+        if self.model_host_name in reachable:
+            model = self.recipe.model
+            paths = {
+                "workdir": model.workdir,
+                "checkpoint": model.checkpoint,
+                "source_path": model.source_path,
+            }
+            path_probe = (
+                "import json,os,shutil,sys; p=json.loads(sys.argv[1]); exe=sys.argv[2]; "
+                "r={k:{'path':v,'exists':(os.path.exists(os.path.expanduser(v)) if v else None)} "
+                "for k,v in p.items()}; "
+                "r['python_executable']={'path':exe,'exists':bool((os.path.isfile(os.path.expanduser(exe)) "
+                "and os.access(os.path.expanduser(exe),os.X_OK)) if '/' in exe else shutil.which(exe))}; "
+                "print(json.dumps(r))"
+            )
+            try:
+                result = require_remote_ok(
+                    self.model_runner.run(
+                        [
+                            "python3",
+                            "-c",
+                            path_probe,
+                            json.dumps(paths),
+                            model.python_executable,
+                        ],
+                        timeout=15,
+                    ),
+                    "检查模型环境路径",
+                )
+                details = json.loads(result.stdout)
+                missing: list[str] = []
+                for key in ("workdir", "checkpoint", "source_path", "python_executable"):
+                    item = details.get(key) or {}
+                    value = item.get("path")
+                    if value and not item.get("exists"):
+                        # Hub-style checkpoint identifiers are not local paths.
+                        if key == "checkpoint" and not str(value).startswith(("/", "~", ".")):
+                            continue
+                        missing.append(f"{key}={value}")
+                if missing:
+                    raise RuntimeError("路径不存在或不可执行：" + ", ".join(missing))
+                add(
+                    "model.environment",
+                    "pass",
+                    "模型工作目录、Checkpoint/来源与 Python 环境可用",
+                    paths=details,
+                    provider=model.provider,
+                )
+            except Exception as error:  # noqa: BLE001
+                add(
+                    "model.environment",
+                    "fail",
+                    "模型环境检查失败",
+                    error=str(error),
+                    provider=model.provider,
+                )
+
+        if self.robot_host_name in reachable:
+            ros = self.recipe.robot.ros
+            cli = "ros2" if ros.version == 2 else "rosnode"
+            try:
+                result = self._run_robot_environment(
+                    ["bash", "--noprofile", "--norc", "-c", f"command -v {cli}"],
+                    setup=ros.setup,
+                    environment=self._ros_environment(ros),
+                    timeout=15,
+                )
+                require_remote_ok(result, "检查 ROS 环境")
+                add(
+                    "robot.ros.environment",
+                    "pass",
+                    f"ROS {ros.version} setup 与命令可用",
+                    command=result.stdout.strip(),
+                    setup=ros.setup,
+                )
+                try:
+                    self._check_ros_graph()
+                    self._check_topic_freshness()
+                    self._check_topic_rates()
+                    add(
+                        "robot.ros.runtime",
+                        "pass",
+                        "当前 ROS graph、类型、频率与新鲜度符合 Recipe",
+                    )
+                except Exception as error:  # noqa: BLE001
+                    add(
+                        "robot.ros.runtime",
+                        "warning",
+                        "ROS Bringup 未运行或当前 graph/readiness 未满足；启动编排时会强制复检",
+                        error=str(error),
+                    )
+            except Exception as error:  # noqa: BLE001
+                add(
+                    "robot.ros.environment",
+                    "fail",
+                    "ROS setup 或命令检查失败",
+                    error=str(error),
+                    setup=ros.setup,
+                )
+
+        counts = {
+            status: sum(1 for item in checks if item["status"] == status)
+            for status in ("pass", "warning", "fail")
+        }
+        return {
+            "ok": counts["fail"] == 0,
+            "deploymentId": self.recipe.deployment_id,
+            "recipeVersion": self.recipe.version,
+            "readOnly": True,
+            "summary": {
+                "passed": counts["pass"],
+                "warnings": counts["warning"],
+                "failed": counts["fail"],
+            },
+            "checks": checks,
+            "note": "预检不会启动模型、ROS、本体或发送动作；启动阶段会重复全部强制 readiness 检查。",
+        }
+
     def _ensure_tunnel_credentials(self) -> None:
         assert self._robot_home and self._model_home
         base = f"{self._robot_home}/.embodit/deployments/{self.recipe.deployment_id}"

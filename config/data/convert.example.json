@@ -5,5 +5,12 @@
   "action_key": "action",
   "state_topic": "/observation/state",
   "action_topic": "/action",
-  "notes": "跨格式转换时按需覆盖字段/topic 映射；未映射特征会写入 conversion_report.known_losses"
+  "camera_topics": {
+    "head": "/camera/head/compressed",
+    "left_wrist": "/camera/left_wrist/compressed"
+  },
+  "mcap_image_quality": 90,
+  "on_error": "fail",
+  "allow_camera_loss": false,
+  "notes": "写入 MCAP 时相机保存为 JPEG foxglove.CompressedImage；未映射特征和已知损失写入 conversion_report"
 }

@@ -1,29 +1,526 @@
-# 真机部署层详细指南
+# 真机部署层使用指南
 
 [English](README.md) · **中文**
 
-配置管理采用“本体配置 + 模型配置”的组合方式：两部分独立保存、版本化和复用，测试时各选择一份，Embodit 再生成运行所需的 Recipe。模型既可以位于独立 SSH 主机，也可以直接位于运行 Embodit 的机器；本体建立到模型端的 SSH Local Forward，ROS、本体生命周期操作、初始位姿和 Robot Client 全部在本体端运行。Embodit 是控制面，不进入实时观测/动作数据链路。
+本指南说明如何接入模型、本体和安全配置。当前架构已完成真机链路验证；换用新设备时，必须重新确认 SDK/ROS 接口、单位、关节顺序、限位和生命周期操作。
 
 ## 1. 运行架构
 
+Embodit 是控制面，不进入实时观测/动作链路：
+
 ```text
 Workstation [Embodit]
-  ├─ SSH → Model Host [Inference Service :8000]
-  └─ SSH → Robot Host [SSH Tunnel + ROS Bringup + Robot Client]
-                         └─ localhost:8000 → Model Host:8000
+  ├─ local/SSH → Model Host [Model Runner :8000]
+  └─ SSH → Robot Host
+             ├─ SSH local-forward: localhost:8000 → Model Host:8000
+             ├─ ROS Bringup
+             └─ Robot Client: observation → model → validation → controller
 ```
 
-Embodit 与模型端同机时，模型管理链路改为本地执行，不需要“本机 SSH 回连本机”；实时数据链路保持不变：
+模型可以运行在 Embodit 工作电脑或独立 GPU 主机。本体当前必须能够被 Embodit 通过 SSH 管理，并能访问模型端 SSH 地址以建立受限隧道。
+
+配置分为：
+
+- 本体 Config：主机、ROS、Bringup、readiness、生命周期、初始位姿、Robot Client、限位；
+- 模型 Config：主机、Provider、Checkpoint、Python 环境和服务端口；
+- Recipe v2：组合两份 Config 后生成的唯一运行配置。
+
+模板：
+
+- [`../../config/deployment/robot.example.json`](../../config/deployment/robot.example.json)
+- [`../../config/deployment/models/python.example.json`](../../config/deployment/models/python.example.json)
+- [`../../config/deployment/models/openpi.example.json`](../../config/deployment/models/openpi.example.json)
+- [`../../config/deployment/models/lerobot.example.json`](../../config/deployment/models/lerobot.example.json)
+- [`../../config/deployment/models/starvla.example.json`](../../config/deployment/models/starvla.example.json)
+
+## 2. 接入前准备
+
+### 2.1 工作电脑
+
+- Linux、Python 3.10+、uv、OpenSSH client；
+- 能访问本体 SSH；模型在远端时也要能访问模型 SSH；
+- 项目目录可写，用于 `.embodit_cache/deploy/` 状态；
+- 本地模型配置中的 `host.user` 必须等于运行 Embodit 的用户。
+
+### 2.2 本体端
+
+- Python 3、OpenSSH client、`ssh-keygen`、`ssh-keyscan`；
+- systemd 和 `systemd-run`；
+- 配置中的 ROS setup 文件；
+- Robot Bringup、topic/service/action 或厂商 Python SDK；
+- 本体侧必须独立执行硬件限位、命令有效期、错误状态和急停。
+
+### 2.3 模型端
+
+- systemd；
+- 对应模型 Python 环境、Checkpoint 和 Embodit checkout；
+- 远端模型需要 SSH；本地模型由 Embodit 直接执行；
+- `endpoint.bind` 默认 `127.0.0.1`，不应直接暴露到局域网。
+
+内置 Provider 首次使用前初始化固定源码：
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
+git submodule status --recursive
+```
+
+每个 Provider 使用独立 Python/CUDA 环境。上游版本和安装边界见 [`../../third_party/README.md`](../../third_party/README.md)。
+
+## 3. 最短接入流程
+
+```bash
+mkdir -p config/local/models
+cp config/deployment/robot.example.json config/local/my-robot.json
+cp config/deployment/models/python.example.json config/local/models/my-model.json
+```
+
+编辑两份文件后：
+
+```bash
+export ROBOT_SSH_PASSWORD='<robot-password>'
+export MODEL_SSH_PASSWORD='<model-password>'  # 远端模型需要
+
+bash embodit.sh recipe-compose \
+  config/local/my-robot.json \
+  config/local/models/my-model.json \
+  --output /tmp/my-deployment.json
+
+bash embodit.sh recipe-validate /tmp/my-deployment.json
+```
+
+推荐启动网页：
+
+```bash
+bash embodit.sh start
+```
+
+进入“真机部署”：
+
+1. 选择本体和模型配置；
+2. 运行“预检”；预检只读连接主机，检查 systemd、模型路径/Python、ROS setup，ROS 已运行时检查 graph/type/rate/freshness；
+3. 启动模型并等待 `/health`；
+4. 填写 Prompt，连接本体并进入 Dry Run 或评测；
+5. 观察实际模型输入、计划动作、执行动作、延迟和日志；
+6. 暂停/断开/关闭，或在危险情况下执行急停。
+
+CLI：
+
+```bash
+bash embodit.sh recipe-run /tmp/my-deployment.json --mode dry_run
+bash embodit.sh recipe-run /tmp/my-deployment.json --mode live
+bash embodit.sh recipe-stop /tmp/my-deployment.json
+bash embodit.sh recipe-stop /tmp/my-deployment.json --emergency
+```
+
+## 4. 通用主机字段 `host`
+
+本体 Config 和模型 Config 都包含 `host`：
+
+| 字段 | 必填 | 写法 |
+|---|---:|---|
+| `connection` | 否 | `ssh`（默认）或 `local`；本体只允许 `ssh` |
+| `address` | 是 | SSH 地址；本地模型时填写本体可访问的工作电脑地址 |
+| `port` | 否 | SSH 端口，默认 `22` |
+| `user` | 是 | 目标主机用户名；不能含空格或 `@` |
+| `auth` | SSH 是 | 见下表；`local` 禁止填写 |
+| `connect_timeout_s` | 否 | SSH 连接超时，默认 `8`，范围 `1..60` |
+| `host_key_policy` | 否 | `accept-new` 或 `strict`；稳定环境建议 `strict` |
+| `service_manager` | 否 | `system` 或 `user`；决定使用 system/user systemd |
+
+SSH 认证：
+
+```json
+{"type": "key", "identity_file": "/home/user/.ssh/id_ed25519"}
+{"type": "password_env", "environment_variable": "ROBOT_SSH_PASSWORD"}
+{"type": "password", "password": "..."}
+```
+
+| 字段 | 写法 |
+|---|---|
+| `type` | `key`、`password_env` 或 `password` |
+| `identity_file` | `type=key` 时的 Embodit 主机私钥路径 |
+| `environment_variable` | `type=password_env` 时的变量名 |
+| `password` | `type=password` 时的明文密码 |
+
+推荐 `key` 或 `password_env`。直接密码会保存在本地配置文件中；文件权限必须为 `0600`，且不能提交 Git。
+
+## 5. 本体 Config 字段
+
+顶层：
+
+| 字段 | 写法 |
+|---|---|
+| `version` | 固定 `1` |
+| `kind` | 固定 `robot` |
+| `config_id` | 唯一 ID，`A-Z/a-z/0-9/_.-`，最长 64 |
+| `name` | 页面显示名 |
+| `host` | 本体 SSH，见第 4 节 |
+| `robot` | ROS、生命周期和 Client |
+| `tunnel` | 本体到模型端的本地转发 |
+| `runtime` | 停止、回滚和监控策略 |
+
+### 5.1 `robot.ros`
+
+| 字段 | 必填 | 写法 |
+|---|---:|---|
+| `version` | 是 | `1` 或 `2` |
+| `distro` | 是 | 如 `noetic`、`humble`；用于记录和诊断 |
+| `setup` | 是 | 本体绝对路径数组，按顺序 `source` |
+| `domain_id` | ROS2 可选 | `0..232`；ROS1 禁止 |
+| `master_uri` | ROS1 可选 | 如 `http://127.0.0.1:11311`；ROS2 禁止 |
+| `rmw_implementation` | ROS2 可选 | 如 `rmw_cyclonedds_cpp` |
+
+### 5.2 `robot.bringup`
+
+Bringup 是 systemd 托管命令：
+
+| 字段 | 写法 |
+|---|---|
+| `command` | argv 数组，不经过 shell，如 `["ros2","launch","pkg","robot.launch.py"]` |
+| `workdir` | 本体绝对工作目录，可选 |
+| `setup` | 在 `robot.ros.setup` 后额外 source 的绝对路径 |
+| `environment` | 环境变量对象 |
+| `startup_timeout_s` | 进入 readiness 前允许的启动时间 |
+| `restart` | `no`、`on-failure` 或 `always` |
+
+需要管道、重定向或复合 shell 时，显式使用 `["bash","-lc","..."]`。
+
+### 5.3 `robot.readiness`
+
+| 字段 | 写法 |
+|---|---|
+| `timeout_s` | 整体 readiness 超时，默认 `60` |
+| `interval_s` | 重试间隔，默认 `1` |
+| `nodes` | 必须存在的完整节点名 |
+| `topics` | topic 名、精确类型、最低频率和新鲜度 |
+| `services` | `{name,type}` 数组 |
+| `actions` | `{name,type}` 数组；ROS1 不接受，应检查 actionlib topics |
+
+Topic 字段：
+
+| 字段 | 写法 |
+|---|---|
+| `name` | 以 `/` 开头 |
+| `type` | ROS2 如 `sensor_msgs/msg/JointState`；ROS1 如 `sensor_msgs/JointState` |
+| `minimum_rate_hz` | `0` 表示不检查频率 |
+| `sample_seconds` | 采样窗口，`>0` 且 `<=15` |
+| `maximum_age_ms` | ROS2 header 最大年龄；无 header 的类型不要配置 |
+
+启动阶段会检查 node、topic/service/action 类型、topic 频率和新鲜度。ROS1 新鲜度只确认收到消息，不计算 header age。
+
+### 5.4 生命周期操作
+
+`power_on`、`power_off`、`hold`、`stop` 使用同一结构：
+
+| 字段 | 写法 |
+|---|---|
+| `type` | `none`、`command`、`ros2_service`、`ros1_service` |
+| `command` | `type=command` 时的 argv |
+| `name` | ROS service 名 |
+| `service_type` | 精确 service 类型 |
+| `request` | 请求 JSON；空请求用 `{}` |
+| `timeout_s` | 调用超时 |
+
+`hold` 应停止新动作并保持安全状态；`stop` 应执行设备定义的最快软件停止。两者不能替代硬件急停。
+
+### 5.5 `robot.initial_pose`
+
+| 字段 | 写法 |
+|---|---|
+| `type` | `none`、`command`、`follow_joint_trajectory` |
+| `action` | FollowJointTrajectory action 名 |
+| `command` | `type=command` 时 argv |
+| `joint_state_topic` | 实测位置 topic，默认 `/joint_states` |
+| `joint_names` | 控制顺序 |
+| `positions` | 与 `joint_names` 等长，使用控制器原生单位 |
+| `duration_s` | 轨迹时长 |
+| `tolerance` | 实测最大绝对误差 |
+| `timeout_s` | 动作和实测确认超时 |
+
+`follow_joint_trajectory` 当前只支持 ROS2。示例位置不是通用安全位姿。
+
+### 5.6 `robot.client`
+
+通用字段：
+
+| 字段 | 写法 |
+|---|---|
+| `builtin` | `ros2_standard`、`python_adapter`，或不填并提供 `command` |
+| `config` | 内置 Client 配置 |
+| `command/workdir/setup/environment` | 自定义 Client 使用 |
+| `startup_timeout_s` | Client readiness 超时 |
+| `restart` | Live 推荐 `no`；编排器会避免故障后自动恢复真实动作 |
+| `health` | `http/tcp/command/ros_node`；内置 Client 通常用状态节点/topic |
+
+自定义 Client 的 `command/workdir/setup/environment/startup_timeout_s/restart` 与 Bringup 写法相同。组件 Config 中的 `client.host` 建议省略，组合时固定为 `robot`。
+
+`health` 字段：
+
+| 字段 | 写法 |
+|---|---|
+| `type` | `http`、`tcp`、`command` 或 `ros_node` |
+| `url` | `type=http` 时必填 |
+| `host` / `port` | TCP 目标；`host` 默认 `127.0.0.1`，`port` 在 `type=tcp` 时必填 |
+| `command` | `type=command` 时的 argv |
+| `name` | `type=ros_node` 时的完整节点名 |
+| `startup_timeout_s` | 等待健康的总时长，默认 `60` |
+| `interval_s` | 检查间隔，默认 `1` |
+
+## 6. 标准 ROS2 Client
+
+适用：观测来自 `JointState/Image/CompressedImage`，动作发往 `FollowJointTrajectory`。
+
+最小结构见 [`../../examples/deployment/ros2_robot_client.example.json`](../../examples/deployment/ros2_robot_client.example.json)。主要字段：
+
+| 字段 | 写法 |
+|---|---|
+| `node_name` | Client 节点名 |
+| `status_topic` | Embodit 读取的状态 topic |
+| `loop_rate_hz` | 推理循环频率 |
+| `watchdog_timeout_s` | 完整观测→推理→校验→发送的超时 |
+| `observation_timeout_s` | 等待全部观测的超时 |
+| `maximum_observation_age_ms` | 本地接收观测最大年龄 |
+| `observations` | 模型输入 key 到 ROS topic/type 的映射 |
+| `controller.action` | FollowJointTrajectory action |
+| `controller.server_timeout_s` | action server 超时 |
+| `action.joints` | 模型动作维度对应的关节顺序 |
+| `action.horizon` | 模型每次必须返回的行数 |
+| `action.rate_hz` | 轨迹点频率 |
+| `action.baseline_observation` | 首步 `max_step` 的基准观测 key |
+| `action.limits.minimum/maximum` | 逐维绝对限位 |
+| `action.limits.max_step` | 第一帧相对实测、后续帧相邻之间的最大变化 |
+
+模型输出必须严格是 `[horizon][joint_count]` 的有限数值，维度、顺序和单位与控制器一致。
+
+## 7. 通用 Python Robot Adapter
+
+适用：厂商 SDK 不适合封装为标准 ROS topic/action。复制 [`../../examples/deployment/python_robot_adapter.py`](../../examples/deployment/python_robot_adapter.py)，实现：
+
+```python
+class RobotAdapter:
+    def __init__(self, config): ...
+    def start(self): ...            # Live 前调用，可选
+    def observe(self) -> dict: ...  # 返回模型观测和动作基准
+    def apply_action(self, row): ...
+    def stop(self): ...             # 暂停/退出/故障调用，可选
+```
+
+配置模板：[`../../examples/deployment/python_robot_client.example.json`](../../examples/deployment/python_robot_client.example.json)。
+
+### 7.1 `config.adapter`
+
+| 字段 | 写法 |
+|---|---|
+| `entrypoint` | `module:ClassName` |
+| `source_file` | Embodit 主机上的单个 `.py` 绝对路径；会上传到本体 |
+| `source_path` | Adapter 已安装在本体时的本体绝对目录 |
+| `module_search_paths` | 本体上的额外 Python import 目录 |
+| `python_executable` | 本体 Python/虚拟环境 |
+| `config` | 原样传给 Adapter 构造函数 |
+
+`source_file` 文件名必须等于 `entrypoint` 的模块名。`source_file` 和 `source_path` 按实际安装方式选用。
+
+### 7.2 观测与 Dry Run
+
+| 字段 | 写法 |
+|---|---|
+| `default_prompt` | 默认任务 Prompt |
+| `task_prompts` | 页面可选 Prompt，最多 1000 项 |
+| `observation_map` | 将 Adapter 返回 key 改成模型输入 key |
+| `dry_run_observation_source` | `synthetic` 或 `adapter` |
+| `dry_run_observations` | 合成 Dry Run 输入 |
+
+合成值：
+
+```json
+{"$synthetic":"vector","length":6,"value":0}
+{"$synthetic":"image","width":224,"height":224,"channels":3,"value":0}
+```
+
+`synthetic` 不导入厂商 Adapter，不碰本体；`adapter` 使用真实只读 `observe()`，仍不调用 `apply_action()`。
+
+### 7.3 动作安全 `config.action`
+
+| 字段 | 写法 |
+|---|---|
+| `width` | 每行动作维度 |
+| `horizon` | 模型返回行数 |
+| `baseline_observation` | Adapter 观测中作为首步基准的 key |
+| `minimum` / `maximum` | 与 `width` 等长的逐维绝对限位 |
+| `max_step` | 与 `width` 等长的逐步变化限位 |
+| `numerical_tolerance` | 边界浮点容差，标量或逐维数组；不是放宽限位 |
+
+`minimum < maximum`，`max_step > 0`，所有数值必须有限。限位必须来自设备资料和受控实测。
+
+### 7.4 调度 `config.control`
+
+| 字段 | 写法 |
+|---|---|
+| `rate_hz` | Live 下发频率 |
+| `dry_run_rate_hz` | Dry Run 推理频率 |
+| `watchdog_timeout_s` | 单次循环超时 |
+| `max_episode_steps` | 可选最大动作步数 |
+| `inference_mode` | `synchronous` 或 `asynchronous` |
+| `action_steps` | 每个 horizon 实际采用步数，`1..horizon` |
+| `asynchronous.request_after_steps` | `1..action_steps-1` 或 `auto` |
+| `asynchronous.latency_margin_ms` | 自动预取延迟余量，默认 `30` |
+
+异步模式在当前动作块执行期间请求下一块；切换前会基于最新实测状态重新校验限位。迟到的推理不会触发追赶式突发下发。
+
+### 7.5 页面观测 `config.telemetry`
+
+| 字段 | 写法 |
+|---|---|
+| `cameras` | 最多 8 项 `{key,label}` |
+| `state` | `{key,label,names,units}` |
+| `action` | `{label,names,units}`；`names` 长度应等于 `width` |
+| `max_image_bytes` | 单图上限，默认 750 KB，最大 5 MB |
+| `history_seconds` | 无图像历史窗口 |
+| `history_max_points` | 历史点数上限 |
+
+支持 JPEG/PNG/WebP 和 `mono8/rgb8/bgr8/rgba8/bgra8` 原始图像。
+
+## 8. 模型 Config 字段
+
+顶层：
+
+| 字段 | 写法 |
+|---|---|
+| `version` | 固定 `1` |
+| `kind` | 固定 `model` |
+| `config_id` | 唯一 ID，最长 64 |
+| `name` | 页面显示名 |
+| `host` | 模型运行主机 |
+| `model` | Provider、Checkpoint 和进程配置 |
+| `endpoint` | 模型监听对象，由以下 `bind/port` 组成 |
+| `endpoint.bind` | 模型监听地址，默认 `127.0.0.1` |
+| `endpoint.port` | 模型端口；组合时自动写入 tunnel 远端目标 |
+
+### 8.1 `model` 通用字段
+
+| 字段 | 写法 |
+|---|---|
+| `provider` | `python/openpi/lerobot/starvla/external` |
+| `host` | 组件 Config 中省略或写 `model`；组合时固定为 `model` |
+| `command` | 仅 `external` 使用的 argv；其他 Provider 禁止 |
+| `workdir` | 模型端绝对工作目录 |
+| `setup` | 启动前 source 的绝对路径数组 |
+| `environment` | 如 `CUDA_VISIBLE_DEVICES` |
+| `health` | 仅 `external` 使用，字段与 5.6 节相同 |
+| `entrypoint` | `python` 必填，写 `module:ClassName` 或工厂函数 |
+| `checkpoint` | 模型端路径或 Provider 支持的标识 |
+| `python_executable` | 模型环境 Python |
+| `load_method` / `predict_method` | Python 方法名，默认 `load` / `predict` |
+| `load_kwargs` | 传给加载器 |
+| `predict_kwargs` | 每次推理附加参数 |
+| `action_horizon` | 可选；组合时覆盖本体 Client horizon |
+| `maximum_request_bytes` | 请求体上限，默认 50 MB |
+| `source_path` | 固定 Provider 源码的自定义绝对路径 |
+| `startup_timeout_s` | 包含权重加载时间 |
+| `restart` | `no/on-failure/always` |
+
+`python/openpi/lerobot/starvla` 的 command、health 由 Embodit 生成，不要手填。
+
+### 8.2 自定义 Python 模型
+
+```python
+class MyVLA:
+    def load(self, checkpoint, **kwargs):
+        self.model = YourModel.from_pretrained(checkpoint, **kwargs)
+
+    def predict(self, observations, **kwargs):
+        return self.model.predict(observations, **kwargs)
+```
+
+`entrypoint` 写成 `module:ClassName`。也可以指向工厂函数 `create_model(checkpoint, **load_kwargs)`。默认方法名是 `load` 和 `predict`，可用 `load_method/predict_method` 修改。
+
+输入是 Robot Client 生成的字典；二进制图像会被恢复为 bytes。输出必须为有限数值二维数组 `[horizon][width]`。Embodit 负责 `/health`、`/infer`、序列化、大小限制和 systemd 托管。
+
+### 8.3 OpenPI / LeRobot / StarVLA
+
+| Provider | Checkpoint 要求 | 常用 `load_kwargs` |
+|---|---|---|
+| `openpi` | 官方目录通常可推断训练 config | 自训练或改名目录设置 `config_name` |
+| `lerobot` | 完整 `save_pretrained` 目录和 processor metadata | 特殊 feature 使用 `observation_map` |
+| `starvla` | 模型配置和归一化统计与权重同目录 | 多归一化域设置 `unnorm_key` |
+
+`workdir` 默认指向包含 `third_party/models/<provider>` 的 Embodit checkout。Provider 环境必须按固定上游提交安装。
+
+### 8.4 `external`
+
+仅用于已有兼容推理服务。配置 `command`、`health` 和服务环境，且服务必须实现内部 `/health`、`/infer` 契约。普通接入优先使用其他 Provider。
+
+## 9. Tunnel 与 Runtime
+
+本体 Config 的 `tunnel`：
+
+| 字段 | 写法 |
+|---|---|
+| `local_bind` | 本体监听地址，默认 `127.0.0.1` |
+| `local_port` | Robot Client 访问端口 |
+| `server_alive_interval_s` | SSH keepalive 间隔 |
+| `server_alive_count_max` | 最大连续失败数 |
+| `restart` | `on-failure` 或 `always` |
+| `health_path` | 模型健康路径，默认 `/health` |
+| `startup_timeout_s` | 隧道健康超时 |
+
+组合后的 Recipe 还包含 `source_host`（固定 `robot`）、`destination_host`（固定 `model`）、`remote_bind`（来自 `endpoint.bind`）和 `remote_port`（来自 `endpoint.port`）。组件 Config 不手填这些字段。Embodit 在本体生成部署专用 Ed25519 key，只允许转发声明的模型端口，并维护独立 `known_hosts`。
+
+`runtime`：
+
+| 字段 | 写法 |
+|---|---|
+| `default_mode` | `dry_run` 或 `live` |
+| `auto_rollback` | 启动失败是否逆序回滚 |
+| `stop_model_on_exit` | 完整停止时是否停止模型 |
+| `power_off_on_exit` | 退出时是否调用 `power_off` |
+| `monitor_interval_s` | 组件状态轮询，默认 `2` |
+| `component_failure_threshold` | 连续失败多少次确认故障，默认 `3` |
+
+## 10. 只读预检与启动顺序
+
+网页“预检”会实际执行只读检查：
+
+- Recipe schema；
+- 本地/SSH 主机连通性、用户和基础命令；
+- system/user systemd manager 可读；
+- 模型 workdir、Checkpoint/source、Python 可用；
+- ROS setup 和 CLI 可用；
+- ROS 已运行时，检查 graph、类型、频率和新鲜度；未运行时给 warning。
+
+预检不会创建隧道、启动服务、上电或发送动作。正式启动仍按顺序强制复检：
 
 ```text
-Embodit + Local Model [Inference Service :8000]
-  └─ SSH → Robot Host [SSH Tunnel + ROS Bringup + Robot Client]
-                         └─ localhost:8000 → Embodit Host:8000
+主机/systemd 预检
+→ 隧道凭据
+→ Model Runner + checkpoint
+→ 模型直连 health
+→ 本体 SSH tunnel + tunnel health
+→ ROS Bringup
+→ graph/type/rate/freshness
+→ power_on
+→ initial_pose + 实测容差
+→ Robot Client
+→ 首次完整推理
+→ dry_run / running
 ```
 
-本体仍通过部署专用密钥连接模型端 SSH 服务来建立受限端口转发。因此 `host.address`/`port` 必须是本体可访问的 Embodit 地址和 SSH 端口；`host.user` 必须与 Embodit 进程的运行用户一致。模型进程、文件、systemd unit 和日志都归该用户管理。
+任何一步失败都会记录原因，并在 `auto_rollback=true` 时逆序清理。
 
-远端长期进程使用 systemd transient unit 托管：
+## 11. Dry Run、Live 与停止
+
+- `dry_run`：执行观测、隧道、模型和动作校验，不向控制器/Adapter 发送动作；
+- `live`：通过全部 readiness 后执行真实动作；
+- 暂停：调用 hold，停止真实动作并保持模型/观测；
+- 断开：停止 Client、ROS 和 tunnel，保留模型；
+- 关闭：同时停止模型；
+- 急停：优先调用 `robot.stop`，不等待模型或监控防抖。
+
+软件停止不能替代硬件急停。正式实验前应在低速、可触达急停的环境测试：正常停止、hold、急停、Client 崩溃、模型超时、网络断开、ROS 故障和下电。
+
+## 12. 日志与故障排查
+
+远端 unit：
 
 ```text
 embodit-model-<deployment-id>.service
@@ -32,318 +529,44 @@ embodit-ros-<deployment-id>.service
 embodit-client-<deployment-id>.service
 ```
 
-工作电脑短暂断开不会直接终止这些服务。隧道和进程按 Recipe 的策略重启；Live 模式下 Client 会被强制设为 `restart=no`，动作校验或本体调用故障后不会自行恢复真实动作。
-
-## 2. 用户与工具的责任边界
-
-| 用户/本体集成方提供 | Embodit 提供 |
-|---|---|
-| SSH 可达的本体，以及独立模型主机或 Embodit 本机地址、ROS setup 路径 | 本地/SSH 执行、主机校验、进程托管、日志、顺序启动与回滚 |
-| 常用模型 Provider 与 Checkpoint，或自定义 Python 入口/高级外部服务 | OpenPI/LeRobot/StarVLA 适配器、Model Runner、localhost HTTP 协议、健康检查、Tensor/JSON 归一化 |
-| ROS topic/service/action 映射和本体专用限位 | graph/type/rate/freshness readiness 与内置 ROS2 Client 校验 |
-| 厂商驱动/Bridge、硬件限位、急停、安全上下电/hold/stop 行为 | 动作校验、执行日志、暂停/继续、goal 取消、配置的 hold/stop/power-off 调用 |
-
-Embodit 无法自动推断安全关节限位、初始位姿、控制频率或生命周期服务语义。这些值必须来自厂商资料，并在可触达硬件急停、低速条件下验证。软件 stop 不能替代经过认证的硬件安全系统。
-
-## 3. 分离配置与自由组合
-
-网页工作台默认管理两类组件配置：
-
-- 本体配置（`version: 1, kind: robot`）：本体 SSH、ROS、Bringup、readiness、上下电/hold/stop、初始位姿、Robot Client、安全限位、本体侧 tunnel 和退出策略；
-- 模型配置（`version: 1, kind: model`）：模型端的本地/SSH 连接、Provider、Checkpoint、运行环境和模型端点；只有自定义 `python` Provider 需要入口；
-- 组合信息：仅包含本次运行的 `deployment_id` 和名称。同一份本体配置可以依次搭配多个模型，同一模型也可以在多个本体上做兼容性测试。
-
-可直接复制 [`../../config/deployment/robot.example.json`](../../config/deployment/robot.example.json) 和 [`../../config/deployment/models/python.example.json`](../../config/deployment/models/python.example.json) 开始配置；常用模型另有 [OpenPI](../../config/deployment/models/openpi.example.json)、[LeRobot](../../config/deployment/models/lerobot.example.json) 和 [StarVLA](../../config/deployment/models/starvla.example.json) 模板。
-
-两类配置内部不需要管理 `robot` / `model` 主机引用。组合时 Embodit 自动建立规范别名、把本体 tunnel 接到所选模型端点，并执行完整 Recipe 交叉校验。保存目录按类型隔离，配置文件和目录权限仍分别为 `0600`、`0700`。
-
-```json
-{
-  "version": 1,
-  "kind": "model",
-  "config_id": "my-vla",
-  "name": "My VLA",
-  "host": {"connection": "local", "address": "192.168.10.10", "user": "root", "service_manager": "system"},
-  "model": {"provider": "python", "entrypoint": "my_vla:MyVLA", "checkpoint": "/root/checkpoints/my-vla", "workdir": "/root/vla"},
-  "endpoint": {"bind": "127.0.0.1", "port": 8000}
-}
-```
-
-工作台可导入单个本体/模型配置、包含两者的组合包，也能导入旧的完整 Recipe 并自动拆分。导出组合会同时保留两份源配置和生成后的 Recipe，便于复现测试。
-
-### 3.1 完整 Recipe
-
-底层编排器继续使用 [`../../config/deployment/recipe.example.json`](../../config/deployment/recipe.example.json) 所示的完整 Recipe。主要部分为：
-
-- `hosts.model`、`hosts.robot`：管理连接、地址、端口、用户、认证、host-key 策略、system/user service manager；模型端支持 `connection: local`，本体端必须为 `ssh`；
-- `model`：Python 入口、Checkpoint、解释器、工作目录、环境，或高级外部命令；
-- `tunnel`：本体监听地址/端口、模型目标、SSH keepalive 与重启策略；
-- `robot.ros`：ROS 1/2、setup、Domain ID/Master URI、RMW；
-- `robot.bringup`：厂商驱动和控制器启动命令；
-- `robot.readiness`：必需 node 和带类型的 topic/service/action、topic 频率与新鲜度；
-- 生命周期操作：`power_on`、`power_off`、`hold`、`stop`；
-- `initial_pose`：FollowJointTrajectory 或自定义命令，以及实测容差；
-- `robot.client`：标准 ROS2 的 `ros2_standard`、非标准 SDK 的通用 `python_adapter`，或高级自定义命令；
-- `runtime`：默认模式、回滚、停止模型、下电策略，以及组件监控间隔与连续失败阈值。
-
-认证既可以直接通过配置管理，也可以使用环境变量或密钥：
-
-```json
-{"type":"password","password":"..."}
-{"type":"password_env","environment_variable":"ROBOT_SSH_PASSWORD"}
-{"type":"key","identity_file":"/home/user/.ssh/id_ed25519"}
-```
-
-`connection` 省略时默认是 `ssh`，与旧配置完全兼容。模型与 Embodit 同机时使用：
-
-```json
-{
-  "connection": "local",
-  "address": "192.168.10.10",
-  "port": 22,
-  "user": "embodit",
-  "service_manager": "user"
-}
-```
-
-本地连接不配置 `auth`；这里的地址、端口和用户仍供本体建立模型隧道使用。`service_manager: user` 不需要系统级 systemd 权限；若使用 `system`，启动 Embodit 的用户必须有管理 system unit 的权限。
-
-保存的 Recipe 文件和目录权限分别为 `0600`、`0700`。密码不会进入 SSH argv、编排日志或下载的 manifest。配置文件中的密码仍属于秘密，应仅本地保存、限制权限并排除出 Git。
-
-## 4. Checkpoint 即用模型
-
-模型主机一次性初始化固定版本的子仓库并按各上游说明创建独立环境后，OpenPI、LeRobot 和 StarVLA 部署只需选择 Provider、填写 Checkpoint；无需 `entrypoint`、启动命令、`/health` 或 `/infer`：
-
-```json
-{
-  "model": {
-    "provider": "lerobot",
-    "checkpoint": "/root/checkpoints/lerobot-policy",
-    "workdir": "/root/Embodit",
-    "python_executable": "/root/miniconda3/envs/lerobot/bin/python"
-  }
-}
-```
-
-网页中的“常用模型 + Checkpoint”栏可生成这部分配置。`workdir` 指向模型主机上的 Embodit checkout，适配器会从其 `third_party/models/<provider>` 固定 gitlink 加载上游代码。若 checkout 在别处，可设置绝对 `source_path`。第三方来源、固定 commit、许可证边界、初始化和升级审查流程见 [`../../third_party/README.md`](../../third_party/README.md)。
-
-Checkpoint 必须包含对应上游正常推理所需的元数据：LeRobot 需要完整 `save_pretrained` 目录；StarVLA 需要模型配置与归一化统计；OpenPI 官方目录通常可推断训练 config，自训练或重命名目录需补充 `load_kwargs.config_name`。这三项是 checkpoint 格式信息，不需要用户实现代码入口。
-
-### 4.1 自定义 Python 模型接口
-
-使用默认 `python` provider 时，用户只需在模型服务器提供模型类和 Checkpoint：
-
-```python
-class MyVLA:
-    def load(self, checkpoint, **kwargs):
-        self.model = YourModel.from_pretrained(checkpoint, **kwargs)
-
-    def predict(self, observations, **kwargs):
-        return self.model.predict(
-            image=observations["wrist_camera"],
-            state=observations["joint_position"],
-            **kwargs,
-        )
-```
-
-入口也可以是工厂函数 `create_model(checkpoint, **load_kwargs) -> model`，返回对象实现 `predict`。
-
-输入契约：
-
-- observation key 与 `robot.client.config.observations` 完全对应；
-- `JointState` 按配置的 `joints` 顺序变成 Python list；模型和 Client 动作校验仍应将非有限传感器输入视为故障；
-- `Image`/`CompressedImage` 变成字典，包含已解码的 `data: bytes`、encoding、时间戳/frame ID，原始 Image 还包含尺寸；
-- 每次调用会附加 `predict_kwargs`。
-
-输出契约：
-
-- 返回形状严格为 `[horizon][joint_count]` 的 Python 二维 list、NumPy array 或 Torch tensor；
-- 数值必须有限，并与 controller action 使用相同单位和关节顺序；
-- 内置 Client 会拒绝 horizon 或关节维度不符的输出，不自动 reshape 或重新排列。
-
-Recipe 示例：
-
-```json
-{
-  "model": {
-    "host": "model",
-    "provider": "python",
-    "entrypoint": "my_vla:MyVLA",
-    "checkpoint": "/root/checkpoints/my-vla",
-    "workdir": "/root/vla",
-    "python_executable": "/root/miniconda3/envs/vla/bin/python",
-    "environment": {"CUDA_VISIBLE_DEVICES": "0"},
-    "load_kwargs": {},
-    "predict_kwargs": {},
-    "startup_timeout_s": 180,
-    "restart": "on-failure"
-  }
-}
-```
-
-`entrypoint`、`checkpoint`、`workdir` 和解释器均在模型服务器解析。Embodit 上传通用 Model Runner，在模型服务器 localhost 绑定 `/health`、`/infer`，限制请求大小（默认 50 MB）、解码二进制观测、归一化 Tensor/array、报告异常并托管进程。内部 HTTP 端点不是普通用户的接入面。
-
-仅已有独立推理服务时设置 `provider: external`；此时用户负责命令、健康检查和兼容的推理协议。最小模板见 [`../../examples/deployment/my_vla.py`](../../examples/deployment/my_vla.py)。
-
-## 5. 隧道认证自动化
-
-首次启动时 Embodit 会：
-
-1. 使用配置的工作电脑凭据登录本体；模型为独立主机时登录模型服务器，为本机时直接执行；
-2. 在本体 `~/.embodit/deployments/<id>/keys/` 生成部署专用 tunnel key；
-3. 通过模型管理连接安装公钥；本机模型直接写入当前用户，独立模型通过 SSH 写入；
-4. 将该 authorized key 限制为只能转发 Recipe 声明的模型端口；
-5. 在本体写入部署专用 `known_hosts`；
-6. 使用 `ExitOnForwardFailure` 和配置的 keepalive 启动 SSH。
-
-因此远端场景只需配置工作电脑能够访问的两端凭据；本机模型不需要管理连接凭据。两种场景都不再手工安装“本体 → 模型服务器”密钥。
-
-## 6. 精确启动与 readiness 标准
-
-启动状态机固定为：
-
-```text
-SSH/systemd 预检
-→ 协调隧道凭据
-→ 启动 Model Runner 并通过 Provider 加载 checkpoint
-→ 模型直连 health
-→ 本体侧 SSH 隧道
-→ 经本体 localhost 隧道检查模型 health
-→ ROS Bringup
-→ ROS graph/type/freshness/rate readiness
-→ 上电
-→ 初始位姿与实测容差检查
-→ Robot Client
-→ 首次完整推理 readiness
-→ dry_run/running
-```
-
-Readiness 是契约，不是固定 sleep：
-
-| 检查 | 通过标准 |
-|---|---|
-| 连接/systemd | SSH 主机接受配置的登录方式；本地模型用户与 Embodit 运行用户一致；各端能够管理 transient unit |
-| Python 模型 | 模型加载后 Runner `/health` 返回 2xx，且不报告 `ready:false`/`ok:false` |
-| 隧道 | 通过 `robot localhost:<local_port>` 能完成相同模型 health |
-| ROS node | 所有配置的 node 名准确出现在 graph 中 |
-| Topic/service/action | 所有配置的名称存在，且类型与配置完全一致 |
-| Topic 频率 | `sample_seconds` 内解析出的平均频率 ≥ `minimum_rate_hz`；设为 `0` 时不检查频率 |
-| ROS2 新鲜度 | 收到一条消息，且 header 时间戳在 ±`maximum_age_ms` 内；无 header 类型配置该项会失败 |
-| ROS1 新鲜度 | 至少收到一条消息；当前 ROS1 不计算 header age |
-| 初始位姿 | `JointState` 包含全部指定关节，最大绝对位置误差 ≤ `tolerance`（默认 0.03） |
-| 内置 Client | 状态 topic 在观测采集、隧道推理、响应解析、动作校验全部成功后报告 `ready` |
-
-Readiness 每隔 `interval_s` 重试，直至 `timeout_s`。类型缺失、topic 过期/低频、位姿超差或 Client 报告 `fault` 都会让启动失败，随后按配置逆序回滚。
-
-## 7. 内置 ROS2 Client 安全标准
-
-`builtin: ros2_standard` 支持 `sensor_msgs/msg/JointState`、`sensor_msgs/msg/Image`、`sensor_msgs/msg/CompressedImage`，通过 `control_msgs/action/FollowJointTrajectory` 发送动作。生成后的 Client 配置会自动上传，示例见 [`../../examples/deployment/ros2_robot_client.example.json`](../../examples/deployment/ros2_robot_client.example.json)。
-
-Live 发送任何 goal 之前，Client 强制执行：
-
-- 所有配置观测在 `observation_timeout_s`（默认 3 秒）内到达，本地接收年龄 ≤ `maximum_observation_age_ms`（默认 500 ms）；
-- 推理 HTTP timeout 取模型 timeout（默认 10 秒）和 watchdog timeout（默认 1 秒）的较小值；
-- 响应体不超过 `maximum_response_bytes`（默认 10 MB），且是有效 JSON；
-- action 形状严格等于 horizon × joint 数，只含有限数值；
-- 各维位于对应关节绝对 `minimum`/`maximum` 内；
-- horizon 第一帧相对配置的 baseline observation 不超过 `max_step`，后续每帧相对上一帧不超过 `max_step`；
-- FollowJointTrajectory server 在超时内接受 goal；
-- 单次完整 loop 不超过 `watchdog_timeout_s`；任一异常都会取消已跟踪 goal、发布 `fault` 并退出。
-
-这些是 Robot Client 边界的软件保护。本体 ROS Bridge/厂商控制器仍必须独立执行硬件限位、命令有效期、控制器状态、碰撞/速度限制和急停逻辑。对于非标准 SDK，应实现薄 ROS Bridge，将状态、轨迹、上下电、hold、stop 和错误码映射为配置的 ROS 契约。
-
-### 7.1 通用 Python Robot Adapter
-
-当厂商 SDK 不适合转换为标准 ROS 接口时，使用 `builtin: python_adapter`。Embodit 仍负责上传通用 Client、模型 HTTP 协议、任务 Prompt、Dry Run、动作校验、频率、readiness、日志和故障退出；本体集成方只提供一个薄对象：
-
-```python
-class RobotAdapter:
-    def __init__(self, config): ...
-    def start(self): ...                 # 可选；仅 Live 调用
-    def observe(self) -> dict: ...       # 返回模型观测与动作 baseline
-    def apply_action(self, row): ...     # 接收一帧已校验动作
-    def stop(self): ...                  # 可选；退出/故障时调用
-```
-
-配置中的 `adapter.entrypoint` 使用 `module:ClassName`。适配器已安装在本体时填写本体绝对目录 `source_path`；使用 Embodit 主机上的单文件薄适配器时填写绝对路径 `source_file`，编排器会自动上传并改写运行目录。`python_executable` 在本体上解析。`dry_run_observations` 支持普通 JSON，以及 `{"$synthetic":"vector","length":N}`、`{"$synthetic":"image","width":W,"height":H,"channels":3}`。Dry Run 不导入 Adapter、不初始化厂商 SDK，只跑合成观测 → 隧道 → 模型 → 动作校验。
-
-`action` 统一声明 `width`、`horizon`、`baseline_observation`、逐维 `minimum`/`maximum`/`max_step`。`numerical_tolerance` 可以是标量或与 `width` 等长的数组；只对处于容差内的边界噪声钳到合法范围，其他维度仍保持严格限位。Live 中每个动作块都先完成形状、有限值、绝对限位和相邻步长校验，之后才逐帧调用 `apply_action`；某个动作块未通过时，Client 丢弃该块、保持最新实测关节状态并继续请求下一次推理，不再因为单次模型越界退出。`control.watchdog_timeout_s` 约束单次调用耗时。模板见 [`../../examples/deployment/python_robot_client.example.json`](../../examples/deployment/python_robot_client.example.json)，薄 Adapter 接口见 [`../../examples/deployment/python_robot_adapter.py`](../../examples/deployment/python_robot_adapter.py)。
-
-`action.horizon` 是模型每次必须输出的动作步数，`control.action_steps` 是 Embodit 从每个动作块实际采用的步数（默认采用整个 horizon），`control.rate_hz` 是 Live 动作下发频率。`control.inference_mode` 可选 `synchronous` 或 `asynchronous`：同步模式执行完当前动作块后才请求下一次推理；异步模式在执行到 `control.asynchronous.request_after_steps` 时启动下一次推理，同时继续执行当前块剩余动作。`request_after_steps` 可填写固定步数，也可设为 `"auto"`；自动模式根据最近一次模型往返延迟、控制频率和 `latency_margin_ms` 动态保留足够的剩余动作。异步结果在切块前会使用切换时的最新本体状态再次执行绝对限位与 `max_step` 校验；如果推理晚于当前块结束，调度时钟从当前时刻恢复，不会为追赶旧 deadline 突发连发动作。典型 Pi 配置可使用 `horizon: 50`、`action_steps: 50`、`request_after_steps: 30`，或使用 `"auto"` 适配不同推理端。
-
-Adapter-backed Dry Run 会持续采样和推理。单次动作越界会记录为 `dryRunSafety.passed: false`，但不会关闭 Client 或常驻模型。它保留为只读诊断工具，不再是每次真机评测前的强制步骤。
-
-可选的 `telemetry` 只描述模型 I/O 的显示方式：`cameras` 指定实际送入模型的图像 key 与名称，`state` 指定状态向量 key、逐维名称和单位，`action` 指定模型输出动作的逐维名称和单位。Embodit 从同一份 `observe()` 结果和已校验 action chunk 生成有界预览，不额外读取厂商状态，也不展示 ROS、隧道或主机信息。`history_seconds`（默认 20 秒）和 `history_max_points` 控制无图像历史缓存；网页可分别观察最近的输入关节状态、模型计划动作、实际下发动作和当前动作块。图像支持 JPEG/PNG/WebP，以及 `mono8`/`rgb8`/`bgr8`/`rgba8`/`bgra8` 原始帧；单图默认最大 750 KB，最多 8 路。
-
-## 8. Dry Run、Live、回滚与停止
-
-Dry Run 使用最终的观测 → 隧道 → 模型 → 校验链路，但不调用轨迹控制器，可用于首次接入或故障诊断。
-
-日常实验中，模型就绪后可直接开始真机评测，无需重复 Dry Run 或输入 challenge 短语。暂停评测只停止真实动作并恢复只读观测，模型、隧道和 ROS 保持常驻；点击继续即可快速恢复。切换 Prompt 只重启轻量 Client，不重新加载模型。`task_prompts` 可在本体 Client 配置中声明常用 Prompt 列表。
-
-“实验位姿”记录的只是模型输入状态向量对应的关节。回位时 Embodit 自动暂停评测，通过同一个通用 Adapter 按配置的 `max_step` 插值移动，完成后保持模型和只读观测运行。
-
-启动失败或监控确认组件持续故障时，`auto_rollback` 按逆序停止组件，并可调用配置的 hold/power-off。运行期默认每 2 秒读取一次结构化 systemd 状态，连续 3 次异常才确认故障；单次 SSH 探测抖动或 systemd 自动重启过渡不会立即终止部署，恢复时会记录 `component_recovered` 事件。可用 `runtime.monitor_interval_s` 和 `runtime.component_failure_threshold` 调整，但不建议把阈值设为 1。探测失败与组件实际退出会生成不同错误信息。急停不经过该防抖，仍首先在本体调用 `robot.stop`，不等待模型。由于最终行为取决于厂商实现，正式使用前必须在受控环境验证正常停止、hold、急停、进程崩溃、网络断开和下电。
-
-## 9. 网页与 CLI 使用
+网页可切换 Orchestration、Model、Tunnel、ROS、Client 日志。CLI：
 
 ```bash
-bash embodit.sh start
+bash embodit.sh logs -f
+bash embodit.sh recipe-validate /tmp/my-deployment.json
 ```
 
-进入“真机部署”，选择本体和模型并启动模型，然后选择 Prompt 后直接点击“开始评测”。动作调度区可在同步、异步固定预取和异步自动预取之间切换，切换只重启轻量 Client。左下执行日志可切换编排、Client、Model、Tunnel 和 ROS，并支持筛选、跟随和清屏；右侧只展示实际模型输入、最近状态/计划/执行轨迹及逐维输出。评测可暂停/继续、快速切换 Prompt，并可记录模型关节位姿后执行一键回位。“断开”只停止本体侧 Client、ROS 与隧道并保留模型；“关闭”同时结束模型服务。
+| 失败位置 | 首要检查 |
+|---|---|
+| host/systemd | SSH 认证、host key、用户、system/user manager 权限 |
+| model environment | workdir、Python、Checkpoint、CUDA、Provider 依赖 |
+| model health | 权重加载日志、输入 schema、端口占用 |
+| tunnel | 本体到模型 SSH 地址、端口、authorized key 限制 |
+| ROS readiness | setup 顺序、Domain ID/Master URI、名称、类型、频率、header 时间 |
+| initial pose | 关节顺序、单位、控制器状态、实测容差 |
+| client safety | action shape、NaN/Inf、绝对限位、max_step、watchdog |
 
-CLI/救援命令：
-
-```bash
-bash embodit.sh recipe-compose \
-  config/deployment/robot.example.json \
-  config/deployment/models/python.example.json \
-  --deployment-id robot-a--my-vla \
-  --output /tmp/robot-a--my-vla.json
-bash embodit.sh recipe-validate config/my-robot.json
-bash embodit.sh recipe-run config/my-robot.json --mode dry_run
-bash embodit.sh recipe-run config/my-robot.json --mode live
-bash embodit.sh recipe-stop config/my-robot.json
-bash embodit.sh recipe-stop config/my-robot.json --emergency
-```
-
-`recipe-run --no-follow` 会在 readiness 完成后退出，远端 systemd 服务继续运行。
-
-## 10. ROS 泛化边界
-
-节点名只作为 readiness 信号，功能适配由带类型的 topic、service、action 定义。Recipe 编排支持 ROS1 和 ROS2；`ros2_standard` 与 FollowJointTrajectory 初始位姿只支持 ROS2。ROS1 或非标准 SDK 可使用厂商无关的 `python_adapter` 契约；ROS1 readiness 不接受 `actions` 声明，应检查对应 actionlib topics。
-
-切换本体 SDK 时，通常只应修改 Recipe 和薄 ROS Bridge；SSH 拓扑、隧道、模型 Provider、生命周期状态机和 UI 保持不变。
-
-## 11. HTTP API
+## 13. HTTP API
 
 ```text
-GET/POST    /api/deploy/recipes
-GET/DELETE  /api/deploy/recipes/{id}
-POST        /api/deploy/recipes/validate
-POST        /api/deploy/recipes/split
 GET/POST    /api/deploy/configs/{robot|model}
 GET/DELETE  /api/deploy/configs/{robot|model}/{id}
 POST        /api/deploy/configs/validate
 POST        /api/deploy/compose
+GET/POST    /api/deploy/recipes
+POST        /api/deploy/recipes/validate
+POST        /api/deploy/recipes/split
 POST        /api/deploy/doctor
-POST        /api/deploy/orchestrations
+POST        /api/deploy/robot-connection
 POST        /api/deploy/orchestrations/prepare-model
-GET         /api/deploy/orchestrations/{id}
+POST        /api/deploy/orchestrations/{id}/start-dry-run
 POST        /api/deploy/orchestrations/{id}/start-evaluation
 POST        /api/deploy/orchestrations/{id}/stop-evaluation
 POST        /api/deploy/orchestrations/{id}/prompt
+POST        /api/deploy/orchestrations/{id}/scheduler
 POST        /api/deploy/orchestrations/{id}/poses
-POST        /api/deploy/orchestrations/{id}/poses/{pose_id}/move
-DELETE      /api/deploy/orchestrations/{id}/poses/{pose_id}
-POST        /api/deploy/orchestrations/{id}/arm-challenge
-POST        /api/deploy/orchestrations/{id}/start-live
 POST        /api/deploy/orchestrations/{id}/stop
 POST        /api/deploy/orchestrations/{id}/emergency-stop
-POST        /api/deploy/orchestrations/{id}/logs
-POST        /api/deploy/orchestrations/{id}/components/{component}/restart
-GET         /api/deploy/orchestrations/{id}/manifest
 ```
 
-本体/模型 Config 是配置管理接口；组合产物 Recipe 和上述 Orchestration API 仍是唯一运行协议。
+Config 用于复用，Recipe 用于执行；不要维护两套运行配置。

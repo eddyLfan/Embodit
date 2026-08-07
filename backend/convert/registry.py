@@ -46,9 +46,9 @@ _pair(FORMAT_HDF5, FORMAT_LEROBOT_V3, _PARTIAL, ["framesReencodeFpsInferred"])
 _pair(FORMAT_MCAP, FORMAT_LEROBOT_V21, _PARTIAL, ["mcapReencodeDropTopicsCalib"])
 _pair(FORMAT_MCAP, FORMAT_LEROBOT_V3, _PARTIAL, ["mcapReencodeDropTopicsCalib"])
 _pair(FORMAT_MCAP, FORMAT_HDF5, _PARTIAL, ["mcapDecodeDropTopics"])
-_pair(FORMAT_LEROBOT_V21, FORMAT_MCAP, _PARTIAL, ["synthTopicsTimestamps"])
-_pair(FORMAT_LEROBOT_V3, FORMAT_MCAP, _PARTIAL, ["synthTopicsTimestamps"])
-_pair(FORMAT_HDF5, FORMAT_MCAP, _PARTIAL, ["synthTopicsTimestamps"])
+_pair(FORMAT_LEROBOT_V21, FORMAT_MCAP, _PARTIAL, ["synthTopicsTimestampsImages"])
+_pair(FORMAT_LEROBOT_V3, FORMAT_MCAP, _PARTIAL, ["synthTopicsTimestampsImages"])
+_pair(FORMAT_HDF5, FORMAT_MCAP, _PARTIAL, ["synthTopicsTimestampsImages"])
 
 
 def pair_capability(source_format: str, target_format: str) -> dict[str, Any] | None:

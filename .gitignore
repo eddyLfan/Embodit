@@ -45,4 +45,6 @@ SAM_checkpoints/*.pt
 SAM_checkpoints/*.pth
 SAM_checkpoints/*.bin
 
-checkpoints/
+checkpoints/*
+
+tests/

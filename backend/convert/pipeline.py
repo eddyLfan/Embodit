@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterator
 
 from datasets.payload import EpisodePayload
 from datasets.registry import get_writer, open_dataset
-from datasets.view import FORMAT_LABELS, FORMAT_MCAP, DatasetView
+from datasets.view import FORMAT_LABELS, DatasetView
 from convert.report import ConversionReport
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -165,19 +165,9 @@ def convert_dataset(
     if not fps:
         raise ValueError("源数据集未提供 fps，且 mapping 中也未指定 fps；请在 mapping 中显式传入 fps")
 
-    allow_camera_loss = bool(mapping.get("allow_camera_loss"))
-    has_cameras = any(ep.cameras for ep in view.episodes)
-    if target_format == FORMAT_MCAP and has_cameras and not allow_camera_loss:
-        raise ValueError(
-            "目标格式 MCAP 暂不支持写入相机图像/视频，转换会丢失所有相机数据；"
-            "如接受丢失，请在 mapping 中设置 allow_camera_loss=true"
-        )
-
     warnings: list[str] = []
     known_losses: list[str] = []
     known_losses.append("跨格式转换可能丢失未映射的 topic/特征/标定元数据")
-    if target_format == FORMAT_MCAP and has_cameras:
-        known_losses.append("MCAP 目标格式不保留相机图像/视频（已显式确认丢失）")
 
     meta = {
         "fps": float(fps),

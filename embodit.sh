@@ -26,6 +26,7 @@ PID_FILE="${STATE_DIR}/service.pid"
 URL_FILE="${STATE_DIR}/service.url"
 LOG_FILE="${STATE_DIR}/service.log"
 TOKEN_FILE="${STATE_DIR}/token"
+ENV_STAMP_FILE="${STATE_DIR}/environment.sha256"
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
   BOLD="$(tput bold)"
@@ -51,6 +52,7 @@ Usage: bash embodit.sh <command> [options]
 
 Commands:
   start [DATA_ROOT]    Start Embodit (default data root: current directory)
+  setup                Install all dependencies without starting the service
   stop                 Stop Embodit and clean up stray instances
   restart [DATA_ROOT]  Restart Embodit
   status               Show whether Embodit is running
@@ -65,6 +67,8 @@ Commands:
 
 Examples:
   bash embodit.sh start ~/datasets
+  bash embodit.sh setup
+  EMBODIT_PYPI_MIRROR=tsinghua bash embodit.sh setup
   EMBODY_PORT=9000 bash embodit.sh start /data/lerobot
   bash embodit.sh status
   bash embodit.sh logs -f
@@ -78,7 +82,8 @@ Examples:
 
 Optional env vars: EMBODY_ROOT, EMBODY_HOST, EMBODY_PORT,
   EMBODY_PUBLIC_HOST, EMBODY_TOKEN, EMBODY_PROXY, EMBODIT_SANDBOX,
-  EMBODIT_CACHE_DIR, EMBODIT_STATE_DIR, EMBODIT_REVIEW_CONFIG,
+  EMBODIT_PYPI_MIRROR, EMBODIT_CACHE_DIR, EMBODIT_STATE_DIR,
+  EMBODIT_REVIEW_CONFIG,
   AUGMENT_PYTHON, AUGMENT_SAM3_CHECKPOINT
 EOF
 }
@@ -98,6 +103,111 @@ running_pid() {
   printf '%s\n' "$pid"
 }
 
+environment_fingerprint() {
+  python3 - "${SCRIPT_DIR}/pyproject.toml" "${SCRIPT_DIR}/uv.lock" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+for name in sys.argv[1:]:
+    with open(name, "rb") as handle:
+        digest.update(handle.read())
+print(digest.hexdigest())
+PY
+}
+
+configure_uv_network() {
+  local mirror="${EMBODIT_PYPI_MIRROR:-}" proxy="${EMBODY_PROXY:-${LEROBOT_PROXY:-}}"
+  if [[ -n "$mirror" ]]; then
+    case "$mirror" in
+      tsinghua|tuna)
+        export UV_DEFAULT_INDEX="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+        ;;
+      official|pypi)
+        export UV_DEFAULT_INDEX="https://pypi.org/simple"
+        ;;
+      http://*|https://*)
+        export UV_DEFAULT_INDEX="$mirror"
+        ;;
+      *)
+        fail "EMBODIT_PYPI_MIRROR must be tsinghua, official, or an HTTP(S) Simple Index URL."
+        return 2
+        ;;
+    esac
+    # The project-specific setting is explicit and therefore takes precedence
+    # over a legacy UV_INDEX_URL inherited from the shell.
+    unset UV_INDEX_URL
+  fi
+  if [[ -n "$proxy" ]]; then
+    export http_proxy="$proxy" https_proxy="$proxy"
+    export HTTP_PROXY="$proxy" HTTPS_PROXY="$proxy"
+  fi
+}
+
+environment_ready() {
+  local fingerprint stamp_fingerprint
+  [[ -x "${SCRIPT_DIR}/.venv/bin/python" && -s "$ENV_STAMP_FILE" ]] || return 1
+  fingerprint="$(environment_fingerprint)"
+  read -r stamp_fingerprint <"$ENV_STAMP_FILE" || return 1
+  [[ "$stamp_fingerprint" == "$fingerprint" ]]
+}
+
+write_environment_stamp() {
+  local fingerprint="$1" temporary="${ENV_STAMP_FILE}.tmp.$$"
+  printf '%s\n' "$fingerprint" >"$temporary"
+  mv "$temporary" "$ENV_STAMP_FILE"
+}
+
+sync_environment() {
+  local fingerprint requirements_file=""
+  if environment_ready; then
+    return 0
+  fi
+  configure_uv_network
+  fingerprint="$(environment_fingerprint)"
+  info "Preparing environment from uv.lock ..."
+  if [[ -n "${UV_DEFAULT_INDEX:-}" ]]; then
+    info "Package index: ${UV_DEFAULT_INDEX}"
+  elif [[ -n "${UV_INDEX_URL:-}" ]]; then
+    info "Package index: ${UV_INDEX_URL}"
+  fi
+  if [[ -n "${UV_DEFAULT_INDEX:-}${UV_INDEX_URL:-}" ]]; then
+    requirements_file="$(mktemp "${TMPDIR:-/tmp}/embodit-requirements.XXXXXX")"
+    if ! (cd "$SCRIPT_DIR" && uv export --frozen --no-dev \
+      --format requirements-txt --no-emit-project >"$requirements_file"); then
+      rm -f "$requirements_file"
+      return 1
+    fi
+    if [[ ! -x "${SCRIPT_DIR}/.venv/bin/python" ]]; then
+      if ! uv venv --python python3 "${SCRIPT_DIR}/.venv"; then
+        rm -f "$requirements_file"
+        return 1
+      fi
+    fi
+    if ! uv pip sync --python "${SCRIPT_DIR}/.venv/bin/python" "$requirements_file"; then
+      rm -f "$requirements_file"
+      return 1
+    fi
+    rm -f "$requirements_file"
+  else
+    (cd "$SCRIPT_DIR" && uv sync --frozen --no-dev)
+  fi
+  write_environment_stamp "$fingerprint"
+}
+
+setup_environment() {
+  if (( $# > 0 )); then
+    fail "setup does not accept arguments."
+    return 2
+  fi
+  if ! command -v uv >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    fail "setup requires uv and python3 on PATH."
+    return 1
+  fi
+  sync_environment
+  ok "Embodit environment is ready."
+}
+
 start_service() {
   if (( $# > 1 )); then
     fail "start accepts at most one DATA_ROOT argument."
@@ -114,7 +224,7 @@ start_service() {
   local port="${EMBODY_PORT:-${LEROBOT_PORT:-8765}}"
   local proxy="${EMBODY_PROXY:-${LEROBOT_PROXY:-}}"
   local public_host="${EMBODY_PUBLIC_HOST:-${LEROBOT_PUBLIC_HOST:-localhost}}"
-  local token url pid start_ts
+  local token url pid start_ts sandbox_notice=""
 
   if [[ -z "$data_root" ]]; then
     data_root="$(pwd)"
@@ -137,6 +247,19 @@ start_service() {
   if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
     fail "EMBODY_PORT must be an integer between 1 and 65535 (got: ${port})."
     return 2
+  fi
+
+  # A non-loopback listener is reachable by other machines. Unless the user
+  # explicitly chooses otherwise, confine every client-supplied path to the
+  # selected data root so a leaked token cannot expose the whole host.
+  if [[ -z "${EMBODIT_SANDBOX+x}" ]]; then
+    case "$host" in
+      127.0.0.1|localhost|::1) ;;
+      *)
+        export EMBODIT_SANDBOX=1
+        sandbox_notice="enabled automatically for non-loopback access"
+        ;;
+    esac
   fi
 
   if pid="$(running_pid)"; then
@@ -188,21 +311,29 @@ PY
   info "${DIM}----------------------------------------${RESET}"
   info "  Data root : ${data_root}"
   info "  Listen on : http://${host}:${port}"
+  if [[ -n "$sandbox_notice" ]]; then
+    info "  Path guard: ${sandbox_notice} (${data_root})"
+  elif [[ "${EMBODIT_SANDBOX:-}" =~ ^(1|true|yes)$ ]]; then
+    info "  Path guard: enabled (${data_root})"
+  elif [[ "$host" != "127.0.0.1" && "$host" != "localhost" && "$host" != "::1" ]]; then
+    fail "  WARNING: Path guard explicitly disabled on non-loopback listener ${host}"
+    fail "           Authenticated clients can access paths allowed by this service account."
+  else
+    info "  Path guard: disabled (local trusted use)"
+  fi
   info "  Log file  : ${LOG_FILE}"
   info ""
 
-  printf 'Syncing environment ... '
-  if (cd "$SCRIPT_DIR" && uv sync --quiet); then
-    printf '%s\n' "${GREEN}done${RESET}"
+  if sync_environment; then
+    ok "Environment is ready."
   else
-    printf '%s\n' "${RED}failed${RESET}"
     fail "uv sync failed. Check network / proxy (EMBODY_PROXY) and retry."
     return 1
   fi
 
   printf 'Starting server ... '
   start_ts=$SECONDS
-  nohup uv run --project "$SCRIPT_DIR" \
+  nohup uv run --no-sync --project "$SCRIPT_DIR" \
     python "${SCRIPT_DIR}/backend/app.py" \
     --host "$host" \
     --port "$port" \
@@ -309,6 +440,11 @@ show_status() {
     ok "Embodit is running (pid ${pid})."
     info "  URL: $(cat "$URL_FILE" 2>/dev/null || printf 'unknown')"
     info "  Log: ${LOG_FILE}"
+    if environment_ready; then
+      info "  Environment: ready"
+    else
+      info "  Environment: dependencies changed; restart or run 'bash embodit.sh setup'"
+    fi
     return 0
   fi
 
@@ -394,15 +530,12 @@ run_recipe_cli() {
     fail "recipe-${subcommand} requires a Recipe path."
     return 2
   fi
-  if [[ -x "${SCRIPT_DIR}/.venv/bin/python" ]]; then
-    "${SCRIPT_DIR}/.venv/bin/python" "${SCRIPT_DIR}/backend/deploy/cli.py" "$subcommand" "$@"
-    return
-  fi
   if ! command -v uv >/dev/null 2>&1; then
     fail "uv is required to create the Embodit environment."
     return 1
   fi
-  uv run --project "$SCRIPT_DIR" python "${SCRIPT_DIR}/backend/deploy/cli.py" "$subcommand" "$@"
+  sync_environment
+  "${SCRIPT_DIR}/.venv/bin/python" "${SCRIPT_DIR}/backend/deploy/cli.py" "$subcommand" "$@"
 }
 
 command="${1:-help}"
@@ -412,6 +545,7 @@ fi
 
 case "$command" in
   start) start_service "$@" ;;
+  setup) setup_environment "$@" ;;
   stop) stop_service "$@" ;;
   restart)
     if (( $# > 1 )); then

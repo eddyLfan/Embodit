@@ -196,7 +196,7 @@
       }
       state.deploymentLogRows = [];
       const output = $('#deploymentExecutionLog');
-      if (output) output.innerHTML = '<div class="deployment-log-empty">日志已清空，等待新内容…</div>';
+      if (output) output.innerHTML = `<div class="deployment-log-empty">${escapeHtml(t('deployLogsCleared'))}</div>`;
     });
     $('#deploymentTrajectoryGroups')?.addEventListener('click', onDeploymentTrajectoryGroup);
     $('#deploymentTrajectorySource')?.addEventListener('change', renderCurrentDeploymentTrajectory);
@@ -240,7 +240,7 @@
     try { pauseAll(); } catch {}
     activatePrimaryLayer('deploy');
     try { await refreshDeploymentOptions(); } catch (error) {
-      setDeploymentResult({ error: error.message }, '载入本体与模型失败', true);
+      setDeploymentResult({ error: error.message }, t('deployLoadConfigsFailed'), true);
     }
     try {
       const orchestrations = await api('/api/deploy/orchestrations');
@@ -261,13 +261,13 @@
     try {
       config = JSON.parse($(selector).value);
     } catch (error) {
-      throw new Error(`${kind === 'robot' ? '本体' : '模型'}配置 JSON 无效：${error.message}`);
+      throw new Error(t('deployConfigJsonInvalid', { kind: t(kind === 'robot' ? 'deployKindRobot' : 'deployKindModel'), msg: error.message }));
     }
     if (!config || typeof config !== 'object' || Array.isArray(config)) {
       throw new Error(t('deployProfileObject'));
     }
     if (config.kind !== kind || config.version !== 1) {
-      throw new Error(`${kind === 'robot' ? '本体' : '模型'}配置必须是 version=1、kind=${kind}`);
+      throw new Error(t('deployConfigVersionInvalid', { kind: t(kind === 'robot' ? 'deployKindRobot' : 'deployKindModel'), value: kind }));
     }
     return config;
   }
@@ -309,7 +309,7 @@
   async function refreshDeploymentComposition(showResult = false) {
     try {
       const recipe = await composeDeploymentRecipe();
-      if (showResult) setDeploymentResult(recipe, '本体与模型配置兼容，Recipe 已生成');
+      if (showResult) setDeploymentResult(recipe, t('deployRecipeComposed'));
       return recipe;
     } catch (error) {
       $('#deploymentRecipe').value = '';
@@ -334,14 +334,14 @@
         const config = examples[kind];
         const id = `__example_${kind}__`;
         state.deploymentConfigCache[kind].set(id, config);
-        metadata[kind] = [{ configId: id, name: `${config.name}（示例）`, valid: true }];
+        metadata[kind] = [{ configId: id, name: `${config.name} (${t('deployExample')})`, valid: true }];
       }
     }
     for (const kind of ['robot', 'model']) {
       const select = $(kind === 'robot' ? '#deploymentRobotSelect' : '#deploymentModelSelect');
       const previous = select.value;
       select.innerHTML = metadata[kind].map((item) =>
-        `<option value="${escapeAttr(item.configId)}">${escapeHtml(item.name)} · ${escapeHtml(item.configId.replace(/^__example_|__$/g, ''))}${item.source === 'project' ? ' · 项目配置' : ''}</option>`
+        `<option value="${escapeAttr(item.configId)}">${escapeHtml(item.name)} · ${escapeHtml(item.configId.replace(/^__example_|__$/g, ''))}${item.source === 'project' ? ` · ${escapeHtml(t('deployProjectConfig'))}` : ''}</option>`
       ).join('');
       select.value = metadata[kind].some((item) => item.configId === previous) ? previous : metadata[kind][0].configId;
     }
@@ -351,7 +351,7 @@
   async function selectedDeploymentConfig(kind) {
     const select = $(kind === 'robot' ? '#deploymentRobotSelect' : '#deploymentModelSelect');
     const id = select?.value;
-    if (!id) throw new Error(`没有可用的${kind === 'robot' ? '本体' : '模型'}配置`);
+    if (!id) throw new Error(t('deployNoConfig', { kind: t(kind === 'robot' ? 'deployKindRobot' : 'deployKindModel') }));
     if (state.deploymentConfigCache[kind].has(id)) return state.deploymentConfigCache[kind].get(id);
     const result = await api(`/api/deploy/configs/${kind}/${encodeURIComponent(id)}`);
     state.deploymentConfigCache[kind].set(id, result.config);
@@ -370,8 +370,8 @@
     configureDeploymentScheduler(robot, model);
     syncDeploymentCompositionIdentity();
     await refreshDeploymentComposition(false);
-    setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', '未检测连接');
-    setDeploymentComponentStatus('#deploymentModelStatus', 'idle', '未启动');
+    setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployConnectionUnchecked'));
+    setDeploymentComponentStatus('#deploymentModelStatus', 'idle', t('deployNotStarted'));
     state.deploymentRobotConnected = false;
     syncDeploymentButtons(false);
   }
@@ -387,7 +387,9 @@
     const input = $('#deploymentTaskPrompt');
     if (input && (!input.value.trim() || !state.deploymentSessionId)) input.value = config.default_prompt || prompts[0] || '';
     const hint = $('#deploymentPromptHint');
-    if (hint) hint.textContent = prompts.length ? `配置中有 ${prompts.length} 个可选 Prompt` : '可直接输入自定义 Prompt';
+    if (hint) hint.textContent = prompts.length
+      ? t('deployPromptCount', { n: prompts.length })
+      : t('deployPromptCustom');
   }
 
   function configureDeploymentScheduler(robot, model = null) {
@@ -408,7 +410,7 @@
     state.deploymentSchedulerDirty = false;
     state.deploymentSchedulerApplying = false;
     syncDeploymentSchedulerControls();
-    renderDeploymentSchedulerHint(`模型输出 ${horizon} 步 · 控制 ${Number(control.rate_hz || 10)} Hz`);
+    renderDeploymentSchedulerHint(t('deploySchedulerBase', { horizon, rate: Number(control.rate_hz || 10) }));
   }
 
   function syncDeploymentSchedulerControls() {
@@ -425,23 +427,23 @@
     const requestAfterSteps = raw === 'auto' ? 'auto' : Number(raw);
     let error = '';
     if (!Number.isInteger(actionSteps) || actionSteps < 1 || actionSteps > horizon) {
-      error = `采用步数必须在 1 到 ${horizon} 之间`;
+      error = t('deployActionStepsRange', { horizon });
     } else if (mode === 'asynchronous' && requestAfterSteps !== 'auto'
       && (!Number.isInteger(requestAfterSteps) || requestAfterSteps < 1 || requestAfterSteps >= actionSteps)) {
-      error = '预取点必须是 auto，或小于采用步数的正整数';
+      error = t('deployPrefetchInvalid');
     }
     return { mode, horizon, actionSteps, requestAfterSteps, error };
   }
 
   function renderDeploymentSchedulerHint(prefix = '') {
     const form = deploymentSchedulerForm();
-    const mode = form.mode === 'asynchronous' ? '异步' : '同步';
+    const mode = t(form.mode === 'asynchronous' ? 'deployModeAsync' : 'deployModeSync');
     const prefetch = form.mode === 'asynchronous'
-      ? ` · ${form.requestAfterSteps === 'auto' ? '自动预取' : `第 ${form.requestAfterSteps} 步预取`}`
+      ? ` · ${form.requestAfterSteps === 'auto' ? t('deployPrefetchAuto') : t('deployPrefetchAt', { step: form.requestAfterSteps })}`
       : '';
-    const status = state.deploymentSchedulerDirty ? ' · 待应用' : '';
+    const status = state.deploymentSchedulerDirty ? ` · ${t('deployPendingApply')}` : '';
     $('#deploymentSchedulerHint').textContent = form.error
-      || `${prefix ? `${prefix} · ` : ''}${mode} · 采用 ${form.actionSteps}/${form.horizon} 步${prefetch}${status}`;
+      || `${prefix ? `${prefix} · ` : ''}${mode} · ${t('deployUseSteps', { used: form.actionSteps, total: form.horizon })}${prefetch}${status}`;
   }
 
   function onDeploymentSchedulerInput() {
@@ -517,7 +519,7 @@
     $('#stopDeployment').disabled = !active;
     $('#stopDeployment').hidden = !active;
     $('#startLiveDeployment').disabled = !active || (!modelReady && !paused) || changing;
-    $('#startLiveDeployment').textContent = paused ? '继续评测' : '开始评测';
+    $('#startLiveDeployment').textContent = t(paused ? 'deployResumeEvaluation' : 'deployStartEvaluation');
     $('#stopLiveDeployment').disabled = !active || !running;
     $('#deploymentRobotSelect').disabled = active;
     $('#deploymentModelSelect').disabled = active;
@@ -527,7 +529,7 @@
     const schedulerContextReady = !state.deploymentSessionId || (active && modelActive);
     $('#applyDeploymentScheduler').disabled = changing || state.deploymentSchedulerApplying
       || !schedulerContextReady || !state.deploymentSchedulerDirty || Boolean(scheduler.error);
-    $('#applyDeploymentScheduler').textContent = state.deploymentSchedulerApplying ? '应用中…' : '应用';
+    $('#applyDeploymentScheduler').textContent = t(state.deploymentSchedulerApplying ? 'deployApplying' : 'deployApply');
     const canRecord = active && ['dry_run', 'running'].includes(snapshot?.state)
       && Array.isArray(snapshot?.modelIo?.input?.state?.values);
     $('#recordDeploymentPose').disabled = !canRecord;
@@ -570,17 +572,17 @@
   async function checkDeploymentRobotConnection() {
     const button = $('#checkDeploymentRobot');
     button.disabled = true;
-    setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', '连接中');
+    setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', t('deployConnecting'));
     try {
       const snapshot = state.deploymentSnapshot;
       if (state.deploymentSessionId && snapshot?.state === 'model_ready' && snapshot?.components?.model?.active) {
         const prompt = $('#deploymentTaskPrompt')?.value.trim();
-        if (!prompt) throw new Error('请先填写任务 Prompt');
+        if (!prompt) throw new Error(t('deployPromptRequired'));
         const connected = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/start-dry-run`, {
           method: 'POST', body: JSON.stringify({ taskPrompt: prompt })
         });
         renderDeploymentSnapshot(connected);
-        setDeploymentResult(connected, '正在建立本体只读观测链路');
+        setDeploymentResult(connected, t('deployOpeningReadOnlyLink'));
         startDeploymentPolling();
         return true;
       }
@@ -588,12 +590,12 @@
         method: 'POST', body: JSON.stringify({ config: deploymentConfig('robot') })
       });
       state.deploymentRobotConnected = Boolean(result.connected);
-      setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', result.hostname ? `已连接 · ${result.hostname}` : '已连接');
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', result.hostname ? `${t('deployConnected')} · ${result.hostname}` : t('deployConnected'));
       return true;
     } catch (error) {
       state.deploymentRobotConnected = false;
-      setDeploymentComponentStatus('#deploymentRobotStatus', 'error', '连接失败');
-      setDeploymentResult({ error: error.message }, '本体连接失败', true);
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'error', t('deployConnectionFailed'));
+      setDeploymentResult({ error: error.message }, t('deployRobotConnectionFailed'), true);
       return false;
     } finally {
       syncDeploymentButtons(Boolean(state.deploymentSessionId), state.deploymentSnapshot);
@@ -601,7 +603,7 @@
   }
 
   async function prepareDeploymentModel() {
-    setBusy(true, '正在准备并启动模型', '检测本体连接与模型运行环境，启动模型服务并等待健康检查。');
+    setBusy(true, t('deployPreparingModel'), t('deployPreparingModelHint'));
     try {
       if (!state.deploymentRobotConnected && !await checkDeploymentRobotConnection()) return;
       const recipe = await composeDeploymentRecipe();
@@ -611,7 +613,7 @@
       state.deploymentSessionId = snapshot.orchestrationId;
       state.deploymentRuntimeKind = 'recipe';
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, '正在检测本体并启动模型');
+      setDeploymentResult(snapshot, t('deployCheckingRobotStartingModel'));
       startDeploymentPolling();
     } catch (error) {
       state.deploymentSessionId = null;
@@ -619,8 +621,8 @@
       state.deploymentSnapshot = null;
       state.deploymentRobotConnected = false;
       syncDeploymentButtons(false);
-      setDeploymentComponentStatus('#deploymentRobotStatus', 'error', '连接失败');
-      setDeploymentComponentStatus('#deploymentModelStatus', 'error', '启动失败');
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'error', t('deployConnectionFailed'));
+      setDeploymentComponentStatus('#deploymentModelStatus', 'error', t('deployStartFailed'));
       setDeploymentResult({ error: error.message }, t('deployFailed'), true);
     } finally {
       setBusy(false);
@@ -629,31 +631,31 @@
 
   async function disconnectDeploymentRobot() {
     if (!state.deploymentSessionId) return;
-    setBusy(true, '正在断开本体', '停止 Client、ROS 与通信隧道；模型保持运行。');
+    setBusy(true, t('deployDisconnectingRobot'), t('deployDisconnectingRobotHint'));
     try {
       const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/disconnect-robot`, { method: 'POST' });
       state.deploymentRobotConnected = false;
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, '本体已断开；模型保持运行，可随时重新开始评测');
+      setDeploymentResult(snapshot, t('deployRobotDisconnected'));
     } catch (error) {
-      setDeploymentResult({ error: error.message }, '断开本体失败', true);
+      setDeploymentResult({ error: error.message }, t('deployDisconnectFailed'), true);
     } finally { setBusy(false); }
   }
 
   async function closeDeploymentModel() {
     if (!state.deploymentSessionId) return;
-    setBusy(true, '正在关闭模型', '停止本体通信与模型推理服务。');
+    setBusy(true, t('deployClosingModel'), t('deployClosingModelHint'));
     try {
       const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/close-model`, { method: 'POST' });
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, '模型与本体通信均已关闭');
+      setDeploymentResult(snapshot, t('deployModelClosed'));
       stopDeploymentPolling();
       state.deploymentSessionId = null;
       state.deploymentRuntimeKind = null;
       state.deploymentRobotConnected = false;
       syncDeploymentButtons(false);
     } catch (error) {
-      setDeploymentResult({ error: error.message }, '关闭模型失败', true);
+      setDeploymentResult({ error: error.message }, t('deployCloseModelFailed'), true);
     } finally { setBusy(false); }
   }
 
@@ -675,13 +677,13 @@
       const anyManagedActive = Object.values(snapshot.components || {}).some((component) => component?.active);
       if (['stopped', 'disconnected'].includes(snapshot.state) || (snapshot.state === 'fault' && !anyManagedActive)) {
         stopDeploymentPolling();
-        setDeploymentResult(snapshot, snapshot.lastError || `部署已${snapshot.state}`, snapshot.state === 'fault');
+        setDeploymentResult(snapshot, snapshot.lastError || t('deployStateMessage', { state: snapshot.state }), snapshot.state === 'fault');
         state.deploymentSessionId = null;
         state.deploymentRuntimeKind = null;
         syncDeploymentButtons(false);
       } else if (snapshot.state === 'fault') {
         stopDeploymentPolling();
-        setDeploymentResult(snapshot, snapshot.lastError || '部署发生故障；可断开本体或关闭模型', true);
+        setDeploymentResult(snapshot, snapshot.lastError || t('deployFaultHint'), true);
       }
     } catch (error) {
       stopDeploymentPolling();
@@ -704,8 +706,8 @@
       state.deploymentSnapshot = null;
       state.deploymentRobotConnected = false;
       syncDeploymentButtons(false);
-      setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', '未检测连接');
-      setDeploymentComponentStatus('#deploymentModelStatus', 'idle', '未启动');
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployConnectionUnchecked'));
+      setDeploymentComponentStatus('#deploymentModelStatus', 'idle', t('deployNotStarted'));
     }
   }
 
@@ -713,7 +715,7 @@
     if (!state.deploymentSessionId) return;
     const taskPrompt = $('#deploymentTaskPrompt')?.value.trim() || '';
     if (!taskPrompt) {
-      setDeploymentResult({ error: '请先选择或填写任务 Prompt' }, '缺少任务 Prompt', true);
+      setDeploymentResult({ error: t('deployPromptChoose') }, t('deployPromptMissing'), true);
       $('#deploymentTaskPrompt')?.focus();
       return;
     }
@@ -724,7 +726,7 @@
       });
       renderDeploymentSnapshot(snapshot);
       startDeploymentPolling();
-      setDeploymentResult(snapshot, snapshot.state === 'starting' ? '正在连接本体并开始评测' : '真机循环运行中');
+      setDeploymentResult(snapshot, t(snapshot.state === 'starting' ? 'deployStartingEvaluation' : 'deployEvaluationRunning'));
     } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
   }
 
@@ -736,7 +738,7 @@
       });
       renderDeploymentSnapshot(snapshot);
       startDeploymentPolling();
-      setDeploymentResult(snapshot, '评测已暂停；模型与观测保持运行，可立即继续或切换 Prompt');
+      setDeploymentResult(snapshot, t('deployEvaluationPaused'));
     } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
   }
 
@@ -751,9 +753,9 @@
         method: 'POST', body: JSON.stringify({ taskPrompt })
       });
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, `Prompt 已切换：${taskPrompt}`);
+      setDeploymentResult(snapshot, t('deployPromptChanged', { prompt: taskPrompt }));
     } catch (error) {
-      setDeploymentResult({ error: error.message }, 'Prompt 切换失败', true);
+      setDeploymentResult({ error: error.message }, t('deployPromptChangeFailed'), true);
     } finally {
       syncDeploymentButtons(true, state.deploymentSnapshot);
     }
@@ -762,7 +764,7 @@
   async function applyDeploymentScheduler() {
     const form = deploymentSchedulerForm();
     if (form.error) {
-      setDeploymentResult({ error: form.error }, '调度配置无效', true);
+      setDeploymentResult({ error: form.error }, t('deploySchedulerInvalid'), true);
       return;
     }
     state.deploymentSchedulerApplying = true;
@@ -772,7 +774,7 @@
         await refreshDeploymentComposition(false);
         state.deploymentSchedulerDirty = false;
         renderDeploymentSchedulerHint();
-        setDeploymentResult({ scheduler: form }, '调度配置将在启动模型时生效');
+        setDeploymentResult({ scheduler: form }, t('deploySchedulerDeferred'));
         return;
       }
       const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/scheduler`, {
@@ -786,9 +788,9 @@
       });
       state.deploymentSchedulerDirty = false;
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, `动作调度已切换为${form.mode === 'asynchronous' ? '异步' : '同步'}模式`);
+      setDeploymentResult(snapshot, t('deploySchedulerChanged', { mode: t(form.mode === 'asynchronous' ? 'deployModeAsync' : 'deployModeSync') }));
     } catch (error) {
-      setDeploymentResult({ error: error.message }, '动作调度切换失败', true);
+      setDeploymentResult({ error: error.message }, t('deploySchedulerChangeFailed'), true);
     } finally {
       state.deploymentSchedulerApplying = false;
       syncDeploymentButtons(Boolean(state.deploymentSessionId), state.deploymentSnapshot);
@@ -797,7 +799,7 @@
 
   async function recordDeploymentPose() {
     if (!state.deploymentSessionId) return;
-    const suggested = `位姿 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+    const suggested = `${t('deployPose')} ${new Date().toLocaleTimeString(window.EmbodyI18n?.getLang?.() === 'en' ? 'en-US' : 'zh-CN', { hour12: false })}`;
     const name = $('#deploymentPoseName')?.value.trim() || suggested;
     try {
       const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/poses`, {
@@ -808,21 +810,21 @@
       if (poses.length) $('#deploymentPoseSelect').value = poses[poses.length - 1].poseId;
       if ($('#deploymentPoseName')) $('#deploymentPoseName').value = '';
       syncDeploymentPoseButtons();
-      setDeploymentResult(snapshot, '当前模型关节位姿已记录');
-    } catch (error) { setDeploymentResult({ error: error.message }, '记录位姿失败', true); }
+      setDeploymentResult(snapshot, t('deployPoseRecorded'));
+    } catch (error) { setDeploymentResult({ error: error.message }, t('deployPoseRecordFailed'), true); }
   }
 
   async function moveDeploymentPose() {
     const poseId = $('#deploymentPoseSelect')?.value;
     if (!state.deploymentSessionId || !poseId) return;
-    setBusy(true, '正在回到记录位姿', '评测将自动暂停，只控制模型动作向量中的关节。');
+    setBusy(true, t('deployMovingPose'), t('deployMovingPoseHint'));
     try {
       const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/poses/${encodeURIComponent(poseId)}/move`, {
         method: 'POST', body: JSON.stringify({ durationS: 3 })
       });
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, '已回到记录位姿；模型与只读观测继续运行');
-    } catch (error) { setDeploymentResult({ error: error.message }, '一键回位失败', true); }
+      setDeploymentResult(snapshot, t('deployPoseReached'));
+    } catch (error) { setDeploymentResult({ error: error.message }, t('deployPoseMoveFailed'), true); }
     finally { setBusy(false); }
   }
 
@@ -834,8 +836,8 @@
         method: 'DELETE'
       });
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, '记录位姿已删除');
-    } catch (error) { setDeploymentResult({ error: error.message }, '删除位姿失败', true); }
+      setDeploymentResult(snapshot, t('deployPoseDeleted'));
+    } catch (error) { setDeploymentResult({ error: error.message }, t('deployPoseDeleteFailed'), true); }
   }
 
   function downloadDeploymentRecord() {
@@ -857,32 +859,32 @@
     const robotLinked = Boolean(snapshot.components?.tunnel?.active || snapshot.components?.ros?.active || snapshot.components?.client?.active);
     if (robotLinked) {
       state.deploymentRobotConnected = true;
-      const mode = snapshot.clientRuntime?.mode === 'live' ? '动作执行' : '只读观测';
-      setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', `已连接 · ${mode}`);
+      const mode = t(snapshot.clientRuntime?.mode === 'live' ? 'deployActionExecution' : 'deployReadOnlyObservation');
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', `${t('deployConnected')} · ${mode}`);
     } else if (snapshot.state === 'model_ready') {
       state.deploymentRobotConnected = false;
-      setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', '已断开');
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployDisconnected'));
     } else if (precheck?.status === 'failed' || snapshot.state === 'fault') {
       state.deploymentRobotConnected = false;
-      setDeploymentComponentStatus('#deploymentRobotStatus', 'error', '连接失败');
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'error', t('deployConnectionFailed'));
     }
-    else if (snapshot.currentStep === 'precheck') setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', '连接中');
-    else setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', '未检测连接');
+    else if (snapshot.currentStep === 'precheck') setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', t('deployConnecting'));
+    else setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployConnectionUnchecked'));
     const clientStatus = snapshot.components?.client?.status;
     const robotDetail = $('#deploymentRobotDetail');
     if (robotDetail) robotDetail.textContent = robotLinked
-      ? `Client ${clientStatus?.activeState || 'active'}/${clientStatus?.subState || 'running'} · ROS ${snapshot.components?.ros?.active ? 'active' : 'off'} · Tunnel ${snapshot.components?.tunnel?.active ? 'active' : 'off'}${snapshot.clientRuntime?.actionShape ? ` · 动作 ${snapshot.clientRuntime.actionShape.join('×')}` : ''}`
-      : '未建立模型输入所用的相机与关节观测链路';
-    if (snapshot.components?.model?.active) setDeploymentComponentStatus('#deploymentModelStatus', 'ready', '模型已启动');
-    else if (snapshot.currentStep === 'model' || snapshot.currentStep === 'model_health') setDeploymentComponentStatus('#deploymentModelStatus', 'pending', '启动中');
-    else if (snapshot.state === 'fault' && snapshot.modelIo) setDeploymentComponentStatus('#deploymentModelStatus', 'idle', '模型已停止');
-    else if (snapshot.state === 'fault') setDeploymentComponentStatus('#deploymentModelStatus', 'error', '启动失败');
-    else setDeploymentComponentStatus('#deploymentModelStatus', 'idle', '未启动');
+      ? `Client ${clientStatus?.activeState || 'active'}/${clientStatus?.subState || 'running'} · ROS ${snapshot.components?.ros?.active ? 'active' : 'off'} · Tunnel ${snapshot.components?.tunnel?.active ? 'active' : 'off'}${snapshot.clientRuntime?.actionShape ? ` · ${t('deployAction')} ${snapshot.clientRuntime.actionShape.join('×')}` : ''}`
+      : t('deployObservationLinkMissing');
+    if (snapshot.components?.model?.active) setDeploymentComponentStatus('#deploymentModelStatus', 'ready', t('deployModelStarted'));
+    else if (snapshot.currentStep === 'model' || snapshot.currentStep === 'model_health') setDeploymentComponentStatus('#deploymentModelStatus', 'pending', t('deployStartingShort'));
+    else if (snapshot.state === 'fault' && snapshot.modelIo) setDeploymentComponentStatus('#deploymentModelStatus', 'idle', t('deployModelStopped'));
+    else if (snapshot.state === 'fault') setDeploymentComponentStatus('#deploymentModelStatus', 'error', t('deployStartFailed'));
+    else setDeploymentComponentStatus('#deploymentModelStatus', 'idle', t('deployNotStarted'));
     const modelManaged = snapshot.components?.model?.status;
     const modelDetail = $('#deploymentModelDetail');
     if (modelDetail) modelDetail.textContent = snapshot.components?.model?.active
-      ? `${modelManaged?.activeState || 'active'}/${modelManaged?.subState || 'running'}${modelManaged?.pid ? ` · PID ${modelManaged.pid}` : ''}${Number.isFinite(Number(snapshot.clientRuntime?.inferenceLatencyMs)) ? ` · 推理 ${Number(snapshot.clientRuntime.inferenceLatencyMs).toFixed(0)} ms` : ''}`
-      : `模型服务未运行${modelManaged?.result ? ` · ${modelManaged.result}` : ''}`;
+      ? `${modelManaged?.activeState || 'active'}/${modelManaged?.subState || 'running'}${modelManaged?.pid ? ` · PID ${modelManaged.pid}` : ''}${Number.isFinite(Number(snapshot.clientRuntime?.inferenceLatencyMs)) ? ` · ${t('deployInference')} ${Number(snapshot.clientRuntime.inferenceLatencyMs).toFixed(0)} ms` : ''}`
+      : `${t('deployModelServiceStopped')}${modelManaged?.result ? ` · ${modelManaged.result}` : ''}`;
     if (snapshot.scheduler) {
       const scheduler = snapshot.scheduler;
       const fields = [$('#deploymentInferenceMode'), $('#deploymentActionSteps'), $('#deploymentRequestAfterSteps')];
@@ -898,10 +900,10 @@
       else {
         const prefetch = scheduler.mode === 'asynchronous'
           ? ` · ${scheduler.prefetchPolicy === 'auto'
-            ? (Number.isFinite(Number(scheduler.requestAfterSteps)) ? `自动预取（当前第 ${scheduler.requestAfterSteps} 步）` : '自动预取（运行时计算）')
-            : `第 ${scheduler.requestAfterSteps} 步预取`}`
+            ? (Number.isFinite(Number(scheduler.requestAfterSteps)) ? t('deployAutoPrefetchCurrent', { step: scheduler.requestAfterSteps }) : t('deployAutoPrefetchRuntime'))
+            : t('deployPrefetchAt', { step: scheduler.requestAfterSteps })}`
           : '';
-        $('#deploymentSchedulerHint').textContent = `输出 ${scheduler.outputSteps} 步 · 采用 ${scheduler.actionSteps} 步${prefetch} · 已生效`;
+        $('#deploymentSchedulerHint').textContent = t('deploySchedulerEffective', { output: scheduler.outputSteps, used: scheduler.actionSteps, prefetch });
       }
       syncDeploymentButtons(!['disconnected', 'stopped', 'fault'].includes(snapshot.state), snapshot);
     }
@@ -929,7 +931,7 @@
     const previous = select.value;
     select.innerHTML = poses.length
       ? poses.map((pose) => `<option value="${escapeAttr(pose.poseId)}">${escapeHtml(pose.name)}</option>`).join('')
-      : '<option value="">暂无记录位姿</option>';
+      : `<option value="">${escapeHtml(t('deployNoRecordedPose'))}</option>`;
     if (poses.some((pose) => pose.poseId === previous)) select.value = previous;
     syncDeploymentPoseButtons();
   }
@@ -944,8 +946,8 @@
     const hasState = ['dry_run', 'running'].includes(stateName)
       && Array.isArray(state.deploymentSnapshot?.modelIo?.input?.state?.values);
     if (hint) hint.textContent = hasState
-      ? `已获得 ${state.deploymentSnapshot.modelIo.input.state.values.length} 维模型关节状态，可记录当前位姿`
-      : '连接本体并获得模型输入关节状态后可记录';
+      ? t('deployPoseReady', { n: state.deploymentSnapshot.modelIo.input.state.values.length })
+      : t('deployPoseNotReady');
   }
 
   function orchestrationLogRows(snapshot) {
@@ -993,7 +995,7 @@
         <time>${escapeHtml(row.time)}</time>
         <span>${escapeHtml(row.tag)}</span>
         <p>${escapeHtml(row.message)}</p>
-      </div>`).join('') : '<div class="deployment-log-empty">没有匹配的日志</div>';
+      </div>`).join('') : `<div class="deployment-log-empty">${escapeHtml(t('deployNoMatchingLogs'))}</div>`;
     if ($('#deploymentLogAutoscroll')?.checked) output.scrollTop = output.scrollHeight;
   }
 
@@ -1015,7 +1017,7 @@
       });
       renderDeploymentLogRows(componentLogRows(result.lines, source));
     } catch (error) {
-      renderDeploymentLogRows([{ time: '--:--:--', level: 'error', tag: source, message: `日志读取失败：${error.message}` }]);
+      renderDeploymentLogRows([{ time: '--:--:--', level: 'error', tag: source, message: t('deployLogReadFailed', { msg: error.message }) }]);
     } finally {
       state.deploymentLogLoading = false;
     }
@@ -1053,13 +1055,13 @@
         const url = safeModelImageUrl(camera.dataUrl);
         if (!url) return '';
         const size = camera.width && camera.height ? `${camera.width} × ${camera.height}` : 'JPEG';
-        return `<figure class="deployment-camera-card"><img src="${escapeAttr(url)}" alt="${escapeAttr(camera.label || camera.key || '模型图像输入')}"><figcaption><strong>${escapeHtml(camera.label || camera.key || '图像输入')}</strong><small>${escapeHtml(size)}</small></figcaption></figure>`;
+        return `<figure class="deployment-camera-card"><img src="${escapeAttr(url)}" alt="${escapeAttr(camera.label || camera.key || t('deployModelImageInput'))}"><figcaption><strong>${escapeHtml(camera.label || camera.key || t('deployImageInput'))}</strong><small>${escapeHtml(size)}</small></figcaption></figure>`;
       }).join('')
-      : '<div class="deployment-io-empty">当前模型输入没有图像</div>';
-    $('#deploymentInputMeta').textContent = input.prompt ? `Prompt · ${input.prompt}` : '实际模型输入';
+      : `<div class="deployment-io-empty">${escapeHtml(t('deployNoInputImages'))}</div>`;
+    $('#deploymentInputMeta').textContent = input.prompt ? `Prompt · ${input.prompt}` : t('deployActualModelInput');
 
     const inputState = input.state;
-    $('#deploymentStateLabel').textContent = inputState?.label || '状态输入';
+    $('#deploymentStateLabel').textContent = inputState?.label || t('deployStateInput');
     $('#deploymentStateKey').textContent = inputState?.key || '—';
     const stateValues = Array.isArray(inputState?.values) ? inputState.values : [];
     $('#deploymentStateGrid').innerHTML = stateValues.length
@@ -1067,7 +1069,7 @@
         const name = inputState.names?.[index] || `state_${index + 1}`;
         return `<div class="deployment-vector-item"><strong title="${escapeAttr(name)}">${escapeHtml(name)}</strong><span>${escapeHtml(formatModelIoValue(value))}</span><small>${escapeHtml(inputState.units?.[index] || '')}</small></div>`;
       }).join('')
-      : '<div class="deployment-io-empty">当前模型输入没有状态向量</div>';
+      : `<div class="deployment-io-empty">${escapeHtml(t('deployNoStateVector'))}</div>`;
 
     const output = modelIo.output;
     const action = output.action || {};
@@ -1075,17 +1077,17 @@
     const width = chunk[0]?.length || 0;
     $('#deploymentActionShape').textContent = chunk.length && width ? `${chunk.length} × ${width}` : '—';
     const latencyText = Number.isFinite(Number(output.inferenceLatencyMs))
-      ? `推理 ${Number(output.inferenceLatencyMs).toFixed(1)} ms`
-      : '模型动作输出';
+      ? `${t('deployInference')} ${Number(output.inferenceLatencyMs).toFixed(1)} ms`
+      : t('deployModelActionOutput');
     const pipeline = output.pipeline || {};
     const timingParts = [
-      Number.isFinite(Number(pipeline.observationMs)) ? `观测 ${Number(pipeline.observationMs).toFixed(1)} ms` : '',
-      Number.isFinite(Number(pipeline.requestSerializationMs)) ? `编码 ${Number(pipeline.requestSerializationMs).toFixed(1)} ms` : '',
-      Number.isFinite(Number(runtimeTiming?.scheduleLagMeanMs)) ? `调度抖动 ${Number(runtimeTiming.scheduleLagMeanMs).toFixed(1)} ms` : '',
+      Number.isFinite(Number(pipeline.observationMs)) ? `${t('deployObservation')} ${Number(pipeline.observationMs).toFixed(1)} ms` : '',
+      Number.isFinite(Number(pipeline.requestSerializationMs)) ? `${t('deployEncoding')} ${Number(pipeline.requestSerializationMs).toFixed(1)} ms` : '',
+      Number.isFinite(Number(runtimeTiming?.scheduleLagMeanMs)) ? `${t('deployScheduleJitter')} ${Number(runtimeTiming.scheduleLagMeanMs).toFixed(1)} ms` : '',
     ].filter(Boolean);
     const detailedLatency = `${latencyText}${timingParts.length ? ` · ${timingParts.join(' · ')}` : ''}`;
     $('#deploymentOutputMeta').textContent = dryRunSafety?.passed === false
-      ? `${detailedLatency} · 动作校验未通过`
+      ? `${detailedLatency} · ${t('deployActionValidationFailed')}`
       : detailedLatency;
     renderDeploymentActionTrajectory(action, chunk, trajectoryHistory);
     $('#deploymentActionGrid').innerHTML = width
@@ -1098,7 +1100,7 @@
         const name = action.names?.[index] || `action_${index + 1}`;
         return `<div class="deployment-vector-item output"><strong title="${escapeAttr(name)}">${escapeHtml(name)}</strong><span>${escapeHtml(formatModelIoValue(first))}</span><small>${escapeHtml(`${formatModelIoValue(minimum)} ～ ${formatModelIoValue(maximum)}${unit ? ` ${unit}` : ''}`)}</small></div>`;
       }).join('')
-      : '<div class="deployment-io-empty">尚无模型动作输出</div>';
+      : `<div class="deployment-io-empty">${escapeHtml(t('deployNoActionOutput'))}</div>`;
   }
 
   const deploymentTrajectoryColors = [
@@ -1109,10 +1111,10 @@
     const names = Array.from({ length: width }, (_, index) => action.names?.[index] || `action_${index + 1}`);
     const indexes = (predicate) => names.map((name, index) => predicate(name.toLowerCase(), index) ? index : -1).filter((index) => index >= 0);
     const groups = [
-      { id: 'left', label: '左臂', indexes: indexes((name) => name.includes('left') && !name.includes('gripper')) },
-      { id: 'right', label: '右臂', indexes: indexes((name) => name.includes('right') && !name.includes('gripper')) },
-      { id: 'gripper', label: '夹爪', indexes: indexes((name) => name.includes('gripper') || name.includes('effector')) },
-      { id: 'all', label: '全部', indexes: Array.from({ length: width }, (_, index) => index) },
+      { id: 'left', label: t('deployLeftArm'), indexes: indexes((name) => name.includes('left') && !name.includes('gripper')) },
+      { id: 'right', label: t('deployRightArm'), indexes: indexes((name) => name.includes('right') && !name.includes('gripper')) },
+      { id: 'gripper', label: t('deployGripper'), indexes: indexes((name) => name.includes('gripper') || name.includes('effector')) },
+      { id: 'all', label: t('filterAll'), indexes: Array.from({ length: width }, (_, index) => index) },
     ].filter((group) => group.indexes.length);
     return { names, groups };
   }
@@ -1128,13 +1130,13 @@
         source: 'chunk',
         rows: chunk,
         xValues: chunk.map((_, index) => index + 1),
-        xLabel: '动作步',
+        xLabel: t('deployActionStep'),
         names: action.names || [],
         units: action.units || [],
       };
     }
     if (!points.length) {
-      return { source, rows: [], xValues: [], xLabel: `最近 ${windowSeconds} 秒`, names: history?.names || action.names || [], units: history?.units || action.units || [] };
+      return { source, rows: [], xValues: [], xLabel: t('deployRecentSeconds', { n: windowSeconds }), names: history?.names || action.names || [], units: history?.units || action.units || [] };
     }
     const latest = Math.max(...points.map((point) => Number(point.tNs)).filter(Number.isFinite));
     const cutoff = latest - windowSeconds * 1e9;
@@ -1144,7 +1146,7 @@
       source,
       rows: points.map((point) => point.values),
       xValues: points.map((point) => (Number(point.tNs) - latest) / 1e9),
-      xLabel: `最近 ${windowSeconds} 秒`,
+      xLabel: t('deployRecentSeconds', { n: windowSeconds }),
       names: stateSource ? (history.stateNames || action.names || []) : (history.names || action.names || []),
       units: stateSource ? (history.stateUnits || action.units || []) : (history.units || action.units || []),
     };
@@ -1166,7 +1168,7 @@
     const rows = data.rows || [];
     const width = rows[0]?.length || 0;
     if (!width || !rows.length) {
-      legend.innerHTML = '<span>等待动作输出</span>';
+      legend.innerHTML = `<span>${escapeHtml(t('deployWaitingActionOutput'))}</span>`;
       return;
     }
     const sourceAction = { names: data.names, units: data.units };
@@ -1271,7 +1273,7 @@
     });
     context.fillStyle = '#64748b';
     context.textAlign = 'center';
-    context.fillText(`${data.xLabel}${perDimension ? ' · 各维独立量程' : ''}`, margin.left + plotWidth / 2, cssHeight - 2);
+    context.fillText(`${data.xLabel}${perDimension ? ` · ${t('deployPerDimensionScale')}` : ''}`, margin.left + plotWidth / 2, cssHeight - 2);
   }
 
   function onDeploymentTrajectoryGroup(event) {
@@ -1306,13 +1308,13 @@
         result = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/logs`, {
           method: 'POST', body: JSON.stringify({ component, lines: 200 })
         });
-        setDeploymentResult(result, `${component} 最近日志`);
+        setDeploymentResult(result, t('deployRecentComponentLogs', { component }));
       } else {
-        if (!window.confirm(`确认重启 ${component}？相关依赖会执行安全检查。`)) return;
-        setBusy(true, `正在重启 ${component}`, '等待远端 systemd 和健康检查');
+        if (!window.confirm(t('deployRestartConfirm', { component }))) return;
+        setBusy(true, t('deployRestarting', { component }), t('deployRestartingHint'));
         result = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/components/${encodeURIComponent(component)}/restart`, { method: 'POST' });
         renderDeploymentSnapshot(result);
-        setDeploymentResult(result, `${component} 已重启`);
+        setDeploymentResult(result, t('deployRestarted', { component }));
       }
     } catch (error) {
       setDeploymentResult({ component, error: error.message }, t('deployFailed'), true);
@@ -1331,7 +1333,7 @@
     }
     container.innerHTML = hosts.map(([name, host]) => `<article class="deployment-host-card">
       <div class="deployment-host-head"><strong>${escapeHtml(name)}</strong><code>${escapeHtml(`${host.user}@${host.address}:${host.port || 22}`)}</code></div>
-      <div class="muted">连接：${escapeHtml(host.connection === 'local' ? 'Embodit 本机' : 'SSH')} · 认证：${escapeHtml(host.connection === 'local' ? '无需管理认证' : (host.auth?.type || '未配置'))} · systemd：${escapeHtml(host.service_manager || 'system')} · ${escapeHtml(host.connection === 'local' ? '模型命令由 Embodit 直接执行' : '启动编排时自动连接、固定 host key 并检测运行环境')}</div>
+      <div class="muted">${escapeHtml(t('deployConnectionLabel'))}：${escapeHtml(host.connection === 'local' ? t('deployLocalHost') : 'SSH')} · ${escapeHtml(t('deployAuthLabel'))}：${escapeHtml(host.connection === 'local' ? t('deployNoManagedAuth') : (host.auth?.type || t('deployNotConfigured')))} · systemd：${escapeHtml(host.service_manager || 'system')} · ${escapeHtml(host.connection === 'local' ? t('deployLocalExecutionHint') : t('deploySshExecutionHint'))}</div>
     </article>`).join('');
   }
 
@@ -1394,6 +1396,13 @@
     try {
       if ($('#deploymentRobotConfig')?.value.trim() && $('#deploymentModelConfig')?.value.trim()) {
         refreshDeploymentComposition(false).catch(() => {});
+      }
+    } catch {}
+    try {
+      if (state.deploymentSnapshot) renderDeploymentSnapshot(state.deploymentSnapshot);
+      else {
+        setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployConnectionUnchecked'));
+        setDeploymentComponentStatus('#deploymentModelStatus', 'idle', t('deployNotStarted'));
       }
     } catch {}
   }

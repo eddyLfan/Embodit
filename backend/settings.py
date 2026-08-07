@@ -41,8 +41,9 @@ HDF5_DEFAULT_FPS = _env_float("EMBODIT_HDF5_FPS", 20.0)
 # (override: EMBODIT_MCAP_GAP_S).
 MCAP_GAP_S = _env_float("EMBODIT_MCAP_GAP_S", 2.0)
 
-# Restrict client-supplied paths to the browse root. Off by default so users
-# can browse anywhere on the machine; set EMBODIT_SANDBOX=1 to enforce.
+# Restrict client-supplied paths to the browse root. ``embodit.sh`` enables
+# this automatically for non-loopback listeners; direct app launches can set
+# EMBODIT_SANDBOX=1 explicitly.
 SANDBOX_PATHS = os.environ.get("EMBODIT_SANDBOX", "").strip() in {"1", "true", "yes"}
 
 # Human-review dropdown options. The server reads this file on each page load,
