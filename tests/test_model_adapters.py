@@ -1,3 +1,4 @@
+import dataclasses
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -26,6 +27,15 @@ def test_native_observation_decodes_ros_rgb_image() -> None:
 
 
 def test_openpi_adapter_loads_and_predicts_from_checkpoint(monkeypatch) -> None:
+    @dataclasses.dataclass(frozen=True)
+    class ModelConfig:
+        action_horizon: int = 10
+
+    @dataclasses.dataclass(frozen=True)
+    class TrainConfig:
+        name: str
+        model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
+
     class Policy:
         metadata = {"action_dim": 2}
 
@@ -36,18 +46,24 @@ def test_openpi_adapter_loads_and_predicts_from_checkpoint(monkeypatch) -> None:
     def get_config(name):
         if name != "pi0_droid":
             raise KeyError(name)
-        return SimpleNamespace(name=name)
+        return TrainConfig(name=name)
 
     training_config = SimpleNamespace(get_config=get_config)
-    policy_config = SimpleNamespace(create_trained_policy=lambda *_args, **_kwargs: Policy())
+    received = {}
+    def create_trained_policy(config, *_args, **_kwargs):
+        received["action_horizon"] = config.model.action_horizon
+        return Policy()
+    policy_config = SimpleNamespace(create_trained_policy=create_trained_policy)
     _module(monkeypatch, "openpi")
     _module(monkeypatch, "openpi.policies", policy_config=policy_config)
     _module(monkeypatch, "openpi.training", config=training_config)
 
     adapter = OpenPIAdapter()
-    adapter.load("/root/checkpoints/pi0_droid/10000")
+    adapter.load("/root/checkpoints/pi0_droid/10000", action_horizon=50)
     actions = adapter.predict({"state": [0.1, 0.2]})
     assert adapter.specification["config_name"] == "pi0_droid"
+    assert adapter.specification["action_horizon"] == 50
+    assert received["action_horizon"] == 50
     assert actions.tolist() == [[1.0, 2.0]]
 
 

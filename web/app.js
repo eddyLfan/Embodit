@@ -54,6 +54,14 @@
     deploymentSnapshot: null,
     deploymentRobotConnected: false,
     deploymentConfigCache: { robot: new Map(), model: new Map() },
+    deploymentTrajectoryGroup: 'left',
+    deploymentTrajectorySource: 'state',
+    deploymentLogRefreshTick: 0,
+    deploymentLogLoading: false,
+    deploymentLogRows: [],
+    deploymentLogClearMarkers: {},
+    deploymentSchedulerDirty: false,
+    deploymentSchedulerApplying: false,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -158,17 +166,48 @@
     $('#openDeployment')?.addEventListener('click', openDeploymentWorkspace);
     $('#deploymentRobotSelect')?.addEventListener('change', () => loadSelectedDeploymentConfigs().catch((error) => setDeploymentResult({ error: error.message }, t('deployFailed'), true)));
     $('#deploymentModelSelect')?.addEventListener('change', () => loadSelectedDeploymentConfigs().catch((error) => setDeploymentResult({ error: error.message }, t('deployFailed'), true)));
-    $('#deploymentTaskPrompt')?.addEventListener('input', () => refreshDeploymentComposition(false).catch(() => {}));
+    $('#deploymentTaskPrompt')?.addEventListener('input', onDeploymentPromptInput);
     $('#checkDeploymentRobot')?.addEventListener('click', checkDeploymentRobotConnection);
     $('#prepareDeploymentModel')?.addEventListener('click', prepareDeploymentModel);
-    $('#validateDeployment')?.addEventListener('click', validateDeploymentRecipe);
-    $('#doctorDeployment')?.addEventListener('click', doctorDeployment);
-    $('#quickstartDeployment')?.addEventListener('click', quickstartDeployment);
+    $('#disconnectDeploymentRobot')?.addEventListener('click', disconnectDeploymentRobot);
+    $('#closeDeploymentModel')?.addEventListener('click', closeDeploymentModel);
+    $('#applyDeploymentPrompt')?.addEventListener('click', applyDeploymentPrompt);
+    $('#applyDeploymentScheduler')?.addEventListener('click', applyDeploymentScheduler);
+    ['#deploymentInferenceMode', '#deploymentActionSteps', '#deploymentRequestAfterSteps'].forEach((selector) => {
+      $(selector)?.addEventListener('input', onDeploymentSchedulerInput);
+    });
     $('#stopDeployment')?.addEventListener('click', stopDeploymentSession);
     $('#startLiveDeployment')?.addEventListener('click', startLiveDeployment);
-    $('#emergencyStopDeployment')?.addEventListener('click', emergencyStopDeployment);
-    $('#downloadDeploymentRecord')?.addEventListener('click', downloadDeploymentRecord);
-    $('#deploymentComponents')?.addEventListener('click', onDeploymentComponentAction);
+    $('#stopLiveDeployment')?.addEventListener('click', stopLiveDeployment);
+    $('#recordDeploymentPose')?.addEventListener('click', recordDeploymentPose);
+    $('#moveDeploymentPose')?.addEventListener('click', moveDeploymentPose);
+    $('#deleteDeploymentPose')?.addEventListener('click', deleteDeploymentPose);
+    $('#deploymentPoseSelect')?.addEventListener('change', syncDeploymentPoseButtons);
+    $('#deploymentLogSource')?.addEventListener('change', () => refreshDeploymentExecutionLog(true));
+    $('#refreshDeploymentLog')?.addEventListener('click', () => refreshDeploymentExecutionLog(true));
+    $('#deploymentLogFilter')?.addEventListener('input', () => renderDeploymentLogRows(state.deploymentLogRows));
+    $('#clearDeploymentLogView')?.addEventListener('click', () => {
+      const source = $('#deploymentLogSource')?.value || 'orchestration';
+      if (source === 'orchestration') {
+        const events = state.deploymentSnapshot?.events || [];
+        state.deploymentLogClearMarkers[source] = events.at(-1)?.timeNs || Date.now() * 1e6;
+      } else {
+        state.deploymentLogClearMarkers[source] = state.deploymentLogRows.at(-1)?.message || null;
+      }
+      state.deploymentLogRows = [];
+      const output = $('#deploymentExecutionLog');
+      if (output) output.innerHTML = '<div class="deployment-log-empty">日志已清空，等待新内容…</div>';
+    });
+    $('#deploymentTrajectoryGroups')?.addEventListener('click', onDeploymentTrajectoryGroup);
+    $('#deploymentTrajectorySource')?.addEventListener('change', renderCurrentDeploymentTrajectory);
+    $('#deploymentTrajectoryWindow')?.addEventListener('change', renderCurrentDeploymentTrajectory);
+    $('#deploymentTrajectoryScale')?.addEventListener('change', renderCurrentDeploymentTrajectory);
+    window.addEventListener('resize', () => {
+      if (state.primaryLayer !== 'deploy') return;
+      const action = state.deploymentSnapshot?.modelIo?.output?.action || {};
+      const chunk = Array.isArray(action.chunk) ? action.chunk.filter(Array.isArray) : [];
+      renderDeploymentActionTrajectory(action, chunk, state.deploymentSnapshot?.trajectoryHistory);
+    });
   }
 
   function activatePrimaryLayer(layer) {
@@ -252,6 +291,7 @@
     if (taskPrompt && robot.robot?.client) {
       robot.robot.client.config = { ...(robot.robot.client.config || {}), task_prompt: taskPrompt };
     }
+    applySchedulerFormToRobot(robot);
     const result = await api('/api/deploy/compose', {
       method: 'POST',
       body: JSON.stringify({
@@ -301,7 +341,7 @@
       const select = $(kind === 'robot' ? '#deploymentRobotSelect' : '#deploymentModelSelect');
       const previous = select.value;
       select.innerHTML = metadata[kind].map((item) =>
-        `<option value="${escapeAttr(item.configId)}">${escapeHtml(item.name)} · ${escapeHtml(item.configId.replace(/^__example_|__$/g, ''))}</option>`
+        `<option value="${escapeAttr(item.configId)}">${escapeHtml(item.name)} · ${escapeHtml(item.configId.replace(/^__example_|__$/g, ''))}${item.source === 'project' ? ' · 项目配置' : ''}</option>`
       ).join('');
       select.value = metadata[kind].some((item) => item.configId === previous) ? previous : metadata[kind][0].configId;
     }
@@ -326,12 +366,117 @@
     ]);
     writeDeploymentConfig('robot', robot);
     writeDeploymentConfig('model', model);
+    configureDeploymentPrompts(robot);
+    configureDeploymentScheduler(robot, model);
     syncDeploymentCompositionIdentity();
     await refreshDeploymentComposition(false);
     setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', '未检测连接');
     setDeploymentComponentStatus('#deploymentModelStatus', 'idle', '未启动');
     state.deploymentRobotConnected = false;
     syncDeploymentButtons(false);
+  }
+
+  function configureDeploymentPrompts(robot) {
+    const config = robot?.robot?.client?.config || {};
+    const prompts = Array.from(new Set([
+      ...(Array.isArray(config.task_prompts) ? config.task_prompts : []),
+      config.default_prompt,
+    ].filter((value) => typeof value === 'string' && value.trim()).map((value) => value.trim())));
+    const list = $('#deploymentTaskPromptOptions');
+    if (list) list.innerHTML = prompts.map((prompt) => `<option value="${escapeAttr(prompt)}"></option>`).join('');
+    const input = $('#deploymentTaskPrompt');
+    if (input && (!input.value.trim() || !state.deploymentSessionId)) input.value = config.default_prompt || prompts[0] || '';
+    const hint = $('#deploymentPromptHint');
+    if (hint) hint.textContent = prompts.length ? `配置中有 ${prompts.length} 个可选 Prompt` : '可直接输入自定义 Prompt';
+  }
+
+  function configureDeploymentScheduler(robot, model = null) {
+    const config = robot?.robot?.client?.config || {};
+    const control = config.control || {};
+    const robotHorizon = Number(config.action?.horizon) || 1;
+    const horizon = Number(model?.model?.action_horizon) || robotHorizon;
+    const mode = control.inference_mode || 'synchronous';
+    const requestAfter = control.asynchronous?.request_after_steps ?? 'auto';
+    const configuredActionSteps = Number(control.action_steps) || robotHorizon;
+    const actionSteps = horizon !== robotHorizon && configuredActionSteps === robotHorizon
+      ? horizon
+      : Math.min(horizon, configuredActionSteps);
+    $('#deploymentInferenceMode').value = mode;
+    $('#deploymentActionSteps').value = String(actionSteps);
+    $('#deploymentActionSteps').max = String(horizon);
+    $('#deploymentRequestAfterSteps').value = String(requestAfter);
+    state.deploymentSchedulerDirty = false;
+    state.deploymentSchedulerApplying = false;
+    syncDeploymentSchedulerControls();
+    renderDeploymentSchedulerHint(`模型输出 ${horizon} 步 · 控制 ${Number(control.rate_hz || 10)} Hz`);
+  }
+
+  function syncDeploymentSchedulerControls() {
+    const asynchronous = $('#deploymentInferenceMode')?.value === 'asynchronous';
+    $('#deploymentPrefetchField')?.classList.toggle('hidden', !asynchronous);
+    if ($('#deploymentRequestAfterSteps')) $('#deploymentRequestAfterSteps').disabled = !asynchronous;
+  }
+
+  function deploymentSchedulerForm() {
+    const horizon = Number($('#deploymentActionSteps')?.max) || 1;
+    const actionSteps = Number($('#deploymentActionSteps')?.value);
+    const mode = $('#deploymentInferenceMode')?.value || 'synchronous';
+    const raw = ($('#deploymentRequestAfterSteps')?.value || 'auto').trim().toLowerCase();
+    const requestAfterSteps = raw === 'auto' ? 'auto' : Number(raw);
+    let error = '';
+    if (!Number.isInteger(actionSteps) || actionSteps < 1 || actionSteps > horizon) {
+      error = `采用步数必须在 1 到 ${horizon} 之间`;
+    } else if (mode === 'asynchronous' && requestAfterSteps !== 'auto'
+      && (!Number.isInteger(requestAfterSteps) || requestAfterSteps < 1 || requestAfterSteps >= actionSteps)) {
+      error = '预取点必须是 auto，或小于采用步数的正整数';
+    }
+    return { mode, horizon, actionSteps, requestAfterSteps, error };
+  }
+
+  function renderDeploymentSchedulerHint(prefix = '') {
+    const form = deploymentSchedulerForm();
+    const mode = form.mode === 'asynchronous' ? '异步' : '同步';
+    const prefetch = form.mode === 'asynchronous'
+      ? ` · ${form.requestAfterSteps === 'auto' ? '自动预取' : `第 ${form.requestAfterSteps} 步预取`}`
+      : '';
+    const status = state.deploymentSchedulerDirty ? ' · 待应用' : '';
+    $('#deploymentSchedulerHint').textContent = form.error
+      || `${prefix ? `${prefix} · ` : ''}${mode} · 采用 ${form.actionSteps}/${form.horizon} 步${prefetch}${status}`;
+  }
+
+  function onDeploymentSchedulerInput() {
+    state.deploymentSchedulerDirty = true;
+    syncDeploymentSchedulerControls();
+    renderDeploymentSchedulerHint();
+    syncDeploymentButtons(Boolean(state.deploymentSessionId), state.deploymentSnapshot);
+  }
+
+  function applySchedulerFormToRobot(robot) {
+    const client = robot?.robot?.client;
+    if (!client) return;
+    const config = client.config = { ...(client.config || {}) };
+    const horizon = Number($('#deploymentActionSteps')?.max) || Number(config.action?.horizon) || 1;
+    const actionSteps = Math.max(1, Math.min(horizon, Number($('#deploymentActionSteps')?.value) || horizon));
+    const mode = $('#deploymentInferenceMode')?.value || 'synchronous';
+    const raw = ($('#deploymentRequestAfterSteps')?.value || 'auto').trim().toLowerCase();
+    const requestAfterSteps = raw === 'auto' ? 'auto' : Number(raw);
+    config.action = { ...(config.action || {}), horizon };
+    config.control = {
+      ...(config.control || {}),
+      inference_mode: mode,
+      action_steps: actionSteps,
+      asynchronous: {
+        ...(config.control?.asynchronous || {}),
+        request_after_steps: requestAfterSteps,
+        latency_margin_ms: Number(config.control?.asynchronous?.latency_margin_ms ?? 30),
+      },
+    };
+  }
+
+  function onDeploymentPromptInput() {
+    const button = $('#applyDeploymentPrompt');
+    if (button) button.disabled = !state.deploymentSessionId || !$('#deploymentTaskPrompt')?.value.trim();
+    if (!state.deploymentSessionId) refreshDeploymentComposition(false).catch(() => {});
   }
 
   function setDeploymentResult(payload, hint = '', error = false) {
@@ -360,17 +505,33 @@
 
   function syncDeploymentButtons(active, snapshot = null) {
     const modelReady = snapshot?.state === 'model_ready' && snapshot?.components?.model?.active;
-    const runningStack = ['starting', 'dry_run', 'running'].includes(snapshot?.state);
+    const paused = snapshot?.state === 'dry_run' && snapshot?.components?.model?.active;
+    const running = snapshot?.state === 'running';
+    const changing = snapshot?.state === 'starting';
+    const robotLinked = Boolean(snapshot?.components?.tunnel?.active || snapshot?.components?.ros?.active || snapshot?.components?.client?.active);
+    const modelActive = Boolean(snapshot?.components?.model?.active);
     $('#prepareDeploymentModel').disabled = active;
-    $('#checkDeploymentRobot').disabled = active;
-    $('#quickstartDeployment').disabled = !modelReady;
+    $('#checkDeploymentRobot').disabled = changing || robotLinked || Boolean(state.deploymentSessionId && !modelReady);
+    $('#disconnectDeploymentRobot').disabled = changing || !robotLinked;
+    $('#closeDeploymentModel').disabled = changing || !modelActive;
     $('#stopDeployment').disabled = !active;
-    $('#emergencyStopDeployment').disabled = !active;
-    $('#startLiveDeployment').disabled = !active || snapshot?.state !== 'dry_run';
-    $('#downloadDeploymentRecord').disabled = !active;
+    $('#stopDeployment').hidden = !active;
+    $('#startLiveDeployment').disabled = !active || (!modelReady && !paused) || changing;
+    $('#startLiveDeployment').textContent = paused ? '继续评测' : '开始评测';
+    $('#stopLiveDeployment').disabled = !active || !running;
     $('#deploymentRobotSelect').disabled = active;
     $('#deploymentModelSelect').disabled = active;
-    $('#deploymentTaskPrompt').disabled = runningStack;
+    $('#deploymentTaskPrompt').disabled = changing;
+    $('#applyDeploymentPrompt').disabled = !active || changing || !$('#deploymentTaskPrompt')?.value.trim();
+    const scheduler = deploymentSchedulerForm();
+    const schedulerContextReady = !state.deploymentSessionId || (active && modelActive);
+    $('#applyDeploymentScheduler').disabled = changing || state.deploymentSchedulerApplying
+      || !schedulerContextReady || !state.deploymentSchedulerDirty || Boolean(scheduler.error);
+    $('#applyDeploymentScheduler').textContent = state.deploymentSchedulerApplying ? '应用中…' : '应用';
+    const canRecord = active && ['dry_run', 'running'].includes(snapshot?.state)
+      && Array.isArray(snapshot?.modelIo?.input?.state?.values);
+    $('#recordDeploymentPose').disabled = !canRecord;
+    syncDeploymentPoseButtons();
   }
 
   async function validateDeploymentRecipe() {
@@ -411,6 +572,18 @@
     button.disabled = true;
     setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', '连接中');
     try {
+      const snapshot = state.deploymentSnapshot;
+      if (state.deploymentSessionId && snapshot?.state === 'model_ready' && snapshot?.components?.model?.active) {
+        const prompt = $('#deploymentTaskPrompt')?.value.trim();
+        if (!prompt) throw new Error('请先填写任务 Prompt');
+        const connected = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/start-dry-run`, {
+          method: 'POST', body: JSON.stringify({ taskPrompt: prompt })
+        });
+        renderDeploymentSnapshot(connected);
+        setDeploymentResult(connected, '正在建立本体只读观测链路');
+        startDeploymentPolling();
+        return true;
+      }
       const result = await api('/api/deploy/robot-connection', {
         method: 'POST', body: JSON.stringify({ config: deploymentConfig('robot') })
       });
@@ -423,7 +596,7 @@
       setDeploymentResult({ error: error.message }, '本体连接失败', true);
       return false;
     } finally {
-      button.disabled = Boolean(state.deploymentSessionId);
+      syncDeploymentButtons(Boolean(state.deploymentSessionId), state.deploymentSnapshot);
     }
   }
 
@@ -454,31 +627,34 @@
     }
   }
 
-  async function quickstartDeployment() {
-    const taskPrompt = $('#deploymentTaskPrompt')?.value.trim() || '';
-    if (!taskPrompt) {
-      setDeploymentResult({ error: '请先选择或填写任务 Prompt' }, '缺少任务 Prompt', true);
-      $('#deploymentTaskPrompt')?.focus();
-      return;
-    }
-    if (!state.deploymentSessionId || state.deploymentSnapshot?.state !== 'model_ready') {
-      setDeploymentResult({ error: '请先启动模型并等待模型就绪' }, '模型尚未就绪', true);
-      return;
-    }
-    setBusy(true, t('deployStarting'), t('deployStartingHint'));
+  async function disconnectDeploymentRobot() {
+    if (!state.deploymentSessionId) return;
+    setBusy(true, '正在断开本体', '停止 Client、ROS 与通信隧道；模型保持运行。');
     try {
-      await refreshDeploymentComposition(false);
-      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/start-dry-run`, {
-        method: 'POST', body: JSON.stringify({ taskPrompt })
-      });
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/disconnect-robot`, { method: 'POST' });
+      state.deploymentRobotConnected = false;
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, 'Dry Run 已启动；不会发送真实动作');
-      startDeploymentPolling();
+      setDeploymentResult(snapshot, '本体已断开；模型保持运行，可随时重新开始评测');
     } catch (error) {
-      setDeploymentResult({ error: error.message }, t('deployFailed'), true);
-    } finally {
-      setBusy(false);
-    }
+      setDeploymentResult({ error: error.message }, '断开本体失败', true);
+    } finally { setBusy(false); }
+  }
+
+  async function closeDeploymentModel() {
+    if (!state.deploymentSessionId) return;
+    setBusy(true, '正在关闭模型', '停止本体通信与模型推理服务。');
+    try {
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/close-model`, { method: 'POST' });
+      renderDeploymentSnapshot(snapshot);
+      setDeploymentResult(snapshot, '模型与本体通信均已关闭');
+      stopDeploymentPolling();
+      state.deploymentSessionId = null;
+      state.deploymentRuntimeKind = null;
+      state.deploymentRobotConnected = false;
+      syncDeploymentButtons(false);
+    } catch (error) {
+      setDeploymentResult({ error: error.message }, '关闭模型失败', true);
+    } finally { setBusy(false); }
   }
 
   function startDeploymentPolling() {
@@ -496,12 +672,16 @@
     try {
       const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}`);
       renderDeploymentSnapshot(snapshot);
-      if (['fault', 'stopped', 'disconnected'].includes(snapshot.state)) {
+      const anyManagedActive = Object.values(snapshot.components || {}).some((component) => component?.active);
+      if (['stopped', 'disconnected'].includes(snapshot.state) || (snapshot.state === 'fault' && !anyManagedActive)) {
         stopDeploymentPolling();
         setDeploymentResult(snapshot, snapshot.lastError || `部署已${snapshot.state}`, snapshot.state === 'fault');
         state.deploymentSessionId = null;
         state.deploymentRuntimeKind = null;
         syncDeploymentButtons(false);
+      } else if (snapshot.state === 'fault') {
+        stopDeploymentPolling();
+        setDeploymentResult(snapshot, snapshot.lastError || '部署发生故障；可断开本体或关闭模型', true);
       }
     } catch (error) {
       stopDeploymentPolling();
@@ -531,30 +711,131 @@
 
   async function startLiveDeployment() {
     if (!state.deploymentSessionId) return;
+    const taskPrompt = $('#deploymentTaskPrompt')?.value.trim() || '';
+    if (!taskPrompt) {
+      setDeploymentResult({ error: '请先选择或填写任务 Prompt' }, '缺少任务 Prompt', true);
+      $('#deploymentTaskPrompt')?.focus();
+      return;
+    }
     try {
       const base = '/api/deploy/orchestrations';
-      const challenge = await api(`${base}/${encodeURIComponent(state.deploymentSessionId)}/arm-challenge`, { method: 'POST' });
-      const confirmation = window.prompt(`真机动作安全确认\n\n请逐字输入：\n${challenge.phrase}`);
-      if (!confirmation) return;
-      const snapshot = await api(`${base}/${encodeURIComponent(state.deploymentSessionId)}/start-live`, {
-        method: 'POST', body: JSON.stringify({ confirmation })
+      const snapshot = await api(`${base}/${encodeURIComponent(state.deploymentSessionId)}/start-evaluation`, {
+        method: 'POST', body: JSON.stringify({ taskPrompt })
       });
       renderDeploymentSnapshot(snapshot);
       startDeploymentPolling();
-      setDeploymentResult(snapshot, '真机循环运行中');
+      setDeploymentResult(snapshot, snapshot.state === 'starting' ? '正在连接本体并开始评测' : '真机循环运行中');
     } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
   }
 
-  async function emergencyStopDeployment() {
-    if (!state.deploymentSessionId || !window.confirm('立即停止动作、断开本体与模型并将会话置为故障？')) return;
-    stopDeploymentPolling();
+  async function stopLiveDeployment() {
+    if (!state.deploymentSessionId || state.deploymentSnapshot?.state !== 'running') return;
     try {
-      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/emergency-stop`, {
-        method: 'POST', body: JSON.stringify({ reason: '用户从网页触发急停' })
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/stop-evaluation`, {
+        method: 'POST'
       });
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, '急停已执行', true);
+      startDeploymentPolling();
+      setDeploymentResult(snapshot, '评测已暂停；模型与观测保持运行，可立即继续或切换 Prompt');
     } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
+  }
+
+  async function applyDeploymentPrompt() {
+    if (!state.deploymentSessionId) return;
+    const taskPrompt = $('#deploymentTaskPrompt')?.value.trim() || '';
+    if (!taskPrompt) return;
+    const button = $('#applyDeploymentPrompt');
+    button.disabled = true;
+    try {
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/prompt`, {
+        method: 'POST', body: JSON.stringify({ taskPrompt })
+      });
+      renderDeploymentSnapshot(snapshot);
+      setDeploymentResult(snapshot, `Prompt 已切换：${taskPrompt}`);
+    } catch (error) {
+      setDeploymentResult({ error: error.message }, 'Prompt 切换失败', true);
+    } finally {
+      syncDeploymentButtons(true, state.deploymentSnapshot);
+    }
+  }
+
+  async function applyDeploymentScheduler() {
+    const form = deploymentSchedulerForm();
+    if (form.error) {
+      setDeploymentResult({ error: form.error }, '调度配置无效', true);
+      return;
+    }
+    state.deploymentSchedulerApplying = true;
+    syncDeploymentButtons(Boolean(state.deploymentSessionId), state.deploymentSnapshot);
+    try {
+      if (!state.deploymentSessionId) {
+        await refreshDeploymentComposition(false);
+        state.deploymentSchedulerDirty = false;
+        renderDeploymentSchedulerHint();
+        setDeploymentResult({ scheduler: form }, '调度配置将在启动模型时生效');
+        return;
+      }
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/scheduler`, {
+        method: 'POST',
+        body: JSON.stringify({
+          mode: form.mode,
+          actionSteps: form.actionSteps,
+          requestAfterSteps: form.requestAfterSteps,
+          latencyMarginMs: 30,
+        }),
+      });
+      state.deploymentSchedulerDirty = false;
+      renderDeploymentSnapshot(snapshot);
+      setDeploymentResult(snapshot, `动作调度已切换为${form.mode === 'asynchronous' ? '异步' : '同步'}模式`);
+    } catch (error) {
+      setDeploymentResult({ error: error.message }, '动作调度切换失败', true);
+    } finally {
+      state.deploymentSchedulerApplying = false;
+      syncDeploymentButtons(Boolean(state.deploymentSessionId), state.deploymentSnapshot);
+    }
+  }
+
+  async function recordDeploymentPose() {
+    if (!state.deploymentSessionId) return;
+    const suggested = `位姿 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+    const name = $('#deploymentPoseName')?.value.trim() || suggested;
+    try {
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/poses`, {
+        method: 'POST', body: JSON.stringify({ name })
+      });
+      renderDeploymentSnapshot(snapshot);
+      const poses = snapshot.recordedPoses || [];
+      if (poses.length) $('#deploymentPoseSelect').value = poses[poses.length - 1].poseId;
+      if ($('#deploymentPoseName')) $('#deploymentPoseName').value = '';
+      syncDeploymentPoseButtons();
+      setDeploymentResult(snapshot, '当前模型关节位姿已记录');
+    } catch (error) { setDeploymentResult({ error: error.message }, '记录位姿失败', true); }
+  }
+
+  async function moveDeploymentPose() {
+    const poseId = $('#deploymentPoseSelect')?.value;
+    if (!state.deploymentSessionId || !poseId) return;
+    setBusy(true, '正在回到记录位姿', '评测将自动暂停，只控制模型动作向量中的关节。');
+    try {
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/poses/${encodeURIComponent(poseId)}/move`, {
+        method: 'POST', body: JSON.stringify({ durationS: 3 })
+      });
+      renderDeploymentSnapshot(snapshot);
+      setDeploymentResult(snapshot, '已回到记录位姿；模型与只读观测继续运行');
+    } catch (error) { setDeploymentResult({ error: error.message }, '一键回位失败', true); }
+    finally { setBusy(false); }
+  }
+
+  async function deleteDeploymentPose() {
+    const poseId = $('#deploymentPoseSelect')?.value;
+    if (!state.deploymentSessionId || !poseId) return;
+    try {
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/poses/${encodeURIComponent(poseId)}`, {
+        method: 'DELETE'
+      });
+      renderDeploymentSnapshot(snapshot);
+      setDeploymentResult(snapshot, '记录位姿已删除');
+    } catch (error) { setDeploymentResult({ error: error.message }, '删除位姿失败', true); }
   }
 
   function downloadDeploymentRecord() {
@@ -568,29 +849,65 @@
     state.deploymentSnapshot = snapshot;
     setDeploymentState(snapshot.state);
     state.deploymentRuntimeKind = 'recipe';
+    const observedPrompt = snapshot.modelIo?.input?.prompt;
+    const promptInput = $('#deploymentTaskPrompt');
+    if (observedPrompt && promptInput && document.activeElement !== promptInput) promptInput.value = observedPrompt;
     syncDeploymentButtons(!['disconnected', 'stopped', 'fault'].includes(snapshot.state), snapshot);
-    const passed = (snapshot.steps || []).filter((item) => item.status === 'passed').length;
-    const failed = (snapshot.steps || []).filter((item) => item.status === 'failed').length;
-    $('#deployMetricSteps').textContent = passed;
-    $('#deployMetricHz').textContent = snapshot.currentStep || '—';
-    $('#deployMetricInference').textContent = snapshot.mode || '—';
-    $('#deployMetricActions').textContent = Object.values(snapshot.components || {}).filter((item) => item.active).length;
-    $('#deployMetricErrors').textContent = failed;
     const precheck = (snapshot.steps || []).find((item) => item.name === 'precheck');
-    if (precheck?.status === 'passed') {
+    const robotLinked = Boolean(snapshot.components?.tunnel?.active || snapshot.components?.ros?.active || snapshot.components?.client?.active);
+    if (robotLinked) {
       state.deploymentRobotConnected = true;
-      setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', '已连接');
+      const mode = snapshot.clientRuntime?.mode === 'live' ? '动作执行' : '只读观测';
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', `已连接 · ${mode}`);
+    } else if (snapshot.state === 'model_ready') {
+      state.deploymentRobotConnected = false;
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', '已断开');
     } else if (precheck?.status === 'failed' || snapshot.state === 'fault') {
       state.deploymentRobotConnected = false;
       setDeploymentComponentStatus('#deploymentRobotStatus', 'error', '连接失败');
     }
     else if (snapshot.currentStep === 'precheck') setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', '连接中');
     else setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', '未检测连接');
+    const clientStatus = snapshot.components?.client?.status;
+    const robotDetail = $('#deploymentRobotDetail');
+    if (robotDetail) robotDetail.textContent = robotLinked
+      ? `Client ${clientStatus?.activeState || 'active'}/${clientStatus?.subState || 'running'} · ROS ${snapshot.components?.ros?.active ? 'active' : 'off'} · Tunnel ${snapshot.components?.tunnel?.active ? 'active' : 'off'}${snapshot.clientRuntime?.actionShape ? ` · 动作 ${snapshot.clientRuntime.actionShape.join('×')}` : ''}`
+      : '未建立模型输入所用的相机与关节观测链路';
     if (snapshot.components?.model?.active) setDeploymentComponentStatus('#deploymentModelStatus', 'ready', '模型已启动');
     else if (snapshot.currentStep === 'model' || snapshot.currentStep === 'model_health') setDeploymentComponentStatus('#deploymentModelStatus', 'pending', '启动中');
+    else if (snapshot.state === 'fault' && snapshot.modelIo) setDeploymentComponentStatus('#deploymentModelStatus', 'idle', '模型已停止');
     else if (snapshot.state === 'fault') setDeploymentComponentStatus('#deploymentModelStatus', 'error', '启动失败');
     else setDeploymentComponentStatus('#deploymentModelStatus', 'idle', '未启动');
-    renderDeploymentComponents(snapshot.components || {});
+    const modelManaged = snapshot.components?.model?.status;
+    const modelDetail = $('#deploymentModelDetail');
+    if (modelDetail) modelDetail.textContent = snapshot.components?.model?.active
+      ? `${modelManaged?.activeState || 'active'}/${modelManaged?.subState || 'running'}${modelManaged?.pid ? ` · PID ${modelManaged.pid}` : ''}${Number.isFinite(Number(snapshot.clientRuntime?.inferenceLatencyMs)) ? ` · 推理 ${Number(snapshot.clientRuntime.inferenceLatencyMs).toFixed(0)} ms` : ''}`
+      : `模型服务未运行${modelManaged?.result ? ` · ${modelManaged.result}` : ''}`;
+    if (snapshot.scheduler) {
+      const scheduler = snapshot.scheduler;
+      const fields = [$('#deploymentInferenceMode'), $('#deploymentActionSteps'), $('#deploymentRequestAfterSteps')];
+      const editing = state.deploymentSchedulerDirty || fields.includes(document.activeElement);
+      if (!editing) {
+        $('#deploymentInferenceMode').value = scheduler.mode || 'synchronous';
+        $('#deploymentActionSteps').value = String(scheduler.actionSteps || scheduler.outputSteps || 1);
+        $('#deploymentActionSteps').max = String(scheduler.outputSteps || scheduler.actionSteps || 1);
+        $('#deploymentRequestAfterSteps').value = String(scheduler.prefetchPolicy === 'auto' ? 'auto' : (scheduler.requestAfterSteps ?? 'auto'));
+      }
+      syncDeploymentSchedulerControls();
+      if (editing) renderDeploymentSchedulerHint();
+      else {
+        const prefetch = scheduler.mode === 'asynchronous'
+          ? ` · ${scheduler.prefetchPolicy === 'auto'
+            ? (Number.isFinite(Number(scheduler.requestAfterSteps)) ? `自动预取（当前第 ${scheduler.requestAfterSteps} 步）` : '自动预取（运行时计算）')
+            : `第 ${scheduler.requestAfterSteps} 步预取`}`
+          : '';
+        $('#deploymentSchedulerHint').textContent = `输出 ${scheduler.outputSteps} 步 · 采用 ${scheduler.actionSteps} 步${prefetch} · 已生效`;
+      }
+      syncDeploymentButtons(!['disconnected', 'stopped', 'fault'].includes(snapshot.state), snapshot);
+    }
+    renderDeploymentPoses(snapshot.recordedPoses || []);
+    renderDeploymentModelIo(snapshot.modelIo, snapshot.dryRunSafety, snapshot.trajectoryHistory, snapshot.runtimeTiming);
+    refreshDeploymentExecutionLog(false);
     const output = $('#deploymentResult');
     if (output) output.textContent = JSON.stringify({
       state: snapshot.state,
@@ -598,11 +915,373 @@
       currentStep: snapshot.currentStep,
       components: snapshot.components,
       steps: snapshot.steps,
+      dryRunSafety: snapshot.dryRunSafety,
       lastError: snapshot.lastError,
       recentEvents: (snapshot.events || []).slice(-30),
     }, null, 2);
     const hint = $('#deploymentResultHint');
     if (hint) hint.textContent = snapshot.lastError || `${snapshot.name || snapshot.deploymentId} · ${snapshot.state}`;
+  }
+
+  function renderDeploymentPoses(poses) {
+    const select = $('#deploymentPoseSelect');
+    if (!select) return;
+    const previous = select.value;
+    select.innerHTML = poses.length
+      ? poses.map((pose) => `<option value="${escapeAttr(pose.poseId)}">${escapeHtml(pose.name)}</option>`).join('')
+      : '<option value="">暂无记录位姿</option>';
+    if (poses.some((pose) => pose.poseId === previous)) select.value = previous;
+    syncDeploymentPoseButtons();
+  }
+
+  function syncDeploymentPoseButtons() {
+    const hasPose = Boolean($('#deploymentPoseSelect')?.value);
+    const stateName = state.deploymentSnapshot?.state;
+    const canMove = hasPose && ['dry_run', 'running'].includes(stateName);
+    if ($('#moveDeploymentPose')) $('#moveDeploymentPose').disabled = !canMove;
+    if ($('#deleteDeploymentPose')) $('#deleteDeploymentPose').disabled = !hasPose;
+    const hint = $('#deploymentPoseHint');
+    const hasState = ['dry_run', 'running'].includes(stateName)
+      && Array.isArray(state.deploymentSnapshot?.modelIo?.input?.state?.values);
+    if (hint) hint.textContent = hasState
+      ? `已获得 ${state.deploymentSnapshot.modelIo.input.state.values.length} 维模型关节状态，可记录当前位姿`
+      : '连接本体并获得模型输入关节状态后可记录';
+  }
+
+  function orchestrationLogRows(snapshot) {
+    const marker = Number(state.deploymentLogClearMarkers.orchestration || 0);
+    const rows = (snapshot?.events || []).filter((event) => Number(event.timeNs || 0) > marker).slice(-160).map((event) => {
+      const time = event.timeNs ? new Date(event.timeNs / 1e6).toLocaleTimeString('zh-CN', { hour12: false }) : '--:--:--';
+      const detail = Object.entries(event)
+        .filter(([key]) => !['timeNs', 'event', 'state'].includes(key))
+        .map(([key, value]) => `${key}=${typeof value === 'object' ? JSON.stringify(value) : value}`)
+        .join(' ');
+      const name = String(event.event || 'event');
+      const level = /fault|failed|error|unhealthy/.test(name) ? 'error' : (/requested|starting/.test(name) ? 'pending' : 'info');
+      return { time, level, tag: name, message: detail || event.state || '' };
+    });
+    if (snapshot?.lastError) rows.push({ time: '--:--:--', level: 'error', tag: 'ERROR', message: snapshot.lastError });
+    return rows;
+  }
+
+  function componentLogRows(lines, source) {
+    let rows = (lines || []).map((line) => {
+      const text = String(line);
+      const timestamp = text.match(/^\S+\s+(\d\d:\d\d:\d\d)/)?.[1] || '--:--:--';
+      const level = /error|exception|traceback|failed|fault/i.test(text) ? 'error' : (/warn/i.test(text) ? 'pending' : 'info');
+      return { time: timestamp, level, tag: source, message: text };
+    });
+    const marker = state.deploymentLogClearMarkers[source];
+    if (marker) {
+      let markerIndex = -1;
+      for (let index = rows.length - 1; index >= 0; index -= 1) {
+        if (rows[index].message === marker) { markerIndex = index; break; }
+      }
+      rows = markerIndex >= 0 ? rows.slice(markerIndex + 1) : rows;
+    }
+    return rows;
+  }
+
+  function renderDeploymentLogRows(rows) {
+    const output = $('#deploymentExecutionLog');
+    if (!output) return;
+    state.deploymentLogRows = rows;
+    const filter = ($('#deploymentLogFilter')?.value || '').trim().toLowerCase();
+    const visible = filter ? rows.filter((row) => `${row.tag} ${row.message}`.toLowerCase().includes(filter)) : rows;
+    output.innerHTML = visible.length ? visible.map((row) => `
+      <div class="deployment-log-row ${escapeAttr(row.level)}">
+        <time>${escapeHtml(row.time)}</time>
+        <span>${escapeHtml(row.tag)}</span>
+        <p>${escapeHtml(row.message)}</p>
+      </div>`).join('') : '<div class="deployment-log-empty">没有匹配的日志</div>';
+    if ($('#deploymentLogAutoscroll')?.checked) output.scrollTop = output.scrollHeight;
+  }
+
+  async function refreshDeploymentExecutionLog(force = false) {
+    const output = $('#deploymentExecutionLog');
+    if (!output) return;
+    const source = $('#deploymentLogSource')?.value || 'orchestration';
+    if (source === 'orchestration') {
+      renderDeploymentLogRows(orchestrationLogRows(state.deploymentSnapshot));
+      return;
+    }
+    state.deploymentLogRefreshTick += 1;
+    if (!force && state.deploymentLogRefreshTick % 4 !== 0) return;
+    if (!state.deploymentSessionId || state.deploymentLogLoading) return;
+    state.deploymentLogLoading = true;
+    try {
+      const result = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/logs`, {
+        method: 'POST', body: JSON.stringify({ component: source, lines: 160 })
+      });
+      renderDeploymentLogRows(componentLogRows(result.lines, source));
+    } catch (error) {
+      renderDeploymentLogRows([{ time: '--:--:--', level: 'error', tag: source, message: `日志读取失败：${error.message}` }]);
+    } finally {
+      state.deploymentLogLoading = false;
+    }
+  }
+
+  function formatModelIoValue(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '—';
+    const absolute = Math.abs(number);
+    if (absolute >= 1000 || (absolute > 0 && absolute < 0.001)) return number.toExponential(3);
+    return number.toFixed(4).replace(/\.?0+$/, '');
+  }
+
+  function safeModelImageUrl(value) {
+    const url = typeof value === 'string' ? value : '';
+    return /^data:image\/(?:jpeg|png|webp|bmp);base64,[A-Za-z0-9+/=]+$/.test(url) ? url : '';
+  }
+
+  function renderDeploymentModelIo(modelIo, dryRunSafety = null, trajectoryHistory = null, runtimeTiming = null) {
+    const placeholder = $('#deploymentModelIoPlaceholder');
+    const container = $('#deploymentModelIo');
+    if (!placeholder || !container) return;
+    if (!modelIo?.input || !modelIo?.output) {
+      placeholder.classList.remove('hidden');
+      container.classList.add('hidden');
+      return;
+    }
+    placeholder.classList.add('hidden');
+    container.classList.remove('hidden');
+
+    const input = modelIo.input;
+    const cameras = Array.isArray(input.cameras) ? input.cameras : [];
+    $('#deploymentCameraGrid').innerHTML = cameras.length
+      ? cameras.map((camera) => {
+        const url = safeModelImageUrl(camera.dataUrl);
+        if (!url) return '';
+        const size = camera.width && camera.height ? `${camera.width} × ${camera.height}` : 'JPEG';
+        return `<figure class="deployment-camera-card"><img src="${escapeAttr(url)}" alt="${escapeAttr(camera.label || camera.key || '模型图像输入')}"><figcaption><strong>${escapeHtml(camera.label || camera.key || '图像输入')}</strong><small>${escapeHtml(size)}</small></figcaption></figure>`;
+      }).join('')
+      : '<div class="deployment-io-empty">当前模型输入没有图像</div>';
+    $('#deploymentInputMeta').textContent = input.prompt ? `Prompt · ${input.prompt}` : '实际模型输入';
+
+    const inputState = input.state;
+    $('#deploymentStateLabel').textContent = inputState?.label || '状态输入';
+    $('#deploymentStateKey').textContent = inputState?.key || '—';
+    const stateValues = Array.isArray(inputState?.values) ? inputState.values : [];
+    $('#deploymentStateGrid').innerHTML = stateValues.length
+      ? stateValues.map((value, index) => {
+        const name = inputState.names?.[index] || `state_${index + 1}`;
+        return `<div class="deployment-vector-item"><strong title="${escapeAttr(name)}">${escapeHtml(name)}</strong><span>${escapeHtml(formatModelIoValue(value))}</span><small>${escapeHtml(inputState.units?.[index] || '')}</small></div>`;
+      }).join('')
+      : '<div class="deployment-io-empty">当前模型输入没有状态向量</div>';
+
+    const output = modelIo.output;
+    const action = output.action || {};
+    const chunk = Array.isArray(action.chunk) ? action.chunk.filter(Array.isArray) : [];
+    const width = chunk[0]?.length || 0;
+    $('#deploymentActionShape').textContent = chunk.length && width ? `${chunk.length} × ${width}` : '—';
+    const latencyText = Number.isFinite(Number(output.inferenceLatencyMs))
+      ? `推理 ${Number(output.inferenceLatencyMs).toFixed(1)} ms`
+      : '模型动作输出';
+    const pipeline = output.pipeline || {};
+    const timingParts = [
+      Number.isFinite(Number(pipeline.observationMs)) ? `观测 ${Number(pipeline.observationMs).toFixed(1)} ms` : '',
+      Number.isFinite(Number(pipeline.requestSerializationMs)) ? `编码 ${Number(pipeline.requestSerializationMs).toFixed(1)} ms` : '',
+      Number.isFinite(Number(runtimeTiming?.scheduleLagMeanMs)) ? `调度抖动 ${Number(runtimeTiming.scheduleLagMeanMs).toFixed(1)} ms` : '',
+    ].filter(Boolean);
+    const detailedLatency = `${latencyText}${timingParts.length ? ` · ${timingParts.join(' · ')}` : ''}`;
+    $('#deploymentOutputMeta').textContent = dryRunSafety?.passed === false
+      ? `${detailedLatency} · 动作校验未通过`
+      : detailedLatency;
+    renderDeploymentActionTrajectory(action, chunk, trajectoryHistory);
+    $('#deploymentActionGrid').innerHTML = width
+      ? Array.from({ length: width }, (_, index) => {
+        const series = chunk.map((row) => Number(row[index])).filter(Number.isFinite);
+        const first = series[0];
+        const minimum = Math.min(...series);
+        const maximum = Math.max(...series);
+        const unit = action.units?.[index] || '';
+        const name = action.names?.[index] || `action_${index + 1}`;
+        return `<div class="deployment-vector-item output"><strong title="${escapeAttr(name)}">${escapeHtml(name)}</strong><span>${escapeHtml(formatModelIoValue(first))}</span><small>${escapeHtml(`${formatModelIoValue(minimum)} ～ ${formatModelIoValue(maximum)}${unit ? ` ${unit}` : ''}`)}</small></div>`;
+      }).join('')
+      : '<div class="deployment-io-empty">尚无模型动作输出</div>';
+  }
+
+  const deploymentTrajectoryColors = [
+    '#2563eb', '#e11d48', '#059669', '#d97706', '#7c3aed', '#0891b2', '#db2777', '#4f46e5',
+  ];
+
+  function deploymentTrajectoryGroups(action, width) {
+    const names = Array.from({ length: width }, (_, index) => action.names?.[index] || `action_${index + 1}`);
+    const indexes = (predicate) => names.map((name, index) => predicate(name.toLowerCase(), index) ? index : -1).filter((index) => index >= 0);
+    const groups = [
+      { id: 'left', label: '左臂', indexes: indexes((name) => name.includes('left') && !name.includes('gripper')) },
+      { id: 'right', label: '右臂', indexes: indexes((name) => name.includes('right') && !name.includes('gripper')) },
+      { id: 'gripper', label: '夹爪', indexes: indexes((name) => name.includes('gripper') || name.includes('effector')) },
+      { id: 'all', label: '全部', indexes: Array.from({ length: width }, (_, index) => index) },
+    ].filter((group) => group.indexes.length);
+    return { names, groups };
+  }
+
+  function deploymentTrajectoryData(action, chunk, history) {
+    const requested = $('#deploymentTrajectorySource')?.value || state.deploymentTrajectorySource || 'state';
+    const windowSeconds = Number($('#deploymentTrajectoryWindow')?.value) || 20;
+    const historyKey = ['state', 'planned', 'executed'].includes(requested) ? requested : null;
+    let points = historyKey && Array.isArray(history?.[historyKey]) ? history[historyKey] : [];
+    let source = requested;
+    if (source === 'chunk') {
+      return {
+        source: 'chunk',
+        rows: chunk,
+        xValues: chunk.map((_, index) => index + 1),
+        xLabel: '动作步',
+        names: action.names || [],
+        units: action.units || [],
+      };
+    }
+    if (!points.length) {
+      return { source, rows: [], xValues: [], xLabel: `最近 ${windowSeconds} 秒`, names: history?.names || action.names || [], units: history?.units || action.units || [] };
+    }
+    const latest = Math.max(...points.map((point) => Number(point.tNs)).filter(Number.isFinite));
+    const cutoff = latest - windowSeconds * 1e9;
+    points = points.filter((point) => Number(point.tNs) >= cutoff && Array.isArray(point.values));
+    const stateSource = source === 'state';
+    return {
+      source,
+      rows: points.map((point) => point.values),
+      xValues: points.map((point) => (Number(point.tNs) - latest) / 1e9),
+      xLabel: `最近 ${windowSeconds} 秒`,
+      names: stateSource ? (history.stateNames || action.names || []) : (history.names || action.names || []),
+      units: stateSource ? (history.stateUnits || action.units || []) : (history.units || action.units || []),
+    };
+  }
+
+  function renderCurrentDeploymentTrajectory() {
+    state.deploymentTrajectorySource = $('#deploymentTrajectorySource')?.value || 'executed';
+    const action = state.deploymentSnapshot?.modelIo?.output?.action || {};
+    const chunk = Array.isArray(action.chunk) ? action.chunk.filter(Array.isArray) : [];
+    renderDeploymentActionTrajectory(action, chunk, state.deploymentSnapshot?.trajectoryHistory);
+  }
+
+  function renderDeploymentActionTrajectory(action, chunk, history = null) {
+    const canvas = $('#deploymentActionTrajectory');
+    const legend = $('#deploymentTrajectoryLegend');
+    const groupContainer = $('#deploymentTrajectoryGroups');
+    if (!canvas || !legend || !groupContainer) return;
+    const data = deploymentTrajectoryData(action, chunk, history);
+    const rows = data.rows || [];
+    const width = rows[0]?.length || 0;
+    if (!width || !rows.length) {
+      legend.innerHTML = '<span>等待动作输出</span>';
+      return;
+    }
+    const sourceAction = { names: data.names, units: data.units };
+    const { names, groups } = deploymentTrajectoryGroups(sourceAction, width);
+    if (!groups.some((group) => group.id === state.deploymentTrajectoryGroup)) {
+      state.deploymentTrajectoryGroup = groups[0]?.id || 'all';
+    }
+    groupContainer.innerHTML = groups.map((group) =>
+      `<button type="button" data-trajectory-group="${escapeAttr(group.id)}" class="${group.id === state.deploymentTrajectoryGroup ? 'active' : ''}">${escapeHtml(group.label)}</button>`
+    ).join('');
+    const selected = groups.find((group) => group.id === state.deploymentTrajectoryGroup) || groups[0];
+    const indexes = selected.indexes;
+    legend.innerHTML = indexes.map((index, colorIndex) =>
+      `<span><i style="background:${deploymentTrajectoryColors[colorIndex % deploymentTrajectoryColors.length]}"></i>${escapeHtml(names[index])}</span>`
+    ).join('');
+
+    const rect = canvas.getBoundingClientRect();
+    const cssWidth = Math.max(320, Math.floor(rect.width || 800));
+    const cssHeight = Math.max(180, Math.floor(rect.height || 220));
+    const ratio = Math.min(2, window.devicePixelRatio || 1);
+    if (canvas.width !== Math.floor(cssWidth * ratio) || canvas.height !== Math.floor(cssHeight * ratio)) {
+      canvas.width = Math.floor(cssWidth * ratio);
+      canvas.height = Math.floor(cssHeight * ratio);
+    }
+    const context = canvas.getContext('2d');
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, cssWidth, cssHeight);
+    const margin = { left: 48, right: 18, top: 16, bottom: 30 };
+    const plotWidth = cssWidth - margin.left - margin.right;
+    const plotHeight = cssHeight - margin.top - margin.bottom;
+    const perDimension = ($('#deploymentTrajectoryScale')?.value || 'per') === 'per';
+    const seriesStats = new Map(indexes.map((index) => {
+      const values = rows.map((row) => Number(row[index])).filter(Number.isFinite);
+      return [index, { minimum: Math.min(...values), maximum: Math.max(...values) }];
+    }));
+    const values = indexes.flatMap((index) => rows.map((row) => Number(row[index])).filter(Number.isFinite));
+    let minimum = perDimension ? 0 : Math.min(...values);
+    let maximum = perDimension ? 1 : Math.max(...values);
+    if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) return;
+    if (minimum === maximum) {
+      const delta = Math.max(0.1, Math.abs(minimum) * 0.1);
+      minimum -= delta;
+      maximum += delta;
+    } else {
+      const padding = (maximum - minimum) * 0.12;
+      minimum -= padding;
+      maximum += padding;
+    }
+    const xValues = data.xValues || rows.map((_, index) => index);
+    const xMinimum = Math.min(...xValues);
+    const xMaximum = Math.max(...xValues);
+    const x = (step) => margin.left + (xMaximum === xMinimum ? 0 : (xValues[step] - xMinimum) / (xMaximum - xMinimum)) * plotWidth;
+    const y = (value) => margin.top + (maximum - value) / (maximum - minimum) * plotHeight;
+    context.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+    context.lineWidth = 1;
+    for (let tick = 0; tick <= 4; tick += 1) {
+      const yy = margin.top + tick / 4 * plotHeight;
+      const value = maximum - tick / 4 * (maximum - minimum);
+      context.strokeStyle = '#e2e8f0';
+      context.beginPath(); context.moveTo(margin.left, yy); context.lineTo(cssWidth - margin.right, yy); context.stroke();
+      context.fillStyle = '#64748b';
+      context.textAlign = 'right';
+      context.fillText(perDimension ? `${Math.round(value * 100)}%` : formatModelIoValue(value), margin.left - 7, yy + 3);
+    }
+    if (!perDimension && minimum < 0 && maximum > 0) {
+      context.strokeStyle = '#94a3b8';
+      context.setLineDash([4, 4]);
+      context.beginPath(); context.moveTo(margin.left, y(0)); context.lineTo(cssWidth - margin.right, y(0)); context.stroke();
+      context.setLineDash([]);
+    }
+    for (let tick = 0; tick <= 4; tick += 1) {
+      const step = Math.round(tick / 4 * Math.max(0, rows.length - 1));
+      const xx = x(step);
+      context.fillStyle = '#94a3b8';
+      context.textAlign = 'center';
+      const label = data.source === 'chunk' ? String(step + 1) : `${xValues[step].toFixed(1)}s`;
+      context.fillText(label, xx, cssHeight - 10);
+    }
+    indexes.forEach((index, colorIndex) => {
+      const series = rows.map((row) => Number(row[index]));
+      const stats = seriesStats.get(index);
+      const plotValue = (value) => {
+        if (!perDimension || !stats || stats.minimum === stats.maximum) return perDimension ? 0.5 : value;
+        return (value - stats.minimum) / (stats.maximum - stats.minimum);
+      };
+      context.strokeStyle = deploymentTrajectoryColors[colorIndex % deploymentTrajectoryColors.length];
+      context.lineWidth = 2;
+      context.lineJoin = 'round';
+      context.lineCap = 'round';
+      context.beginPath();
+      series.forEach((value, step) => {
+        if (!Number.isFinite(value)) return;
+        if (step === 0) context.moveTo(x(step), y(plotValue(value)));
+        else context.lineTo(x(step), y(plotValue(value)));
+      });
+      context.stroke();
+      if (series.length <= 60) series.forEach((value, step) => {
+          if (!Number.isFinite(value)) return;
+          context.fillStyle = deploymentTrajectoryColors[colorIndex % deploymentTrajectoryColors.length];
+          context.beginPath(); context.arc(x(step), y(plotValue(value)), 1.8, 0, Math.PI * 2); context.fill();
+        });
+    });
+    context.fillStyle = '#64748b';
+    context.textAlign = 'center';
+    context.fillText(`${data.xLabel}${perDimension ? ' · 各维独立量程' : ''}`, margin.left + plotWidth / 2, cssHeight - 2);
+  }
+
+  function onDeploymentTrajectoryGroup(event) {
+    const button = event.target.closest('[data-trajectory-group]');
+    if (!button) return;
+    state.deploymentTrajectoryGroup = button.dataset.trajectoryGroup;
+    const modelIo = state.deploymentSnapshot?.modelIo;
+    const action = modelIo?.output?.action || {};
+    const chunk = Array.isArray(action.chunk) ? action.chunk.filter(Array.isArray) : [];
+    renderDeploymentActionTrajectory(action, chunk, state.deploymentSnapshot?.trajectoryHistory);
   }
 
   function renderDeploymentComponents(components) {
@@ -613,7 +1292,6 @@
       .filter(([name]) => ['model', 'tunnel', 'ros', 'client'].includes(name))
       .map(([name, value]) => `<div class="deployment-component ${value.active ? 'active' : ''}">
         <span><i></i><strong>${escapeHtml(name)}</strong><small>${escapeHtml(value.active ? 'active' : 'inactive')}</small></span>
-        <span><button data-component-action="logs" data-component="${escapeAttr(name)}">日志</button><button data-component-action="restart" data-component="${escapeAttr(name)}">重启</button></span>
       </div>`).join('');
   }
 
@@ -4715,7 +5393,8 @@
     });
     element.addEventListener('pointermove', (event) => {
       if (!element.classList.contains('dragging')) return;
-      const delta = (horizontal ? event.clientX : event.clientY) - startPointer;
+      const direction = options.invert ? -1 : 1;
+      const delta = ((horizontal ? event.clientX : event.clientY) - startPointer) * direction;
       options.set(clamp(startValue + delta, options.min(), options.max()));
     });
     const stop = (event) => {
@@ -4746,6 +5425,7 @@
     const workspace = document.querySelector('.review-workspace');
     const deploymentWorkspace = document.querySelector('.deployment-layout');
     const deploymentSidebar = document.querySelector('.deployment-config-pane');
+    const deploymentLog = document.querySelector('.deployment-log-panel');
     const strip = $('#videoStrip');
     const stripWrap = document.querySelector('.strip-wrap');
     const columnHandle = $('#splitColumns');
@@ -4796,6 +5476,29 @@
       done: () => {
         const inline = deploymentWorkspace.style.getPropertyValue('--deployment-sidebar-w');
         layout.deploymentSidebarW = inline ? Math.round(deploymentSidebarWidth()) : null;
+        saveLayout();
+      }
+    });
+
+    // Deployment log height ----------------------------------------------
+    const deploymentLogHeight = () => deploymentLog.getBoundingClientRect().height;
+    if (layout.deploymentLogH) {
+      deploymentSidebar.style.setProperty('--deployment-log-h', `${layout.deploymentLogH}px`);
+    }
+    bindSplitter($('#splitDeploymentLog'), {
+      axis: 'y',
+      invert: true,
+      get: deploymentLogHeight,
+      min: () => 120,
+      max: () => Math.max(180, deploymentSidebar.getBoundingClientRect().height - 180),
+      set: (value) => deploymentSidebar.style.setProperty('--deployment-log-h', `${Math.round(value)}px`),
+      reset: () => {
+        deploymentSidebar.style.removeProperty('--deployment-log-h');
+        layout.deploymentLogH = null;
+      },
+      done: () => {
+        const inline = deploymentSidebar.style.getPropertyValue('--deployment-log-h');
+        layout.deploymentLogH = inline ? Math.round(deploymentLogHeight()) : null;
         saveLayout();
       }
     });

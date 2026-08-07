@@ -275,6 +275,21 @@ class DeploymentDryRunRequest(BaseModel):
     taskPrompt: str = Field(min_length=1, max_length=2000)
 
 
+class DeploymentPoseRecordRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=100)
+
+
+class DeploymentPoseMoveRequest(BaseModel):
+    durationS: float = Field(default=3.0, gt=0, le=60)
+
+
+class DeploymentSchedulerRequest(BaseModel):
+    mode: str
+    actionSteps: int = Field(ge=1, le=10_000)
+    requestAfterSteps: int | str = "auto"
+    latencyMarginMs: float = Field(default=30, ge=0, le=10_000)
+
+
 class DeploymentOrchestrationLogsRequest(BaseModel):
     component: str
     lines: int = Field(default=100, ge=1, le=1000)
@@ -288,7 +303,11 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     deploy_root = settings.CACHE_DIR / "deploy"
     deployment_recipes = RecipeStore(deploy_root / "recipes")
     deployment_configs = {
-        kind: DeploymentConfigStore(deploy_root / "configs", kind)
+        kind: DeploymentConfigStore(
+            deploy_root / "configs",
+            kind,
+            discovery_roots=[settings.CONFIG_DIR / "local"],
+        )
         for kind in ("robot", "model")
     }
     deployment_orchestrations = OrchestrationRegistry(deploy_root / "orchestrations")
@@ -1208,7 +1227,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             "componentConfigKinds": ["robot", "model"],
             "modelProviders": ["python", "openpi", "lerobot", "starvla", "external"],
             "checkpointModelProviders": [item["id"] for item in MODEL_PROVIDER_CATALOG],
-            "robotClients": ["ros2_standard", "custom"],
+            "robotClients": ["ros2_standard", "python_adapter", "custom"],
             "features": {
                 "recipeOrchestration": True,
                 "independentRobotModelConfigs": True,
@@ -1342,6 +1361,145 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/start-evaluation",
+        dependencies=[Depends(authorize)],
+    )
+    def start_deployment_evaluation(
+        orchestration_id: str,
+        request: DeploymentDryRunRequest,
+    ) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).start_evaluation(
+                task_prompt=request.taskPrompt
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/prompt",
+        dependencies=[Depends(authorize)],
+    )
+    def update_deployment_prompt(
+        orchestration_id: str,
+        request: DeploymentDryRunRequest,
+    ) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).update_task_prompt(
+                request.taskPrompt
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/scheduler",
+        dependencies=[Depends(authorize)],
+    )
+    def update_deployment_scheduler(
+        orchestration_id: str,
+        request: DeploymentSchedulerRequest,
+    ) -> dict[str, Any]:
+        try:
+            request_after: int | str = request.requestAfterSteps
+            if isinstance(request_after, str) and request_after != "auto":
+                request_after = int(request_after)
+            return deployment_orchestrations.get(orchestration_id).update_action_scheduler(
+                mode=request.mode,
+                action_steps=request.actionSteps,
+                request_after_steps=request_after,
+                latency_margin_ms=request.latencyMarginMs,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/disconnect-robot",
+        dependencies=[Depends(authorize)],
+    )
+    def disconnect_deployment_robot(orchestration_id: str) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).disconnect_robot()
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/close-model",
+        dependencies=[Depends(authorize)],
+    )
+    def close_deployment_model(orchestration_id: str) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).close_model()
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/poses",
+        dependencies=[Depends(authorize)],
+    )
+    def record_deployment_pose(
+        orchestration_id: str,
+        request: DeploymentPoseRecordRequest,
+    ) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).record_pose(request.name)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/poses/{pose_id}/move",
+        dependencies=[Depends(authorize)],
+    )
+    def move_deployment_pose(
+        orchestration_id: str,
+        pose_id: str,
+        request: DeploymentPoseMoveRequest,
+    ) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).move_to_recorded_pose(
+                pose_id,
+                duration_s=request.durationS,
+            )
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.delete(
+        "/api/deploy/orchestrations/{orchestration_id}/poses/{pose_id}",
+        dependencies=[Depends(authorize)],
+    )
+    def delete_deployment_pose(orchestration_id: str, pose_id: str) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).delete_pose(pose_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post(
         "/api/deploy/orchestrations/{orchestration_id}/arm-challenge",
         dependencies=[Depends(authorize)],
     )
@@ -1363,6 +1521,20 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     ) -> dict[str, Any]:
         try:
             return deployment_orchestrations.get(orchestration_id).promote_live(request.confirmation)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/stop-evaluation",
+        dependencies=[Depends(authorize)],
+    )
+    def deployment_orchestration_stop_evaluation(orchestration_id: str) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).stop_evaluation()
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:

@@ -7,6 +7,7 @@ copied here. The referenced upstream revisions and licenses are documented in
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import sys
 from pathlib import Path
@@ -127,6 +128,7 @@ class OpenPIAdapter:
         *,
         source_path: str | None = None,
         config_name: str | None = None,
+        action_horizon: int | None = None,
         default_prompt: str | None = None,
         device: str | None = None,
         observation_map: dict[str, str] | None = None,
@@ -138,6 +140,13 @@ class OpenPIAdapter:
 
         resolved_name = config_name or self._infer_config_name(checkpoint, training_config)
         config = training_config.get_config(resolved_name)
+        if action_horizon is not None:
+            if isinstance(action_horizon, bool) or not isinstance(action_horizon, int) or action_horizon <= 0:
+                raise ValueError("action_horizon 必须是正整数")
+            config = dataclasses.replace(
+                config,
+                model=dataclasses.replace(config.model, action_horizon=action_horizon),
+            )
         self.policy = policy_config.create_trained_policy(
             config,
             checkpoint,
@@ -149,6 +158,7 @@ class OpenPIAdapter:
         self.specification = {
             "family": "openpi",
             "config_name": resolved_name,
+            "action_horizon": action_horizon or getattr(config.model, "action_horizon", None),
             "checkpoint": checkpoint,
             **(getattr(self.policy, "metadata", None) or {}),
         }

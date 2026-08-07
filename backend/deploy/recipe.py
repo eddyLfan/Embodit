@@ -8,11 +8,12 @@ path and describes the complete model, tunnel, ROS, and robot-client runtime.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -150,6 +151,7 @@ class ModelService(ManagedService):
     predict_method: str = Field(default="predict", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     load_kwargs: dict[str, Any] = Field(default_factory=dict)
     predict_kwargs: dict[str, Any] = Field(default_factory=dict)
+    action_horizon: PositiveInt | None = None
     maximum_request_bytes: int = Field(default=50_000_000, ge=1024, le=1_000_000_000)
     source_path: str | None = None
 
@@ -183,11 +185,13 @@ class ModelService(ManagedService):
 
 
 class RobotClientService(ManagedService):
-    builtin: Literal["ros2_standard"] | None = None
+    builtin: Literal["ros2_standard", "python_adapter"] | None = None
     config: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def validate_builtin(self) -> "RobotClientService":
+        if self.builtin is not None and self.command:
+            raise ValueError("内置 Robot Client 由 Embodit 自动生成，不能同时配置 command")
         if self.builtin == "ros2_standard":
             if not isinstance(self.config, dict):
                 raise ValueError("ros2_standard Client 必须配置 config")
@@ -195,6 +199,197 @@ class RobotClientService(ManagedService):
             missing = sorted(required - set(self.config))
             if missing:
                 raise ValueError("ros2_standard Client config 缺少：" + ", ".join(missing))
+        elif self.builtin == "python_adapter":
+            if not isinstance(self.config, dict):
+                raise ValueError("python_adapter Client 必须配置 config")
+            required = {"adapter", "action"}
+            missing = sorted(required - set(self.config))
+            if missing:
+                raise ValueError("python_adapter Client config 缺少：" + ", ".join(missing))
+            adapter = self.config.get("adapter")
+            if not isinstance(adapter, dict) or not isinstance(adapter.get("entrypoint"), str):
+                raise ValueError("python_adapter Client adapter.entrypoint 必须配置")
+            entrypoint = adapter["entrypoint"]
+            module, separator, attribute = entrypoint.partition(":")
+            if not separator or not module or not attribute:
+                raise ValueError("python_adapter Client adapter.entrypoint 必须使用 module:ClassName")
+            source_path = adapter.get("source_path")
+            if source_path is not None and (not isinstance(source_path, str) or not Path(source_path).is_absolute()):
+                raise ValueError("python_adapter Client adapter.source_path 必须是本体上的绝对路径")
+            module_search_paths = adapter.get("module_search_paths", [])
+            if not isinstance(module_search_paths, list) or any(
+                not isinstance(path, str) or not Path(path).is_absolute()
+                for path in module_search_paths
+            ):
+                raise ValueError(
+                    "python_adapter Client adapter.module_search_paths 必须是本体上的绝对路径数组"
+                )
+            source_file = adapter.get("source_file")
+            if source_file is not None:
+                if not isinstance(source_file, str) or not Path(source_file).is_absolute():
+                    raise ValueError("python_adapter Client adapter.source_file 必须是 Embodit 主机上的绝对路径")
+                if Path(source_file).suffix != ".py":
+                    raise ValueError("python_adapter Client adapter.source_file 必须是 Python 文件")
+                if "." in module or Path(source_file).stem != module:
+                    raise ValueError("adapter.source_file 文件名必须与 entrypoint 模块名一致")
+            python_executable = adapter.get("python_executable", "python3")
+            if not isinstance(python_executable, str) or not python_executable or "\x00" in python_executable:
+                raise ValueError("python_adapter Client adapter.python_executable 非法")
+            task_prompts = self.config.get("task_prompts")
+            if task_prompts is not None and (
+                not isinstance(task_prompts, list)
+                or not 1 <= len(task_prompts) <= 1000
+                or any(
+                    not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2000
+                    for prompt in task_prompts
+                )
+            ):
+                raise ValueError("python_adapter Client task_prompts 必须是 1 到 1000 项的非空字符串数组")
+            action = self.config.get("action")
+            if not isinstance(action, dict):
+                raise ValueError("python_adapter Client action 必须是对象")
+            width = action.get("width")
+            if not isinstance(width, int) or isinstance(width, bool) or width <= 0:
+                raise ValueError("python_adapter Client action.width 必须是正整数")
+            horizon = action.get("horizon", 1)
+            if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon <= 0:
+                raise ValueError("python_adapter Client action.horizon 必须是正整数")
+            for name in ("minimum", "maximum", "max_step"):
+                values = action.get(name)
+                if not isinstance(values, list) or len(values) != width:
+                    raise ValueError(f"python_adapter Client action.{name} 维度必须等于 width")
+                if any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    for value in values
+                ):
+                    raise ValueError(f"python_adapter Client action.{name} 必须是有限数值数组")
+            if any(low >= high for low, high in zip(action["minimum"], action["maximum"])):
+                raise ValueError("python_adapter Client action.minimum 必须逐维小于 maximum")
+            if any(step <= 0 for step in action["max_step"]):
+                raise ValueError("python_adapter Client action.max_step 必须逐维大于 0")
+            numerical_tolerance = action.get("numerical_tolerance", 1e-6)
+            tolerances = (
+                numerical_tolerance
+                if isinstance(numerical_tolerance, list)
+                else [numerical_tolerance] * width
+            )
+            if len(tolerances) != width or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+                for value in tolerances
+            ):
+                raise ValueError(
+                    "python_adapter Client action.numerical_tolerance 必须是非负有限数值或与 width 等长的数组"
+                )
+            baseline = action.get("baseline_observation")
+            if not isinstance(baseline, str) or not baseline:
+                raise ValueError("python_adapter Client action.baseline_observation 必须配置")
+            dry_run_source = self.config.get("dry_run_observation_source", "synthetic")
+            if dry_run_source not in {"synthetic", "adapter"}:
+                raise ValueError(
+                    "python_adapter Client dry_run_observation_source 必须是 synthetic 或 adapter"
+                )
+            if dry_run_source == "synthetic" and not isinstance(self.config.get("dry_run_observations"), dict):
+                raise ValueError("python_adapter Client synthetic Dry Run 必须配置 dry_run_observations 对象")
+            telemetry = self.config.get("telemetry", {})
+            if not isinstance(telemetry, dict):
+                raise ValueError("python_adapter Client telemetry 必须是对象")
+            maximum_image_bytes = telemetry.get("max_image_bytes", 750_000)
+            if (
+                not isinstance(maximum_image_bytes, int)
+                or isinstance(maximum_image_bytes, bool)
+                or not 1 <= maximum_image_bytes <= 5_000_000
+            ):
+                raise ValueError("python_adapter Client telemetry.max_image_bytes 必须在 1 到 5000000 之间")
+            cameras = telemetry.get("cameras", [])
+            if not isinstance(cameras, list) or len(cameras) > 8:
+                raise ValueError("python_adapter Client telemetry.cameras 必须是最多 8 项的数组")
+            for camera in cameras:
+                if not isinstance(camera, dict) or not isinstance(camera.get("key"), str) or not camera["key"]:
+                    raise ValueError("python_adapter Client telemetry.cameras[].key 必须配置")
+            for section_name in ("state", "action"):
+                section = telemetry.get(section_name, {})
+                if not isinstance(section, dict):
+                    raise ValueError(f"python_adapter Client telemetry.{section_name} 必须是对象")
+                names = section.get("names")
+                if names is not None and (
+                    not isinstance(names, list) or any(not isinstance(item, str) for item in names)
+                ):
+                    raise ValueError(f"python_adapter Client telemetry.{section_name}.names 必须是字符串数组")
+                units = section.get("units")
+                if units is not None and not isinstance(units, (str, list)):
+                    raise ValueError(
+                        f"python_adapter Client telemetry.{section_name}.units 必须是字符串或数组"
+                    )
+                if isinstance(units, list) and any(not isinstance(item, str) for item in units):
+                    raise ValueError(
+                        f"python_adapter Client telemetry.{section_name}.units 只能包含字符串"
+                    )
+            action_names = telemetry.get("action", {}).get("names")
+            if isinstance(action_names, list) and len(action_names) != width:
+                raise ValueError("python_adapter Client telemetry.action.names 维度必须等于 action.width")
+            control = self.config.get("control", {})
+            if not isinstance(control, dict):
+                raise ValueError("python_adapter Client control 必须是对象")
+            for name in ("rate_hz", "dry_run_rate_hz", "max_episode_steps", "watchdog_timeout_s"):
+                value = control.get(name)
+                if value is not None and (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or value <= 0
+                ):
+                    raise ValueError(f"python_adapter Client control.{name} 必须大于 0")
+            inference_mode = control.get("inference_mode", "synchronous")
+            if inference_mode not in {"synchronous", "asynchronous"}:
+                raise ValueError(
+                    "python_adapter Client control.inference_mode 必须是 synchronous 或 asynchronous"
+                )
+            action_steps = control.get("action_steps", horizon)
+            if (
+                isinstance(action_steps, bool)
+                or not isinstance(action_steps, int)
+                or not 1 <= action_steps <= horizon
+            ):
+                raise ValueError(
+                    "python_adapter Client control.action_steps 必须在 1 到 action.horizon 之间"
+                )
+            asynchronous = control.get("asynchronous", {})
+            if not isinstance(asynchronous, dict):
+                raise ValueError("python_adapter Client control.asynchronous 必须是对象")
+            request_after_steps = asynchronous.get(
+                "request_after_steps",
+                "auto",
+            )
+            if (
+                request_after_steps != "auto"
+                and (isinstance(request_after_steps, bool) or not isinstance(request_after_steps, int))
+            ):
+                raise ValueError(
+                    "python_adapter Client control.asynchronous.request_after_steps 必须是整数或 auto"
+                )
+            if (
+                inference_mode == "asynchronous"
+                and request_after_steps != "auto"
+                and not 1 <= request_after_steps < action_steps
+            ):
+                raise ValueError(
+                    "异步推理要求 control.asynchronous.request_after_steps 在 1 到 action_steps-1 之间"
+                )
+            latency_margin_ms = asynchronous.get("latency_margin_ms", 30)
+            if (
+                isinstance(latency_margin_ms, bool)
+                or not isinstance(latency_margin_ms, (int, float))
+                or not math.isfinite(float(latency_margin_ms))
+                or float(latency_margin_ms) < 0
+            ):
+                raise ValueError(
+                    "python_adapter Client control.asynchronous.latency_margin_ms 必须是非负有限数值"
+                )
         return self
 
 
@@ -311,6 +506,8 @@ class RuntimePolicy(StrictModel):
     auto_rollback: bool = True
     stop_model_on_exit: bool = True
     power_off_on_exit: bool = False
+    monitor_interval_s: float = Field(default=2, gt=0, le=60)
+    component_failure_threshold: int = Field(default=3, ge=1, le=20)
 
 
 class RobotBody(StrictModel):
@@ -461,7 +658,22 @@ def compose_recipe(
     resolved_runtime = robot.runtime if runtime is None else RuntimePolicy.model_validate(runtime)
 
     model_service = model.model.model_copy(update={"host": "model"})
-    robot_client = robot.robot.client.model_copy(update={"host": "robot"})
+    robot_client_config = robot.robot.client.config
+    if model.model.action_horizon is not None and robot_client_config is not None:
+        robot_client_config = dict(robot_client_config)
+        action = dict(robot_client_config.get("action") or {})
+        previous_horizon = action.get("horizon")
+        action["horizon"] = model.model.action_horizon
+        robot_client_config["action"] = action
+        control = dict(robot_client_config.get("control") or {})
+        # An action_steps value equal to the previous horizon means "use the
+        # complete chunk". Keep that intent when a different model is paired.
+        if control.get("action_steps") == previous_horizon:
+            control["action_steps"] = model.model.action_horizon
+        robot_client_config["control"] = control
+    robot_client = robot.robot.client.model_copy(
+        update={"host": "robot", "config": robot_client_config}
+    )
     robot_deployment = RobotDeployment(
         host="robot",
         **robot.robot.model_dump(mode="python", exclude={"client"}),

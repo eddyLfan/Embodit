@@ -207,7 +207,7 @@
       <div class="deployment-page-title modal-title">
         <div class="deployment-title-copy">
           <h2 id="deploymentTitle" data-i18n="deployTitle">真机部署工作台</h2>
-          <p data-i18n="deployDesc">独立完成本体连接、模型接入、预检、Dry Run、真机运行与实时观测。</p>
+          <p data-i18n="deployDesc">本体连接、模型常驻、Prompt 切换、真机评测与实时模型 I/O 观测。</p>
         </div>
         <div class="deployment-title-status">
           <div class="deployment-page-status"><i></i><span data-i18n="deployControlPlaneReady">部署控制面已就绪</span></div>
@@ -215,8 +215,10 @@
         </div>
       </div>
       <div class="deployment-safety-bar">
-        <strong>安全模式</strong><span>默认仅 Dry Run；真机动作必须先通过预检、连续试跑和一次性人工确认。</span>
-        <button id="emergencyStopDeployment" class="danger emergency" disabled>立即急停</button>
+        <strong>实验模式</strong><span>模型服务常驻；评测可直接开始、暂停和继续，Prompt 可随时快速切换。</span>
+        <div class="deployment-safety-actions">
+          <button id="stopDeployment" hidden disabled>关闭部署</button>
+        </div>
       </div>
       <div class="deployment-layout">
         <aside class="deployment-config-pane" aria-label="部署配置">
@@ -232,8 +234,12 @@
                   <select id="deploymentRobotSelect" aria-label="选择本体"><option value="">正在载入…</option></select>
                   <div class="deployment-inline-status">
                     <span id="deploymentRobotStatus" class="deployment-component-status idle"><i></i>未检测连接</span>
-                    <button id="checkDeploymentRobot" type="button">检测连接</button>
+                    <span class="deployment-connection-actions">
+                      <button id="checkDeploymentRobot" type="button">连接</button>
+                      <button id="disconnectDeploymentRobot" type="button" disabled>断开</button>
+                    </span>
                   </div>
+                  <small id="deploymentRobotDetail" class="deployment-status-detail">未建立观测链路</small>
                 </div>
               </section>
               <section class="deployment-operation-step">
@@ -243,34 +249,69 @@
                   <select id="deploymentModelSelect" aria-label="选择模型"><option value="">正在载入…</option></select>
                   <div class="deployment-step-actions">
                     <span id="deploymentModelStatus" class="deployment-component-status idle"><i></i>未启动</span>
-                    <button id="prepareDeploymentModel" class="primary" type="button">启动模型</button>
+                    <span class="deployment-connection-actions">
+                      <button id="prepareDeploymentModel" class="primary" type="button">启动模型</button>
+                      <button id="closeDeploymentModel" type="button" disabled>关闭</button>
+                    </span>
                   </div>
+                  <small id="deploymentModelDetail" class="deployment-status-detail">模型服务未启动</small>
                 </div>
               </section>
               <section class="deployment-operation-step">
                 <div class="deployment-step-number">3</div>
                 <div class="deployment-step-body">
                   <label for="deploymentTaskPrompt">任务 Prompt</label>
-                  <input id="deploymentTaskPrompt" list="deploymentTaskPromptOptions" placeholder="选择常用任务或直接输入" autocomplete="off">
-                  <datalist id="deploymentTaskPromptOptions">
-                    <option value="抓取目标物体并放入指定区域"></option>
-                    <option value="将桌面物体整理到托盘中"></option>
-                    <option value="移动机械臂到安全初始位姿"></option>
-                  </datalist>
+                  <input id="deploymentTaskPrompt" list="deploymentTaskPromptOptions" placeholder="从配置列表选择或直接输入" autocomplete="off">
+                  <datalist id="deploymentTaskPromptOptions"></datalist>
+                  <div class="deployment-prompt-actions">
+                    <small id="deploymentPromptHint">等待载入 Prompt 列表</small>
+                    <button id="applyDeploymentPrompt" type="button" disabled>切换 Prompt</button>
+                  </div>
+                </div>
+              </section>
+              <section class="deployment-operation-step">
+                <div class="deployment-step-number">4</div>
+                <div class="deployment-step-body">
+                  <span class="deployment-step-label">动作调度</span>
+                  <div class="deployment-scheduler-grid">
+                    <label><span>推理</span><select id="deploymentInferenceMode"><option value="synchronous">同步</option><option value="asynchronous">异步</option></select></label>
+                    <label><span>采用步数</span><input id="deploymentActionSteps" type="number" min="1" step="1"></label>
+                    <label id="deploymentPrefetchField"><span>预取点</span><input id="deploymentRequestAfterSteps" value="auto" placeholder="auto 或步数"></label>
+                  </div>
+                  <div class="deployment-prompt-actions">
+                    <small id="deploymentSchedulerHint">等待模型动作长度</small>
+                    <button id="applyDeploymentScheduler" type="button" disabled>应用</button>
+                  </div>
+                </div>
+              </section>
+              <section class="deployment-operation-step">
+                <div class="deployment-step-number">5</div>
+                <div class="deployment-step-body">
+                  <span class="deployment-step-label">实验位姿</span>
+                  <input id="deploymentPoseName" placeholder="位姿名称（可留空自动命名）" maxlength="100" autocomplete="off">
+                  <div class="deployment-pose-row">
+                    <select id="deploymentPoseSelect" aria-label="已记录位姿"><option value="">暂无记录位姿</option></select>
+                    <button id="recordDeploymentPose" type="button" disabled>记录当前</button>
+                  </div>
+                  <div class="deployment-pose-actions">
+                    <button id="moveDeploymentPose" type="button" disabled>一键回位</button>
+                    <button id="deleteDeploymentPose" type="button" disabled>删除记录</button>
+                  </div>
+                  <small id="deploymentPoseHint" class="deployment-status-detail">连接本体并获得关节观测后可记录</small>
                 </div>
               </section>
               <section class="deployment-operation-step deployment-run-step">
-                <div class="deployment-step-number">4</div>
+                <div class="deployment-step-number">6</div>
                 <div class="deployment-step-body">
-                  <span class="deployment-step-label">运行任务</span>
+                  <span class="deployment-step-label">真机评测</span>
                   <div class="deployment-run-actions">
-                    <button id="quickstartDeployment" class="primary deploy-launch" disabled data-i18n="deployDryRun">开始 Dry Run</button>
-                    <button id="startLiveDeployment" class="danger" disabled>确认并正式执行</button>
+                    <button id="startLiveDeployment" class="primary deploy-launch" disabled>开始评测</button>
+                    <button id="stopLiveDeployment" disabled>暂停评测</button>
                   </div>
                 </div>
               </section>
             </div>
-            <details class="deployment-config-preview">
+            <details class="deployment-config-preview" hidden>
               <summary>查看只读配置</summary>
               <div class="deployment-composition-meta">
                 <label><span>部署 ID</span><input id="deploymentId" value="robot-a--my-vla" readonly spellcheck="false"></label>
@@ -292,35 +333,82 @@
               </details>
             </details>
           </div>
-          <div class="deployment-actions">
-            <button id="validateDeployment" data-i18n="deployValidate">校验配置</button>
-            <button id="doctorDeployment" data-i18n="deployDoctor">运行预检</button>
-            <button id="downloadDeploymentRecord" disabled>下载运行清单</button>
-            <button id="stopDeployment" class="danger" disabled data-i18n="deployStop">停止会话</button>
-          </div>
+          <div id="splitDeploymentLog" class="splitter splitter-row deployment-log-splitter" role="separator" aria-orientation="horizontal" tabindex="0" title="拖动调整日志高度 · 双击复位"></div>
+          <section class="deployment-log-panel" aria-label="执行日志">
+            <div class="deployment-log-head">
+              <span class="deployment-log-title"><i></i><strong>执行日志</strong></span>
+              <select id="deploymentLogSource" aria-label="日志来源">
+                <option value="orchestration">编排</option>
+                <option value="client">Client</option>
+                <option value="model">Model</option>
+                <option value="tunnel">Tunnel</option>
+                <option value="ros">ROS</option>
+              </select>
+              <button id="refreshDeploymentLog" type="button" title="刷新日志">↻</button>
+            </div>
+            <div class="deployment-log-tools">
+              <input id="deploymentLogFilter" type="search" placeholder="筛选日志" autocomplete="off">
+              <label><input id="deploymentLogAutoscroll" type="checkbox" checked> 跟随</label>
+              <button id="clearDeploymentLogView" type="button">清屏</button>
+            </div>
+            <div id="deploymentExecutionLog" class="deployment-log-lines" role="log" aria-live="polite"><div class="deployment-log-empty">等待部署启动…</div></div>
+          </section>
         </aside>
         <div id="splitDeploymentSidebar" class="splitter splitter-col deployment-splitter" role="separator" aria-orientation="vertical" tabindex="0" title="拖动调整部署操作栏宽度 · 双击复位"></div>
-        <section class="deployment-result-pane" aria-label="真机状态观测">
+        <section class="deployment-result-pane" aria-label="模型 I/O 观测">
           <div class="deployment-observation-head">
-            <div class="deployment-pane-title"><strong>真机状态观测</strong><small id="deploymentResultHint" data-i18n="deployReady">等待操作</small></div>
-            <span class="deployment-reserved-badge">观测区预留</span>
-          </div>
-          <div class="deployment-metrics">
-            <div><strong id="deployMetricSteps">0</strong><span>完成步骤</span></div>
-            <div><strong id="deployMetricHz">—</strong><span>当前步骤</span></div>
-            <div><strong id="deployMetricInference">—</strong><span>运行模式</span></div>
-            <div><strong id="deployMetricActions">0</strong><span>活动组件</span></div>
-            <div><strong id="deployMetricErrors">0</strong><span>错误</span></div>
+            <div class="deployment-pane-title"><strong>模型 I/O 观测</strong><small id="deploymentResultHint" data-i18n="deployReady">等待操作</small></div>
           </div>
           <div class="deployment-observation-stage">
-            <div class="deployment-observation-placeholder">
+            <div id="deploymentModelIoPlaceholder" class="deployment-observation-placeholder">
               <span class="deployment-observation-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-              <strong>真机状态观测区域</strong>
-              <p>为后续相机画面、关节状态、动作轨迹与告警信息预留</p>
+              <strong>等待模型 I/O</strong>
+              <p>机器人客户端启动后，这里只展示实际送入模型的观测和模型返回的动作</p>
+            </div>
+            <div id="deploymentModelIo" class="deployment-model-io hidden">
+              <section class="deployment-io-section">
+                <div class="deployment-io-heading"><strong>模型输入</strong><small id="deploymentInputMeta">—</small></div>
+                <div id="deploymentCameraGrid" class="deployment-camera-grid"></div>
+                <div class="deployment-vector-panel">
+                  <div class="deployment-vector-heading"><strong id="deploymentStateLabel">关节状态</strong><code id="deploymentStateKey">—</code></div>
+                  <div id="deploymentStateGrid" class="deployment-vector-grid"></div>
+                </div>
+              </section>
+              <section class="deployment-io-section">
+                <div class="deployment-io-heading"><strong>模型输出</strong><small id="deploymentOutputMeta">—</small></div>
+                <div class="deployment-vector-panel">
+                  <div class="deployment-vector-heading"><strong>动作输出</strong><code id="deploymentActionShape">—</code></div>
+                  <div class="deployment-trajectory-toolbar">
+                    <div class="deployment-trajectory-view-controls">
+                      <select id="deploymentTrajectorySource" aria-label="轨迹来源">
+                        <option value="executed">实际执行</option>
+                        <option value="state" selected>关节状态</option>
+                        <option value="planned">模型计划</option>
+                        <option value="chunk">当前动作块</option>
+                      </select>
+                      <select id="deploymentTrajectoryWindow" aria-label="轨迹时间窗">
+                        <option value="5">最近 5 秒</option>
+                        <option value="10">最近 10 秒</option>
+                        <option value="20" selected>最近 20 秒</option>
+                        <option value="60">最近 60 秒</option>
+                      </select>
+                      <select id="deploymentTrajectoryScale" aria-label="轨迹量程">
+                        <option value="per" selected>逐维变化</option>
+                        <option value="shared">统一量程</option>
+                      </select>
+                    </div>
+                    <div id="deploymentTrajectoryGroups" class="deployment-trajectory-groups"></div>
+                  </div>
+                  <div class="deployment-trajectory-chart">
+                    <canvas id="deploymentActionTrajectory" width="960" height="300" aria-label="实时动作轨迹"></canvas>
+                    <div id="deploymentTrajectoryLegend" class="deployment-trajectory-legend"></div>
+                  </div>
+                  <div id="deploymentActionGrid" class="deployment-vector-grid"></div>
+                </div>
+              </section>
             </div>
           </div>
-          <div id="deploymentComponents" class="deployment-components hidden"></div>
-          <div class="deployment-runtime-details">
+          <div class="deployment-runtime-details" hidden>
             <details class="deployment-runtime-log">
               <summary>运行日志</summary>
               <pre id="deploymentResult">—</pre>

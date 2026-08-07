@@ -1,0 +1,59 @@
+{
+  "builtin": "python_adapter",
+  "config": {
+    "default_prompt": "pick up the object",
+    "adapter": {
+      "entrypoint": "my_robot_adapter:RobotAdapter",
+      "source_file": "/absolute/path/to/my_robot_adapter.py",
+      "module_search_paths": ["/absolute/path/to/vendor_sdk"],
+      "python_executable": "/usr/bin/python3",
+      "config": {
+        "device": "robot0"
+      }
+    },
+    "observation_map": {
+      "observation/state": "joint_position",
+      "observation/image": "wrist_camera"
+    },
+    "dry_run_observation_source": "synthetic",
+    "dry_run_observations": {
+      "joint_position": {"$synthetic": "vector", "length": 6, "value": 0},
+      "wrist_camera": {"$synthetic": "image", "width": 224, "height": 224, "channels": 3, "value": 0}
+    },
+    "telemetry": {
+      "cameras": [
+        {"key": "observation/image", "label": "Wrist camera"}
+      ],
+      "state": {
+        "key": "observation/state",
+        "label": "Joint state",
+        "names": ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"],
+        "units": "rad"
+      },
+      "action": {
+        "names": ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"],
+        "units": "rad"
+      }
+    },
+    "action": {
+      "width": 6,
+      "horizon": 8,
+      "baseline_observation": "observation/state",
+      "minimum": [-2.8, -2.0, -2.8, -3.0, -2.8, -3.0],
+      "maximum": [2.8, 2.0, 2.8, 3.0, 2.8, 3.0],
+      "max_step": [0.1, 0.1, 0.1, 0.15, 0.15, 0.2]
+    },
+    "control": {
+      "rate_hz": 10,
+      "dry_run_rate_hz": 5,
+      "watchdog_timeout_s": 1.0,
+      "inference_mode": "asynchronous",
+      "action_steps": 8,
+      "asynchronous": {
+        "request_after_steps": 5
+      }
+    }
+  },
+  "startup_timeout_s": 120,
+  "restart": "no"
+}

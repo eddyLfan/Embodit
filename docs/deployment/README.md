@@ -32,7 +32,7 @@ embodit-ros-<deployment-id>.service
 embodit-client-<deployment-id>.service
 ```
 
-A brief workstation disconnect does not directly terminate them. Tunnel and process restart behavior follows the Recipe, except that the Client is forced to `restart=no` in Live mode so a safety fault cannot resume physical motion without a new confirmation.
+A brief workstation disconnect does not directly terminate them. Tunnel and process restart behavior follows the Recipe, except that the Client is forced to `restart=no` in Live mode so an action-validation or robot-call fault cannot automatically resume physical motion.
 
 ## 2. Responsibility boundary
 
@@ -41,7 +41,7 @@ A brief workstation disconnect does not directly terminate them. Tunnel and proc
 | An SSH-reachable robot plus either a separate model host or the Embodit machine address, and ROS setup paths | Local/SSH execution, host validation, process supervision, logs, ordered startup and rollback |
 | A common model provider and checkpoint, or a custom Python entrypoint/advanced external service | OpenPI/LeRobot/StarVLA adapters, Model Runner, localhost HTTP protocol, health checks, tensor/JSON normalization |
 | ROS topic/service/action mapping and robot-specific limits | Graph/type/rate/freshness readiness and built-in ROS2 Client validation |
-| Vendor driver/bridge, hardware limits, e-stop, safe power/hold/stop behavior | Dry Run, short-lived Live challenge, goal cancellation, configured hold/stop/power-off calls |
+| Vendor driver/bridge, hardware limits, e-stop, safe power/hold/stop behavior | Action validation, execution logs, pause/resume, goal cancellation, configured hold/stop/power-off calls |
 
 Embodit cannot infer safe joint limits, initial poses, controller rates, or lifecycle service semantics. Those values must come from the robot manufacturer and be validated at low speed with hardware e-stop access. A software stop is not a replacement for a certified hardware safety system.
 
@@ -83,8 +83,8 @@ The runtime orchestrator continues to consume the full Recipe shown in [`../../c
 - `robot.readiness`: required nodes and typed topics/services/actions, topic rate and freshness;
 - lifecycle operations: `power_on`, `power_off`, `hold`, `stop`;
 - `initial_pose`: FollowJointTrajectory pose or custom command plus measured tolerance;
-- `robot.client`: built-in `ros2_standard` Client or a custom command;
-- `runtime`: default mode, rollback, model shutdown, and power-off policy.
+- `robot.client`: `ros2_standard`, the vendor-neutral `python_adapter`, or an advanced custom command;
+- `runtime`: default mode, rollback, model shutdown, power-off policy, and component-monitor timing/thresholds.
 
 Authentication may be managed directly in the Recipe or through an environment variable/key:
 
@@ -252,13 +252,27 @@ Before any Live goal is sent, the Client enforces:
 
 These are software guards at the Robot Client boundary. The ROS Bridge/vendor controller must independently enforce hardware limits, command validity/age, controller state, collision/speed constraints, and e-stop behavior. For a nonstandard SDK, implement a thin ROS Bridge that maps its state, trajectory, power, hold, stop, and fault codes to the configured ROS contract.
 
+### 7.1 Generic Python Robot Adapter
+
+For vendor SDKs that do not map cleanly to standard ROS, use `builtin: python_adapter`. Embodit uploads and owns the generic Client, model protocol, prompt, Dry Run, action validation, timing, readiness, logs, and fault handling. The robot integrator supplies only an object with `observe()` and `apply_action(row)`, plus optional `start()` and `stop()` methods.
+
+`adapter.entrypoint` uses `module:ClassName`. Use robot-side `source_path` for an installed adapter, or an absolute control-host `source_file` for a one-file adapter that Embodit uploads automatically; `python_executable` is resolved on the robot. Dry Run uses declarative synthetic observations and never imports the adapter or initializes the vendor SDK. The action config defines width, horizon, baseline observation, and per-dimension minimum, maximum, and max-step limits. `numerical_tolerance` may be a scalar or a width-sized array; only boundary noise within that tolerance is clamped to the legal range. In Live, an invalid model chunk is discarded and replaced with a validated hold chunk built from the latest measured model state, while the Client continues requesting inference instead of exiting. See [`../../examples/deployment/python_robot_client.example.json`](../../examples/deployment/python_robot_client.example.json) and [`../../examples/deployment/python_robot_adapter.py`](../../examples/deployment/python_robot_adapter.py).
+
+`action.horizon` is the number of steps the model must return per request. `control.action_steps` selects how many steps Embodit consumes from each chunk (the full horizon by default), and `control.rate_hz` sets the Live action rate. `control.inference_mode` accepts `synchronous` or `asynchronous`. Synchronous mode requests the next chunk only after the current chunk finishes. Asynchronous mode starts the next request at `control.asynchronous.request_after_steps` while the rest of the current chunk continues. The prefetch point may be a fixed integer or `"auto"`; automatic mode uses the latest round-trip latency, action rate, and `latency_margin_ms` to reserve enough actions. Before switching chunks, Embodit revalidates the asynchronous result against the latest robot state. A late inference resumes the scheduler from the current clock instead of bursting actions to catch up with stale deadlines. A typical Pi setup is `horizon: 50`, `action_steps: 50`, and either `request_after_steps: 30` or `"auto"`.
+
+Adapter-backed Dry Run keeps sampling and inferring after an individual action-safety rejection. It reports `dryRunSafety.passed: false` without stopping the Client or resident model. Dry Run remains available for initial integration and diagnostics, but it is not a mandatory step before each real evaluation.
+
+Optional `telemetry` describes only how model I/O is displayed: `cameras` maps image input keys to labels, `state` names and units the model state vector, and `action` names and units each output dimension. Embodit derives this bounded view from the same `observe()` payload and validated action chunk; it does not read extra vendor, ROS, tunnel, or host state. `history_seconds` (20 seconds by default) and `history_max_points` bound camera-free history for observed state, model plans, and actually applied actions. JPEG/PNG/WebP and raw mono/RGB/BGR/RGBA/BGRA frames are supported, with at most eight images and a 750 KB per-image default limit.
+
 ## 8. Dry Run, Live, rollback, and stop
 
-Dry Run uses the final observation → tunnel → model → validation path but does not call the trajectory controller. The deployment is ready only after one complete inference succeeds.
+Dry Run uses the final observation → tunnel → model → validation path but does not call the trajectory controller. It is useful for initial integration and fault diagnosis.
 
-Live requires a UI challenge phrase valid for 60 seconds. Embodit restarts the Client with `EMBODIT_DEPLOYMENT_MODE=live`; Live cannot be enabled by merely editing the Recipe default while an orchestration is running.
+For routine experiments, a model-ready deployment can start real evaluation directly without repeating Dry Run or typing a challenge phrase. Pausing stops physical actions and restores read-only observation while the model, tunnel, and ROS stay resident; resume is immediate. Changing the Prompt restarts only the lightweight Client, not the model. Common choices are configured with `task_prompts` in the robot Client config.
 
-On startup failure or monitored component failure, `auto_rollback` stops components in reverse order and can call configured hold/power-off operations. Emergency stop calls `robot.stop` on the robot side first and does not wait for the model. Because robot behavior is vendor-specific, test normal stop, hold, emergency stop, process crash, network loss, and power-off in a controlled setup before production use.
+Recorded experiment poses contain only the joint state vector consumed by the model. Moving to one pauses evaluation and uses the same generic Adapter to interpolate within configured `max_step` limits, then leaves the resident model and read-only observation running.
+
+On startup failure or a confirmed persistent component failure, `auto_rollback` stops components in reverse order and can call configured hold/power-off operations. At runtime Embodit reads structured systemd state every two seconds by default and confirms a fault only after three consecutive unhealthy checks. A single SSH probe failure or a systemd auto-restart transition therefore does not immediately terminate the deployment; recovery records a `component_recovered` event. `runtime.monitor_interval_s` and `runtime.component_failure_threshold` are configurable, although a threshold of one is discouraged. Probe failures and actual process exits produce distinct diagnostics. Emergency stop bypasses this debounce: it calls `robot.stop` on the robot side first and does not wait for the model. Because robot behavior is vendor-specific, test normal stop, hold, emergency stop, process crash, network loss, and power-off in a controlled setup before production use.
 
 ## 9. Use the UI and CLI
 
@@ -266,7 +280,7 @@ On startup failure or monitored component failure, `auto_rollback` stops compone
 bash embodit.sh start
 ```
 
-Open “Robot deployment”, select or edit one robot config and one model config, then choose “Validate” or “Preflight and Dry Run”. The UI shows the generated Recipe, step state, component state, logs, controlled component restart, Live confirmation, and emergency stop. Existing Recipe files can be imported and are split automatically.
+Open “Robot deployment”, select a robot and model, start the model, choose a Prompt, and press “Start evaluation”. The scheduler control switches between synchronous, fixed-prefetch asynchronous, and latency-adaptive asynchronous execution without restarting the model. The lower-left log panel switches between orchestration, Client, Model, Tunnel, and ROS logs, with filtering and follow controls. The right side shows only real model inputs plus bounded state, planned-action, and applied-action histories. “Disconnect” stops the robot-side Client, ROS, and tunnel while preserving the model; “Close” also stops the model service.
 
 CLI and rescue commands:
 
@@ -287,7 +301,7 @@ bash embodit.sh recipe-stop config/my-robot.json --emergency
 
 ## 10. ROS generalization boundary
 
-Node names are readiness signals; functional adaptation is defined by typed topics, services, and actions. Recipe orchestration supports ROS1 and ROS2. The built-in Client and FollowJointTrajectory initial-pose implementation are ROS2-only; ROS1 requires a custom Client/command, and ROS1 readiness does not accept an `actions` declaration (check actionlib topics instead).
+Node names are readiness signals; functional adaptation is defined by typed topics, services, and actions. Recipe orchestration supports ROS1 and ROS2. `ros2_standard` and the FollowJointTrajectory initial-pose implementation are ROS2-only. ROS1 and non-standard SDKs can use the vendor-neutral `python_adapter` contract; ROS1 readiness does not accept an `actions` declaration (check actionlib topics instead).
 
 Changing robot SDKs should normally change only the Recipe and a thin ROS Bridge. The SSH topology, tunnel, model provider, lifecycle state machine, and UI remain unchanged.
 
@@ -304,7 +318,14 @@ POST        /api/deploy/configs/validate
 POST        /api/deploy/compose
 POST        /api/deploy/doctor
 POST        /api/deploy/orchestrations
+POST        /api/deploy/orchestrations/prepare-model
 GET         /api/deploy/orchestrations/{id}
+POST        /api/deploy/orchestrations/{id}/start-evaluation
+POST        /api/deploy/orchestrations/{id}/stop-evaluation
+POST        /api/deploy/orchestrations/{id}/prompt
+POST        /api/deploy/orchestrations/{id}/poses
+POST        /api/deploy/orchestrations/{id}/poses/{pose_id}/move
+DELETE      /api/deploy/orchestrations/{id}/poses/{pose_id}
 POST        /api/deploy/orchestrations/{id}/arm-challenge
 POST        /api/deploy/orchestrations/{id}/start-live
 POST        /api/deploy/orchestrations/{id}/stop

@@ -32,7 +32,7 @@ embodit-ros-<deployment-id>.service
 embodit-client-<deployment-id>.service
 ```
 
-工作电脑短暂断开不会直接终止这些服务。隧道和进程按 Recipe 的策略重启；Live 模式下 Client 会被强制设为 `restart=no`，安全故障后不会在缺少新确认的情况下恢复真实动作。
+工作电脑短暂断开不会直接终止这些服务。隧道和进程按 Recipe 的策略重启；Live 模式下 Client 会被强制设为 `restart=no`，动作校验或本体调用故障后不会自行恢复真实动作。
 
 ## 2. 用户与工具的责任边界
 
@@ -41,7 +41,7 @@ embodit-client-<deployment-id>.service
 | SSH 可达的本体，以及独立模型主机或 Embodit 本机地址、ROS setup 路径 | 本地/SSH 执行、主机校验、进程托管、日志、顺序启动与回滚 |
 | 常用模型 Provider 与 Checkpoint，或自定义 Python 入口/高级外部服务 | OpenPI/LeRobot/StarVLA 适配器、Model Runner、localhost HTTP 协议、健康检查、Tensor/JSON 归一化 |
 | ROS topic/service/action 映射和本体专用限位 | graph/type/rate/freshness readiness 与内置 ROS2 Client 校验 |
-| 厂商驱动/Bridge、硬件限位、急停、安全上下电/hold/stop 行为 | Dry Run、短时 Live challenge、goal 取消、配置的 hold/stop/power-off 调用 |
+| 厂商驱动/Bridge、硬件限位、急停、安全上下电/hold/stop 行为 | 动作校验、执行日志、暂停/继续、goal 取消、配置的 hold/stop/power-off 调用 |
 
 Embodit 无法自动推断安全关节限位、初始位姿、控制频率或生命周期服务语义。这些值必须来自厂商资料，并在可触达硬件急停、低速条件下验证。软件 stop 不能替代经过认证的硬件安全系统。
 
@@ -83,8 +83,8 @@ Embodit 无法自动推断安全关节限位、初始位姿、控制频率或生
 - `robot.readiness`：必需 node 和带类型的 topic/service/action、topic 频率与新鲜度；
 - 生命周期操作：`power_on`、`power_off`、`hold`、`stop`；
 - `initial_pose`：FollowJointTrajectory 或自定义命令，以及实测容差；
-- `robot.client`：内置 `ros2_standard` Client 或自定义命令；
-- `runtime`：默认模式、回滚、停止模型和下电策略。
+- `robot.client`：标准 ROS2 的 `ros2_standard`、非标准 SDK 的通用 `python_adapter`，或高级自定义命令；
+- `runtime`：默认模式、回滚、停止模型、下电策略，以及组件监控间隔与连续失败阈值。
 
 认证既可以直接通过配置管理，也可以使用环境变量或密钥：
 
@@ -252,13 +252,38 @@ Live 发送任何 goal 之前，Client 强制执行：
 
 这些是 Robot Client 边界的软件保护。本体 ROS Bridge/厂商控制器仍必须独立执行硬件限位、命令有效期、控制器状态、碰撞/速度限制和急停逻辑。对于非标准 SDK，应实现薄 ROS Bridge，将状态、轨迹、上下电、hold、stop 和错误码映射为配置的 ROS 契约。
 
+### 7.1 通用 Python Robot Adapter
+
+当厂商 SDK 不适合转换为标准 ROS 接口时，使用 `builtin: python_adapter`。Embodit 仍负责上传通用 Client、模型 HTTP 协议、任务 Prompt、Dry Run、动作校验、频率、readiness、日志和故障退出；本体集成方只提供一个薄对象：
+
+```python
+class RobotAdapter:
+    def __init__(self, config): ...
+    def start(self): ...                 # 可选；仅 Live 调用
+    def observe(self) -> dict: ...       # 返回模型观测与动作 baseline
+    def apply_action(self, row): ...     # 接收一帧已校验动作
+    def stop(self): ...                  # 可选；退出/故障时调用
+```
+
+配置中的 `adapter.entrypoint` 使用 `module:ClassName`。适配器已安装在本体时填写本体绝对目录 `source_path`；使用 Embodit 主机上的单文件薄适配器时填写绝对路径 `source_file`，编排器会自动上传并改写运行目录。`python_executable` 在本体上解析。`dry_run_observations` 支持普通 JSON，以及 `{"$synthetic":"vector","length":N}`、`{"$synthetic":"image","width":W,"height":H,"channels":3}`。Dry Run 不导入 Adapter、不初始化厂商 SDK，只跑合成观测 → 隧道 → 模型 → 动作校验。
+
+`action` 统一声明 `width`、`horizon`、`baseline_observation`、逐维 `minimum`/`maximum`/`max_step`。`numerical_tolerance` 可以是标量或与 `width` 等长的数组；只对处于容差内的边界噪声钳到合法范围，其他维度仍保持严格限位。Live 中每个动作块都先完成形状、有限值、绝对限位和相邻步长校验，之后才逐帧调用 `apply_action`；某个动作块未通过时，Client 丢弃该块、保持最新实测关节状态并继续请求下一次推理，不再因为单次模型越界退出。`control.watchdog_timeout_s` 约束单次调用耗时。模板见 [`../../examples/deployment/python_robot_client.example.json`](../../examples/deployment/python_robot_client.example.json)，薄 Adapter 接口见 [`../../examples/deployment/python_robot_adapter.py`](../../examples/deployment/python_robot_adapter.py)。
+
+`action.horizon` 是模型每次必须输出的动作步数，`control.action_steps` 是 Embodit 从每个动作块实际采用的步数（默认采用整个 horizon），`control.rate_hz` 是 Live 动作下发频率。`control.inference_mode` 可选 `synchronous` 或 `asynchronous`：同步模式执行完当前动作块后才请求下一次推理；异步模式在执行到 `control.asynchronous.request_after_steps` 时启动下一次推理，同时继续执行当前块剩余动作。`request_after_steps` 可填写固定步数，也可设为 `"auto"`；自动模式根据最近一次模型往返延迟、控制频率和 `latency_margin_ms` 动态保留足够的剩余动作。异步结果在切块前会使用切换时的最新本体状态再次执行绝对限位与 `max_step` 校验；如果推理晚于当前块结束，调度时钟从当前时刻恢复，不会为追赶旧 deadline 突发连发动作。典型 Pi 配置可使用 `horizon: 50`、`action_steps: 50`、`request_after_steps: 30`，或使用 `"auto"` 适配不同推理端。
+
+Adapter-backed Dry Run 会持续采样和推理。单次动作越界会记录为 `dryRunSafety.passed: false`，但不会关闭 Client 或常驻模型。它保留为只读诊断工具，不再是每次真机评测前的强制步骤。
+
+可选的 `telemetry` 只描述模型 I/O 的显示方式：`cameras` 指定实际送入模型的图像 key 与名称，`state` 指定状态向量 key、逐维名称和单位，`action` 指定模型输出动作的逐维名称和单位。Embodit 从同一份 `observe()` 结果和已校验 action chunk 生成有界预览，不额外读取厂商状态，也不展示 ROS、隧道或主机信息。`history_seconds`（默认 20 秒）和 `history_max_points` 控制无图像历史缓存；网页可分别观察最近的输入关节状态、模型计划动作、实际下发动作和当前动作块。图像支持 JPEG/PNG/WebP，以及 `mono8`/`rgb8`/`bgr8`/`rgba8`/`bgra8` 原始帧；单图默认最大 750 KB，最多 8 路。
+
 ## 8. Dry Run、Live、回滚与停止
 
-Dry Run 使用最终的观测 → 隧道 → 模型 → 校验链路，但不调用轨迹控制器。只有至少一次完整推理成功后，部署才被标记为就绪。
+Dry Run 使用最终的观测 → 隧道 → 模型 → 校验链路，但不调用轨迹控制器，可用于首次接入或故障诊断。
 
-Live 需要网页输入 60 秒内有效的 challenge 短语。Embodit 使用 `EMBODIT_DEPLOYMENT_MODE=live` 重启 Client；编排运行期间不能仅靠修改 Recipe 默认值进入 Live。
+日常实验中，模型就绪后可直接开始真机评测，无需重复 Dry Run 或输入 challenge 短语。暂停评测只停止真实动作并恢复只读观测，模型、隧道和 ROS 保持常驻；点击继续即可快速恢复。切换 Prompt 只重启轻量 Client，不重新加载模型。`task_prompts` 可在本体 Client 配置中声明常用 Prompt 列表。
 
-启动失败或监控到组件故障时，`auto_rollback` 按逆序停止组件，并可调用配置的 hold/power-off。急停首先在本体调用 `robot.stop`，不等待模型。由于最终行为取决于厂商实现，正式使用前必须在受控环境验证正常停止、hold、急停、进程崩溃、网络断开和下电。
+“实验位姿”记录的只是模型输入状态向量对应的关节。回位时 Embodit 自动暂停评测，通过同一个通用 Adapter 按配置的 `max_step` 插值移动，完成后保持模型和只读观测运行。
+
+启动失败或监控确认组件持续故障时，`auto_rollback` 按逆序停止组件，并可调用配置的 hold/power-off。运行期默认每 2 秒读取一次结构化 systemd 状态，连续 3 次异常才确认故障；单次 SSH 探测抖动或 systemd 自动重启过渡不会立即终止部署，恢复时会记录 `component_recovered` 事件。可用 `runtime.monitor_interval_s` 和 `runtime.component_failure_threshold` 调整，但不建议把阈值设为 1。探测失败与组件实际退出会生成不同错误信息。急停不经过该防抖，仍首先在本体调用 `robot.stop`，不等待模型。由于最终行为取决于厂商实现，正式使用前必须在受控环境验证正常停止、hold、急停、进程崩溃、网络断开和下电。
 
 ## 9. 网页与 CLI 使用
 
@@ -266,7 +291,7 @@ Live 需要网页输入 60 秒内有效的 challenge 短语。Embodit 使用 `EM
 bash embodit.sh start
 ```
 
-进入“真机部署”，分别打开或编辑一份本体配置和一份模型配置；两边任意组合后，点击“校验配置”或“一键预检并 Dry Run”。页面会展示生成的 Recipe、步骤状态、组件状态、日志、受控组件重启、Live 确认和急停。旧 Recipe 可以直接导入，工作台会自动拆成两份配置。
+进入“真机部署”，选择本体和模型并启动模型，然后选择 Prompt 后直接点击“开始评测”。动作调度区可在同步、异步固定预取和异步自动预取之间切换，切换只重启轻量 Client。左下执行日志可切换编排、Client、Model、Tunnel 和 ROS，并支持筛选、跟随和清屏；右侧只展示实际模型输入、最近状态/计划/执行轨迹及逐维输出。评测可暂停/继续、快速切换 Prompt，并可记录模型关节位姿后执行一键回位。“断开”只停止本体侧 Client、ROS 与隧道并保留模型；“关闭”同时结束模型服务。
 
 CLI/救援命令：
 
@@ -287,7 +312,7 @@ bash embodit.sh recipe-stop config/my-robot.json --emergency
 
 ## 10. ROS 泛化边界
 
-节点名只作为 readiness 信号，功能适配由带类型的 topic、service、action 定义。Recipe 编排支持 ROS1 和 ROS2；内置 Client 与 FollowJointTrajectory 初始位姿只支持 ROS2。ROS1 需要自定义 Client/命令，且 ROS1 readiness 不接受 `actions` 声明，应检查对应 actionlib topics。
+节点名只作为 readiness 信号，功能适配由带类型的 topic、service、action 定义。Recipe 编排支持 ROS1 和 ROS2；`ros2_standard` 与 FollowJointTrajectory 初始位姿只支持 ROS2。ROS1 或非标准 SDK 可使用厂商无关的 `python_adapter` 契约；ROS1 readiness 不接受 `actions` 声明，应检查对应 actionlib topics。
 
 切换本体 SDK 时，通常只应修改 Recipe 和薄 ROS Bridge；SSH 拓扑、隧道、模型 Provider、生命周期状态机和 UI 保持不变。
 
@@ -304,7 +329,14 @@ POST        /api/deploy/configs/validate
 POST        /api/deploy/compose
 POST        /api/deploy/doctor
 POST        /api/deploy/orchestrations
+POST        /api/deploy/orchestrations/prepare-model
 GET         /api/deploy/orchestrations/{id}
+POST        /api/deploy/orchestrations/{id}/start-evaluation
+POST        /api/deploy/orchestrations/{id}/stop-evaluation
+POST        /api/deploy/orchestrations/{id}/prompt
+POST        /api/deploy/orchestrations/{id}/poses
+POST        /api/deploy/orchestrations/{id}/poses/{pose_id}/move
+DELETE      /api/deploy/orchestrations/{id}/poses/{pose_id}
 POST        /api/deploy/orchestrations/{id}/arm-challenge
 POST        /api/deploy/orchestrations/{id}/start-live
 POST        /api/deploy/orchestrations/{id}/stop

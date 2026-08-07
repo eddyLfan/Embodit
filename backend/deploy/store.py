@@ -102,13 +102,14 @@ class RecipeStore:
 class DeploymentConfigStore:
     """Private persistence for independently reusable robot/model configs."""
 
-    def __init__(self, root: Path, kind: str):
+    def __init__(self, root: Path, kind: str, discovery_roots: list[Path] | None = None):
         if kind not in {"robot", "model"}:
             raise ValueError("部署配置类型必须是 robot 或 model")
         self.kind = kind
         self.root = (root / kind).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.root.chmod(0o700)
+        self.discovery_roots = [path.resolve() for path in (discovery_roots or [])]
 
     def _path(self, config_id: str) -> Path:
         if not SAFE_DEPLOYMENT_ID.fullmatch(config_id):
@@ -140,17 +141,39 @@ class DeploymentConfigStore:
 
     def get(self, config_id: str) -> dict[str, Any]:
         path = self._path(config_id)
-        if not path.is_file():
+        if path.is_file():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            return self._parse(raw).model_dump(mode="json")
+        discovered = self._discover().get(config_id)
+        if discovered is None:
             raise KeyError(f"{self.kind} 配置不存在：{config_id}")
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        return self._parse(raw).model_dump(mode="json")
+        return discovered[0]
+
+    def _discover(self) -> dict[str, tuple[dict[str, Any], Path]]:
+        values: dict[str, tuple[dict[str, Any], Path]] = {}
+        for root in self.discovery_roots:
+            if not root.is_dir():
+                continue
+            for path in sorted(root.glob("*.json")):
+                try:
+                    payload = self._parse(
+                        json.loads(path.read_text(encoding="utf-8"))
+                    ).model_dump(mode="json")
+                except Exception:
+                    continue
+                values.setdefault(payload["config_id"], (payload, path))
+        return values
 
     def list(self) -> list[dict[str, Any]]:
         values: list[dict[str, Any]] = []
+        saved_ids: set[str] = set()
         paths = sorted(self.root.glob("*.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True)
         for path in paths:
             try:
-                values.append(self.describe(self.get(path.stem)))
+                described = self.describe(self.get(path.stem))
+                described["source"] = "saved"
+                values.append(described)
+                saved_ids.add(described["configId"])
             except Exception as error:  # noqa: BLE001
                 values.append({
                     "configId": path.stem,
@@ -159,7 +182,14 @@ class DeploymentConfigStore:
                     "version": 1,
                     "valid": False,
                     "error": str(error),
+                    "source": "saved",
                 })
+        for config_id, (payload, _path) in self._discover().items():
+            if config_id in saved_ids:
+                continue
+            described = self.describe(payload)
+            described["source"] = "project"
+            values.append(described)
         return values
 
     def delete(self, config_id: str) -> bool:
