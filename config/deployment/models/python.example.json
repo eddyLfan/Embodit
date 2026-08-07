@@ -5,20 +5,18 @@
   "name": "My VLA",
   "host": {
     "connection": "local",
-    "address": "192.168.10.10",
+    "address": "127.0.0.1",
     "port": 22,
-    "user": "root",
-    "service_manager": "system"
+    "user": "embodit",
+    "service_manager": "user"
   },
   "model": {
-    "workdir": "/root/vla",
-    "environment": {
-      "CUDA_VISIBLE_DEVICES": "0"
-    },
+    "workdir": "/path/to/model/project",
+    "environment": {},
     "provider": "python",
     "entrypoint": "my_vla:MyVLA",
-    "checkpoint": "/root/checkpoints/my-vla",
-    "python_executable": "/root/miniconda3/envs/vla/bin/python",
+    "checkpoint": "/path/to/checkpoints/my-vla",
+    "python_executable": "/path/to/model-env/bin/python",
     "load_kwargs": {},
     "predict_kwargs": {},
     "startup_timeout_s": 180,

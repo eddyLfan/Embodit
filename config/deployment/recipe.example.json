@@ -4,39 +4,37 @@
   "name": "Robot A + VLA Server",
   "hosts": {
     "model": {
-      "address": "10.40.1.181",
-      "port": 5115,
-      "user": "root",
+      "address": "192.0.2.10",
+      "port": 22,
+      "user": "model",
       "auth": {
-        "type": "password",
-        "password": "CHANGE_ME_MODEL_PASSWORD"
+        "type": "password_env",
+        "environment_variable": "MODEL_SSH_PASSWORD"
       },
       "host_key_policy": "accept-new",
-      "service_manager": "system"
+      "service_manager": "user"
     },
     "robot": {
-      "address": "192.168.10.20",
+      "address": "192.0.2.20",
       "port": 22,
-      "user": "root",
+      "user": "robot",
       "auth": {
-        "type": "password",
-        "password": "CHANGE_ME_ROBOT_PASSWORD"
+        "type": "password_env",
+        "environment_variable": "ROBOT_SSH_PASSWORD"
       },
       "host_key_policy": "accept-new",
-      "service_manager": "system"
+      "service_manager": "user"
     }
   },
   "model": {
     "host": "model",
-    "workdir": "/root/vla",
+    "workdir": "/path/to/model/project",
     "setup": [],
-    "environment": {
-      "CUDA_VISIBLE_DEVICES": "0"
-    },
+    "environment": {},
     "provider": "python",
     "entrypoint": "my_vla:MyVLA",
-    "checkpoint": "/root/checkpoints/my-vla",
-    "python_executable": "/root/miniconda3/envs/vla/bin/python",
+    "checkpoint": "/path/to/checkpoints/my-vla",
+    "python_executable": "/path/to/model-env/bin/python",
     "load_kwargs": {},
     "predict_kwargs": {},
     "startup_timeout_s": 180,
@@ -62,9 +60,9 @@
       "distro": "humble",
       "setup": [
         "/opt/ros/humble/setup.bash",
-        "/root/robot_ws/install/setup.bash"
+        "/path/to/robot_ws/install/setup.bash"
       ],
-      "domain_id": 18
+      "domain_id": 0
     },
     "bringup": {
       "command": [
@@ -73,7 +71,7 @@
         "vendor_robot_bringup",
         "robot.launch.py"
       ],
-      "workdir": "/root/robot_ws",
+      "workdir": "/path/to/robot_ws",
       "startup_timeout_s": 60,
       "restart": "on-failure"
     },

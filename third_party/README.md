@@ -38,8 +38,8 @@ and supplied through the model config's `checkpoint` field.
 Install each provider by following the README at its pinned revision. Keep one
 environment per provider, for example `openpi`, `lerobot`, and `starvla`; their
 PyTorch/CUDA and transitive dependency pins are not merged into Embodit's web
-environment. The model host must contain the same Embodit checkout (the default
-examples use `/root/Embodit`) and the selected environment before first use.
+environment. The model host must contain the same Embodit checkout (the public
+templates mark this as `/path/to/Embodit`) and the selected environment before first use.
 After that one-time provisioning, a deployment only needs the provider and a
 checkpoint.
 

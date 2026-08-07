@@ -132,6 +132,8 @@ cp config/deployment/robot.example.json config/local/my-robot.json
 cp config/deployment/models/python.example.json config/local/models/my-model.json
 ```
 
+仓库模板刻意使用不可路由的文档专用地址和 `/path/to/...` 占位路径，只用于展示和校验配置结构，不能原样运行。
+
 将示例中的主机、SSH 认证、ROS setup、Bringup、readiness、生命周期操作、模型环境、Checkpoint、观测映射、动作维度和真实安全限位替换为设备值。不要直接使用示例限位控制真机。
 
 组合并检查：

@@ -132,6 +132,8 @@ cp config/deployment/robot.example.json config/local/my-robot.json
 cp config/deployment/models/python.example.json config/local/models/my-model.json
 ```
 
+The committed templates deliberately use non-routable documentation addresses and `/path/to/...` placeholders. They validate the configuration shape but must not be run unchanged.
+
 Replace the example hosts, SSH auth, ROS setup, bring-up, readiness, lifecycle operations, model environment, checkpoint, observation mapping, action dimensions, and safety limits with device-specific values. Never use example limits unchanged on hardware.
 
 Compose and validate:

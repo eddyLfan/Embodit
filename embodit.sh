@@ -77,8 +77,8 @@ Examples:
   bash embodit.sh clean --cache
   bash embodit.sh recipe-compose config/deployment/robot.example.json config/deployment/models/python.example.json --output /tmp/my-deployment.json
   bash embodit.sh recipe-validate config/deployment/recipe.example.json
-  bash embodit.sh recipe-run config/deployment/recipe.example.json --mode dry_run
-  bash embodit.sh recipe-stop config/deployment/recipe.example.json
+  bash embodit.sh recipe-run /path/to/my-deployment.json --mode dry_run
+  bash embodit.sh recipe-stop /path/to/my-deployment.json
 
 Optional env vars: EMBODY_ROOT, EMBODY_HOST, EMBODY_PORT,
   EMBODY_PUBLIC_HOST, EMBODY_TOKEN, EMBODY_PROXY, EMBODIT_SANDBOX,

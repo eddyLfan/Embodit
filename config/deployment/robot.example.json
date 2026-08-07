@@ -4,15 +4,15 @@
   "config_id": "robot-a",
   "name": "Robot A",
   "host": {
-    "address": "192.168.10.20",
+    "address": "192.0.2.20",
     "port": 22,
-    "user": "root",
+    "user": "robot",
     "auth": {
       "type": "password_env",
       "environment_variable": "ROBOT_SSH_PASSWORD"
     },
     "host_key_policy": "accept-new",
-    "service_manager": "system"
+    "service_manager": "user"
   },
   "robot": {
     "ros": {
@@ -20,13 +20,13 @@
       "distro": "humble",
       "setup": [
         "/opt/ros/humble/setup.bash",
-        "/root/robot_ws/install/setup.bash"
+        "/path/to/robot_ws/install/setup.bash"
       ],
-      "domain_id": 18
+      "domain_id": 0
     },
     "bringup": {
       "command": ["ros2", "launch", "vendor_robot_bringup", "robot.launch.py"],
-      "workdir": "/root/robot_ws",
+      "workdir": "/path/to/robot_ws",
       "startup_timeout_s": 60,
       "restart": "on-failure"
     },

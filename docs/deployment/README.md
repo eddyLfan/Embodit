@@ -27,6 +27,8 @@ Deployment configuration has three parts:
 
 Templates: [robot](../../config/deployment/robot.example.json), [Python model](../../config/deployment/models/python.example.json), [OpenPI](../../config/deployment/models/openpi.example.json), [LeRobot](../../config/deployment/models/lerobot.example.json), and [StarVLA](../../config/deployment/models/starvla.example.json).
 
+The committed templates use RFC documentation-only addresses and `/path/to/...` placeholders. They are safe configuration references, not runnable deployments. Copy them to `config/local/`, replace every host/user/path/interface/limit value, and complete preflight before running a Recipe.
+
 ## 2. Prerequisites
 
 Workstation:
@@ -67,7 +69,7 @@ cp config/deployment/robot.example.json config/local/my-robot.json
 cp config/deployment/models/python.example.json config/local/models/my-model.json
 ```
 
-After editing both files:
+Do not run either committed template unchanged. After editing both local copies:
 
 ```bash
 export ROBOT_SSH_PASSWORD='<robot-password>'

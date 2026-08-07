@@ -47,4 +47,5 @@ SAM_checkpoints/*.bin
 
 checkpoints/*
 
+# Maintainer-only regression tests are kept outside the public repository.
 tests/

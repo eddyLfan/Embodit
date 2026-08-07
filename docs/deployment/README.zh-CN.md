@@ -33,6 +33,8 @@ Workstation [Embodit]
 - [`../../config/deployment/models/lerobot.example.json`](../../config/deployment/models/lerobot.example.json)
 - [`../../config/deployment/models/starvla.example.json`](../../config/deployment/models/starvla.example.json)
 
+仓库模板使用 RFC 文档专用地址和 `/path/to/...` 占位路径，只是安全的字段参考，不是可运行部署。必须先复制到 `config/local/`，替换所有主机、用户、路径、接口和限位，并通过预检后再运行 Recipe。
+
 ## 2. 接入前准备
 
 ### 2.1 工作电脑
@@ -74,7 +76,7 @@ cp config/deployment/robot.example.json config/local/my-robot.json
 cp config/deployment/models/python.example.json config/local/models/my-model.json
 ```
 
-编辑两份文件后：
+不要原样运行仓库模板。编辑两份本地副本后：
 
 ```bash
 export ROBOT_SSH_PASSWORD='<robot-password>'

@@ -28,7 +28,6 @@ project/
 ├── third_party/models/         # 固定 gitlink 的模型上游源码，不含权重
 ├── docs/data/                 # 数据层使用指南
 ├── docs/deployment/           # 真机部署层使用指南
-├── tests/                     # 与模块对应的回归测试
 └── embodit.sh                 # 唯一用户脚本入口
 ```
 
