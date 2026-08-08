@@ -14,16 +14,7 @@
 
 Real-robot model iteration is a recurring engineering loop, not one inference call:
 
-```mermaid
-flowchart LR
-    A["Collect robot data"] --> B["Browse, QC, and review"]
-    B --> C["Filter and export training data"]
-    C --> D["Train with your existing stack"]
-    D --> E["Connect a checkpoint"]
-    E --> F["Dry Run / live evaluation"]
-    F --> G["Diagnose failures and collect more data"]
-    G --> B
-```
+![Embodit workflow](images/Flowchart.png)
 
 Dataset inspection, quality decisions, training-set preparation, SSH, model services, tunnels, ROS bring-up, robot lifecycle operations, and action clients usually live in separate scripts and terminals. Embodit consolidates them into one local workspace and a reproducible configuration model.
 
