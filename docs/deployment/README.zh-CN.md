@@ -2,7 +2,7 @@
 
 [English](README.md) · **中文**
 
-本指南说明如何接入模型、本体和安全配置。当前架构已完成真机链路验证；换用新设备时，必须重新确认 SDK/ROS 接口、单位、关节顺序、限位和生命周期操作。
+本指南说明如何接入模型、本体和安全配置。Embodit 提供软件接入路径和自动回归测试，但这不代表某个本体、模型或 Checkpoint 已经完成安全验证。每种设备都必须在受控环境中重新确认 SDK/ROS 接口、单位、关节顺序、限位、生命周期操作和故障行为。
 
 ## 1. 运行架构
 
@@ -35,6 +35,8 @@ Workstation [Embodit]
 
 仓库模板使用 RFC 文档专用地址和 `/path/to/...` 占位路径，只是安全的字段参考，不是可运行部署。必须先复制到 `config/local/`，替换所有主机、用户、路径、接口和限位，并通过预检后再运行 Recipe。
 
+Embodit 原生提供的是明文 HTTP 和 Bearer Token，不内置 TLS。不要将服务直接暴露到公网。超出 localhost 访问时，应使用可信私网或 VPN、防火墙限制和正确配置的 TLS 反向代理。启用局域网访问或真机控制前，请阅读仓库[Security Policy](../../SECURITY.md)。
+
 ## 2. 接入前准备
 
 ### 2.1 工作电脑
@@ -54,8 +56,10 @@ Workstation [Embodit]
 
 ### 2.3 模型端
 
-- systemd；
-- 对应模型 Python 环境、Checkpoint 和 Embodit checkout；
+- 所有受管模型进程都需要 systemd，以及配置所指定的运行时可执行文件或命令；
+- 内置 OpenPI、LeRobot、StarVLA Provider 需要带子模块的固定版本 Embodit checkout、独立 Provider 环境和兼容 Checkpoint；
+- 自定义 Python Provider 需要自己的 `workdir`、可导入模块、Python 运行时和 Checkpoint，不要求 Embodit checkout；
+- `external` Provider 需要兼容的受管命令/服务、健康检查和 `/infer` 契约，不要求 Embodit checkout；
 - 远端模型需要 SSH；本地模型由 Embodit 直接执行；
 - `endpoint.bind` 默认 `127.0.0.1`，不应直接暴露到局域网。
 
@@ -71,10 +75,14 @@ git submodule status --recursive
 ## 3. 最短接入流程
 
 ```bash
-mkdir -p config/local/models
+mkdir -p config/local
+chmod 700 config/local
 cp config/deployment/robot.example.json config/local/my-robot.json
-cp config/deployment/models/python.example.json config/local/models/my-model.json
+cp config/deployment/models/python.example.json config/local/my-model.json
+chmod 600 config/local/my-robot.json config/local/my-model.json
 ```
+
+页面使用非递归规则 `config/local/*.json` 发现项目配置。两份文件都必须直接放在 `config/local/` 根目录；子目录中的配置不会出现在页面中。
 
 不要原样运行仓库模板。编辑两份本地副本后：
 
@@ -84,7 +92,7 @@ export MODEL_SSH_PASSWORD='<model-password>'  # 远端模型需要
 
 bash embodit.sh recipe-compose \
   config/local/my-robot.json \
-  config/local/models/my-model.json \
+  config/local/my-model.json \
   --output /tmp/my-deployment.json
 
 bash embodit.sh recipe-validate /tmp/my-deployment.json
@@ -101,9 +109,10 @@ bash embodit.sh start
 1. 选择本体和模型配置；
 2. 运行“预检”；预检只读连接主机，检查 systemd、模型路径/Python、ROS setup，ROS 已运行时检查 graph/type/rate/freshness；
 3. 启动模型并等待 `/health`；
-4. 填写 Prompt，连接本体并进入 Dry Run 或评测；
+4. 填写 Prompt，连接本体并进入 Dry Run；
 5. 观察实际模型输入、计划动作、执行动作、延迟和日志；
-6. 暂停/断开/关闭，或在危险情况下执行急停。
+6. 需要 Live 时执行第 11 节的一次性短语解锁；
+7. 暂停/断开/关闭，或在危险情况下执行急停。
 
 CLI：
 
@@ -113,6 +122,22 @@ bash embodit.sh recipe-run /tmp/my-deployment.json --mode live
 bash embodit.sh recipe-stop /tmp/my-deployment.json
 bash embodit.sh recipe-stop /tmp/my-deployment.json --emergency
 ```
+
+CLI 命令与参数：
+
+| 命令或参数 | 行为 |
+|---|---|
+| `recipe-compose ROBOT MODEL` | 将两份组件 Config 组合为 Recipe v2 |
+| `--deployment-id ID` | 用 `ID` 覆盖自动生成的 Deployment ID |
+| `--name NAME` | 覆盖自动生成的显示名称 |
+| `--output FILE` | 将 JSON 写入 `FILE` 并设为 `0600`；省略时输出到 stdout |
+| `recipe-validate FILE` | 只校验并打印脱敏 Recipe，不启动服务 |
+| `recipe-run FILE --mode dry_run` | 启动并保持 Dry Run |
+| `recipe-run FILE --mode live` | 要求 TTY，先启动 Dry Run，再要求输入 60 秒有效的一次性短语后进入 Live |
+| `recipe-run FILE` | 使用 `runtime.default_mode`；即使为 `live` 也必须经过同一 Dry Run 与 TTY 确认门控 |
+| `--no-follow` | Dry Run 就绪或 Live 确认完成后退出；本地/远端受管 systemd 组件继续运行 |
+| `recipe-stop FILE` | 按依赖关系逆序停止活动组件 |
+| `--emergency` | 优先调用 `robot.stop`，再逆序拆除组件 |
 
 ## 4. 通用主机字段 `host`
 
@@ -446,7 +471,7 @@ class MyVLA:
 | `lerobot` | 完整 `save_pretrained` 目录和 processor metadata | 特殊 feature 使用 `observation_map` |
 | `starvla` | 模型配置和归一化统计与权重同目录 | 多归一化域设置 `unnorm_key` |
 
-`workdir` 默认指向包含 `third_party/models/<provider>` 的 Embodit checkout。Provider 环境必须按固定上游提交安装。
+对于内置 OpenPI、LeRobot、StarVLA Provider，`workdir` 必须指向包含 `third_party/models/<provider>` 的 Embodit checkout。Provider 环境必须按固定上游提交安装。
 
 ### 8.4 `external`
 
@@ -472,7 +497,7 @@ class MyVLA:
 
 | 字段 | 写法 |
 |---|---|
-| `default_mode` | `dry_run` 或 `live` |
+| `default_mode` | 启动后请求的模式，可为 `dry_run` 或 `live`；`live` 不能绕过 Dry Run 解锁门控 |
 | `auto_rollback` | 启动失败是否逆序回滚 |
 | `stop_model_on_exit` | 完整停止时是否停止模型 |
 | `power_off_on_exit` | 退出时是否调用 `power_off` |
@@ -504,15 +529,39 @@ class MyVLA:
 → initial_pose + 实测容差
 → Robot Client
 → 首次完整推理
-→ dry_run / running
+→ dry_run
 ```
 
 任何一步失败都会记录原因，并在 `auto_rollback=true` 时逆序清理。
 
-## 11. Dry Run、Live 与停止
+## 11. 离线评测、Dry Run、Live 与停止
+
+### 11.1 离线单帧评测
+
+离线单帧评测是面向已录制数据集的纯模型检查。先单独准备模型，并等待 Orchestration 进入 `MODEL_READY`；此时本体观测/控制链路、ROS Bringup、Tunnel 和 Robot Client 都不应连接。选择数据集的 Episode 和帧后，Embodit 读取该帧已记录的 state、相机图像和任务 Prompt，直接请求已驻留模型，再将预测动作块与时间对齐后的记录 action 对比，返回逐维和整体误差指标。
+
+该路径不会给本体上电，不会读取真实本体观测，不会启动控制 Client，也绝不会发送动作。单次模型推理超时为 30 秒。每个 Orchestration 一次只允许一个离线请求（single-flight）；并发请求或在请求未结束时切换其他运行模式会被拒绝。
+
+离线评测不等于 Dry Run 或 Live：
+
+- 离线单帧评测只读取一帧记录数据，且只与 `MODEL_READY` 模型服务交互；
+- Dry Run 运行已配置的观测/Tunnel/模型/动作校验链路，可能持续使用合成观测或只读 Adapter 观测，但不发送控制器/Adapter 动作；
+- Live 连接本体控制链路，并且只在全部 readiness 和解锁要求通过后执行真实动作。
+
+### 11.2 Dry Run 到 Live 的解锁门控
+
+所有 Orchestration 都从 Dry Run 启动，包括 `runtime.default_mode=live` 的 Recipe。Web 与 CLI 都只能在 Dry Run 就绪后提升到 Live，并要求操作者在 60 秒有效期内原样输入服务端生成的一次性短语：
+
+```text
+LIVE <deployment_id> <6 位大写十六进制 token>
+```
+
+Web 只会从已就绪的 Dry Run 请求该 Challenge。CLI 的 `recipe-run --mode live`（以及默认模式为 `live` 的 Recipe）会在启动任何服务前检查交互式 TTY，随后先等待 Dry Run，再打印 Challenge 并读取一整行精确输入；`--no-follow` 也必须完成确认后才退出。短语过期或不匹配时，Orchestration 保持 Dry Run。系统不存在未解锁直达 Live 的路径。
+
+### 11.3 运行与停止行为
 
 - `dry_run`：执行观测、隧道、模型和动作校验，不向控制器/Adapter 发送动作；
-- `live`：通过全部 readiness 后执行真实动作；
+- `live`：通过全部 readiness 和 Dry Run 解锁门控后才执行真实动作；
 - 暂停：调用 hold，停止真实动作并保持模型/观测；
 - 断开：停止 Client、ROS 和 tunnel，保留模型；
 - 关闭：同时停止模型；
@@ -550,25 +599,45 @@ bash embodit.sh recipe-validate /tmp/my-deployment.json
 
 ## 13. HTTP API
 
+以下端点都需要 Embodit 访问 Token。除非运维侧提供 TLS 反向代理，否则它们通过明文 HTTP 提供；网络和凭据要求见 [SECURITY.md](../../SECURITY.md)。
+
 ```text
-GET/POST    /api/deploy/configs/{robot|model}
-GET/DELETE  /api/deploy/configs/{robot|model}/{id}
 POST        /api/deploy/configs/validate
 POST        /api/deploy/compose
-GET/POST    /api/deploy/recipes
 POST        /api/deploy/recipes/validate
 POST        /api/deploy/recipes/split
+GET/POST    /api/deploy/configs/{kind}
+GET/DELETE  /api/deploy/configs/{kind}/{config_id}
+GET/POST    /api/deploy/recipes
+GET/DELETE  /api/deploy/recipes/{recipe_id}
+GET         /api/deploy/capabilities
+GET         /api/deploy/model-catalog
 POST        /api/deploy/doctor
 POST        /api/deploy/robot-connection
+GET         /api/deploy/examples/{name}
+GET/POST    /api/deploy/orchestrations
 POST        /api/deploy/orchestrations/prepare-model
-POST        /api/deploy/orchestrations/{id}/start-dry-run
-POST        /api/deploy/orchestrations/{id}/start-evaluation
-POST        /api/deploy/orchestrations/{id}/stop-evaluation
-POST        /api/deploy/orchestrations/{id}/prompt
-POST        /api/deploy/orchestrations/{id}/scheduler
-POST        /api/deploy/orchestrations/{id}/poses
-POST        /api/deploy/orchestrations/{id}/stop
-POST        /api/deploy/orchestrations/{id}/emergency-stop
+GET         /api/deploy/orchestrations/{orchestration_id}
+POST        /api/deploy/orchestrations/{orchestration_id}/offline-evaluation
+POST        /api/deploy/orchestrations/{orchestration_id}/start-dry-run
+POST        /api/deploy/orchestrations/{orchestration_id}/start-evaluation
+POST        /api/deploy/orchestrations/{orchestration_id}/prompt
+POST        /api/deploy/orchestrations/{orchestration_id}/scheduler
+POST        /api/deploy/orchestrations/{orchestration_id}/disconnect-robot
+POST        /api/deploy/orchestrations/{orchestration_id}/close-model
+POST        /api/deploy/orchestrations/{orchestration_id}/poses
+POST        /api/deploy/orchestrations/{orchestration_id}/poses/{pose_id}/move
+DELETE      /api/deploy/orchestrations/{orchestration_id}/poses/{pose_id}
+POST        /api/deploy/orchestrations/{orchestration_id}/arm-challenge
+POST        /api/deploy/orchestrations/{orchestration_id}/start-live
+POST        /api/deploy/orchestrations/{orchestration_id}/stop-evaluation
+POST        /api/deploy/orchestrations/{orchestration_id}/stop
+POST        /api/deploy/orchestrations/{orchestration_id}/emergency-stop
+POST        /api/deploy/orchestrations/{orchestration_id}/logs
+POST        /api/deploy/orchestrations/{orchestration_id}/components/{component}/restart
+GET         /api/deploy/orchestrations/{orchestration_id}/manifest
 ```
+
+`start-evaluation` 是兼容路由，只会进入或保持 Dry Run，不能把 Orchestration 提升到 Live。Live 必须先调用 `arm-challenge`，再用精确且未过期的短语调用 `start-live`。
 
 Config 用于复用，Recipe 用于执行；不要维护两套运行配置。

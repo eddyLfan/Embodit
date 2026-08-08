@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -21,6 +22,26 @@ from .view import FORMAT_HDF5, CameraRef, DatasetView, EpisodeView
 
 _video_locks: dict[str, threading.Lock] = {}
 _video_locks_guard = threading.Lock()
+
+
+def _new_staging_file(output: Path) -> Path:
+    """Create a unique same-directory staging file for atomic publication."""
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{output.name}.building-",
+        suffix=output.suffix,
+        dir=output.parent,
+    )
+    os.close(descriptor)
+    return Path(name)
+
+
+def _publish_staging_file(staging: Path, output: Path) -> None:
+    """Atomically publish ``staging`` without replacing a concurrent target."""
+    try:
+        os.link(staging, output)
+    except FileExistsError as error:
+        raise FileExistsError(f"目标已存在：{output}") from error
+    staging.unlink()
 
 
 def _open_h5(path: Path):
@@ -554,30 +575,34 @@ class Hdf5Adapter(DatasetAdapter):
     ) -> dict[str, Any]:
         import h5py
 
-        view = self.inspect()
         selected = sorted({int(i) for i in episode_indices})
         output = output.expanduser().resolve()
+        if output.suffix.lower() not in {".hdf5", ".h5"}:
+            output = output.with_suffix(".hdf5")
         if output.exists():
             raise FileExistsError(f"目标已存在：{output}")
         output.parent.mkdir(parents=True, exist_ok=True)
-        if output.suffix.lower() not in {".hdf5", ".h5"}:
-            output = output.with_suffix(".hdf5")
-
-        with h5py.File(output, "w") as dst_f:
-            dst_data = dst_f.create_group("data")
-            copied_env = False
-            for new_idx, old_idx in enumerate(selected):
-                file_path, demo_key, _ep = self._episode_ref(old_idx)
-                with h5py.File(file_path, "r") as src_f:
-                    if demo_key:
-                        src_group = _group_for(src_f, demo_key)
-                    else:
-                        src_group = src_f["data"] if "data" in src_f else src_f
-                    src_f.copy(src_group, dst_data, name=f"demo_{new_idx}")
-                    if not copied_env and "data" in src_f:
-                        for attr_key, attr_val in src_f["data"].attrs.items():
-                            dst_data.attrs[attr_key] = attr_val
-                        copied_env = True
+        staging = _new_staging_file(output)
+        try:
+            with h5py.File(staging, "w") as dst_f:
+                dst_data = dst_f.create_group("data")
+                copied_env = False
+                for new_idx, old_idx in enumerate(selected):
+                    file_path, demo_key, _ep = self._episode_ref(old_idx)
+                    with h5py.File(file_path, "r") as src_f:
+                        if demo_key:
+                            src_group = _group_for(src_f, demo_key)
+                        else:
+                            src_group = src_f["data"] if "data" in src_f else src_f
+                        src_f.copy(src_group, dst_data, name=f"demo_{new_idx}")
+                        if not copied_env and "data" in src_f:
+                            for attr_key, attr_val in src_f["data"].attrs.items():
+                                dst_data.attrs[attr_key] = attr_val
+                            copied_env = True
+            _publish_staging_file(staging, output)
+        except BaseException:
+            staging.unlink(missing_ok=True)
+            raise
         manifest = {
             "version": 1,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -634,10 +659,11 @@ class Hdf5Writer(DatasetWriter):
         if output.exists():
             raise FileExistsError(f"目标已存在：{output}")
         output.parent.mkdir(parents=True, exist_ok=True)
+        staging = _new_staging_file(output)
         total_episodes = 0
         total_frames = 0
         try:
-            with h5py.File(output, "w") as handle:
+            with h5py.File(staging, "w") as handle:
                 data = handle.create_group("data")
                 for idx, ep in enumerate(episodes):
                     group = data.create_group(f"demo_{idx}")
@@ -670,8 +696,9 @@ class Hdf5Writer(DatasetWriter):
                     total_episodes += 1
                     total_frames += length
                 data.attrs["total"] = total_episodes
-        except Exception:
-            output.unlink(missing_ok=True)
+            _publish_staging_file(staging, output)
+        except BaseException:
+            staging.unlink(missing_ok=True)
             raise
         return {
             "output": str(output),

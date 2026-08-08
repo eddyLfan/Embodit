@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv
+      - name: Sync locked development environment
+        run: uv sync --frozen --extra dev
+      - name: Run Python regressions
+        run: uv run --no-sync pytest -q
+      - name: Compile backend
+        run: uv run --no-sync python -m compileall -q backend
+      - name: Check launcher syntax
+        run: bash -n embodit.sh
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Check JavaScript syntax
+        run: |
+          node --check web/app.js
+          node --check web/i18n.js
+          node --check web/utils.js
+      - name: Run frontend regressions
+        run: node --test web/frontend-regressions.test.js

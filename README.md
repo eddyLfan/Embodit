@@ -1,164 +1,275 @@
 <div align="center">
   <img src="images/Embodit_logo.png" alt="Embodit" width="180">
   <h1>Embodit</h1>
-  <p><strong>From real-robot data to model deployment, then back to the next data iteration.</strong></p>
+  <p><strong>A local-first workspace for embodied-data curation and robot-model deployment.</strong></p>
   <p><strong>English</strong> · <a href="README.zh-CN.md">中文</a></p>
   <p>
     <a href="docs/data/README.md">Data guide</a> ·
-    <a href="docs/deployment/README.md">Robot deployment guide</a> ·
-    <a href="docs/architecture.md">Architecture</a>
+    <a href="docs/deployment/README.md">Deployment guide</a> ·
+    <a href="docs/architecture.md">Architecture</a> ·
+    <a href="CONTRIBUTING.md">Contributing</a> ·
+    <a href="SECURITY.md">Security</a>
   </p>
 </div>
 
-## Why Embodit
+> [!IMPORTANT]
+> Embodit is a pre-1.0 engineering toolkit. The data workspace is intended for
+> reproducible local processing; robot deployment remains experimental and is
+> not a real-time controller or hardware safety system. Back up important data,
+> validate every device-specific limit, and keep a physical emergency stop
+> within reach during live experiments.
 
-Real-robot model iteration is a recurring engineering loop, not one inference call:
+## Overview
+
+Real-world robot development is a loop: inspect collected data, find quality
+problems, prepare the next training set, load a model, validate its inputs and
+actions, run a controlled evaluation, and feed the result back into data
+curation. These steps often live in unrelated scripts and terminals. Embodit
+brings them into one local service and one reproducible configuration model.
 
 ![Embodit workflow](images/Flowchart.png)
 
-Dataset inspection, quality decisions, training-set preparation, SSH, model services, tunnels, ROS bring-up, robot lifecycle operations, and action clients usually live in separate scripts and terminals. Embodit consolidates them into one local workspace and a reproducible configuration model.
-
-Embodit does not replace your data-collection SDK, training framework, robot driver, or hardware safety system.
+Embodit does **not** replace a collection SDK, training framework, robot driver,
+access-control gateway, or independent hardware safety chain.
 
 ## Capabilities
 
-| Layer | Capabilities |
+| Area | Included |
 |---|---|
-| Data | Browse LeRobot v2.1/v3, RoboMimic HDF5, and MCAP; synchronized playback; automatic QC; review; labels; filtering; conversion; merge; augmentation; fidelity-aware export |
-| Robot deployment | Reusable robot/model configs; OpenPI, LeRobot, and StarVLA checkpoints; custom Python models; SSH/systemd; model tunnel; ROS readiness; Dry Run; Live; monitoring, stop, and rollback |
+| Dataset inspection | LeRobot v2.1/v3, recognized RoboMimic/Astribot-style HDF5, and MCAP; timeline-aligned cameras, task text, state, and action series |
+| Data governance | `pass/review/quarantine` decisions, episode/interval labels, configurable reasons, automatic QC, finding review, CSV reports |
+| Data processing | Native subset export, fidelity-aware conversion, strict same-format merge, built-in brightness augmentation, optional SAM3-assisted color augmentation |
+| Model integration | Custom Python models, OpenPI, LeRobot, StarVLA, or an existing compatible service; model weights are not bundled |
+| Robot deployment | Composable Robot/Model Configs, Recipe v2, SSH/systemd orchestration, restricted model tunnel, ROS readiness, Dry Run, offline single-frame evaluation, Live mode, monitoring, rollback, and emergency software stop |
 
-See the [data guide](docs/data/README.md) and [robot deployment guide](docs/deployment/README.md). The current deployment architecture has been exercised on real hardware; each device still requires its own SDK integration, topics/actions, physical limits, and safety operations.
+### Supported dataset formats
 
-## Quick Start
+| Format | Browse/QC | Native subset | Cross-format conversion | Strict merge |
+|---|:---:|:---:|:---:|:---:|
+| LeRobot v2.1 | ✓ | ✓ | ✓ | ✓ |
+| LeRobot v3 | ✓ | ✓ | ✓ | ✓ |
+| HDF5 (`.h5`, `.hdf5`) | ✓ | ✓ | ✓ | ✓ |
+| MCAP file or directory | ✓ | ✓ | ✓ | ✓ |
 
-### 1. Install and start
+Native subsets preserve the source format. Cross-format conversion may rebuild
+metadata, transcode media, synthesize timestamps, or omit source-specific
+topics; every conversion writes a report describing known losses. See the
+[data fidelity notes](docs/data/README.md#5-subset-export-and-fidelity).
 
-Requirements: Linux, Python 3.10+, [uv](https://docs.astral.sh/uv/), and Git.
+## Requirements
+
+Core workspace:
+
+- Linux with Bash;
+- Python 3.10 or newer (`python3` on `PATH`);
+- [uv](https://docs.astral.sh/uv/);
+- a modern desktop browser;
+- Git for cloning and optional model submodules.
+
+Robot deployment additionally requires OpenSSH access and a usable systemd
+manager on the managed hosts. ROS, CUDA, SAM3, provider-specific Python
+environments, checkpoints, and vendor SDKs are optional components that must be
+installed separately for the workflows that use them.
+
+Embodit is an application repository (`tool.uv.package = false`), not a PyPI
+library. Use `embodit.sh` as the supported service and deployment entry point.
+
+## Quick start
 
 ```bash
 git clone https://github.com/eddyLfan/Embodit.git
 cd Embodit
 
-# This directory becomes the data browsing root.
+# DATA_ROOT is the initial directory shown by the local workspace.
 bash embodit.sh start /path/to/datasets
 ```
 
-The first start installs all dependencies synchronously and opens the UI only after the environment is ready. Nothing continues installing in the background. You can also prepare the environment separately:
+The first start synchronizes the locked **core** environment before launching
+the service. Later starts skip synchronization while `pyproject.toml` and
+`uv.lock` are unchanged. The terminal prints a URL such as
+`http://localhost:8765/?token=...`; the first request exchanges the token for a
+30-day HttpOnly cookie and redirects to a URL without the token.
+
+Prepare dependencies without starting the service:
+
+```bash
+bash embodit.sh setup
+```
+
+Use a trusted package mirror when needed:
+
+```bash
+EMBODIT_PYPI_MIRROR=tsinghua bash embodit.sh setup
+
+# Or any trusted PEP 503 Simple Index.
+EMBODIT_PYPI_MIRROR=https://mirror.example/simple bash embodit.sh setup
+```
+
+`uv.lock` continues to pin package versions and hashes. Native uv index
+configuration and `EMBODY_PROXY` are also supported.
+
+### Service commands
 
 ```bash
 bash embodit.sh status
-bash embodit.sh setup
-```
-
-An environment fingerprint derived from `pyproject.toml + uv.lock` skips synchronization on later starts when dependencies have not changed. The terminal prints a URL such as `http://localhost:8765/?token=...`; the first visit exchanges the Token for an HttpOnly Cookie.
-
-Select a faster trusted PyPI mirror when the default route is slow:
-
-```bash
-EMBODIT_PYPI_MIRROR=tsinghua \
-bash embodit.sh start /path/to/datasets
-
-# Any trusted PEP 503 Simple Index is accepted.
-EMBODIT_PYPI_MIRROR=https://your-mirror.example/simple \
-bash embodit.sh setup
-```
-
-The script also respects uv's native `UV_DEFAULT_INDEX`, the shared uv cache, and `EMBODY_PROXY`. Package versions and hashes remain pinned by `uv.lock`.
-
-Omit the path to use the current directory:
-
-```bash
-bash embodit.sh start
-```
-
-Service commands:
-
-```bash
-bash embodit.sh status
-bash embodit.sh setup
 bash embodit.sh logs 100
 bash embodit.sh logs -f
 bash embodit.sh restart /path/to/datasets
 bash embodit.sh stop
+
+# Stop the service before a real cleanup.
+bash embodit.sh clean --expired --dry-run
+bash embodit.sh clean --expired
+bash embodit.sh clean --cache
+bash embodit.sh clean --all
 ```
 
-Use another port when needed:
+Cleanup only targets Embodit-managed cache paths. It does not delete dataset
+outputs, labels, review files, deployment state, the virtual environment, or
+the service token/log.
 
-```bash
-EMBODY_PORT=8877 bash embodit.sh start /path/to/datasets
-```
+### Common environment variables
 
-### 2. LAN access
+| Variable | Default | Purpose |
+|---|---|---|
+| `EMBODY_ROOT` | current directory | Initial data root when `start` has no path argument |
+| `EMBODY_HOST` | `127.0.0.1` | Bind address |
+| `EMBODY_PORT` | `8765` | Web port |
+| `EMBODY_PUBLIC_HOST` | `localhost` | Host printed in the browser URL |
+| `EMBODY_TOKEN` | generated/persisted | Explicit bearer token |
+| `EMBODY_PROXY` | unset | HTTP(S) proxy for environment setup |
+| `EMBODIT_SANDBOX` | automatic for non-loopback | Restrict client-supplied data paths to `DATA_ROOT` |
+| `EMBODIT_STATE_DIR` | `.embodit/` | PID, URL, token, environment stamp, and service log |
+| `EMBODIT_CACHE_DIR` | `.embodit_cache/` | Media cache, jobs, QC reports, and deployment state |
+| `EMBODIT_REVIEW_CONFIG` | `config/data/review.json` | Review-reason configuration |
 
-```bash
-EMBODY_HOST=0.0.0.0 \
-EMBODY_PUBLIC_HOST=<workstation-ip> \
-bash embodit.sh start /path/to/datasets
-```
+The full data-specific environment reference is in the
+[data guide](docs/data/README.md#1-start-and-path-scope).
 
-Non-loopback listeners automatically enable path confinement: browsing and all writes are restricted to the selected data root. Set `EMBODIT_SANDBOX=0` only when a trusted deployment explicitly needs other paths.
+## Data workflow
 
-### 3. Run a data iteration
+1. Start Embodit with a directory that contains the datasets and intended
+   output locations.
+2. Inspect episode metadata, cameras, task text, and state/action signals.
+3. Run automatic QC, then review findings and final episode decisions.
+4. Save review progress to `*.review.json`; labels use the dataset's fixed
+   sidecar (`labels.jsonl` for directory datasets or
+   `<filename>.labels.jsonl` for file datasets).
+5. Export selected episodes, convert formats, strictly merge compatible
+   datasets, or preview and run augmentation into a new output path.
 
-1. Open a dataset and inspect cameras, state, action, and task text together.
-2. Run automatic QC and review `quarantine` and `review` episodes.
-3. Add episode/range labels and set final `pass/review/quarantine` decisions.
-4. Export selected episodes, or run conversion, strict merge, and augmentation.
+QC, conversion, merge, and augmentation run in detached workers. Closing the
+browser does not stop them. Details, fidelity limits, thresholds, and cleanup
+policy are documented in the [data guide](docs/data/README.md).
 
-See the [data guide](docs/data/README.md) for formats, QC thresholds, and conversion mappings.
+## Model and robot workflow
 
-### 4. Connect a model and robot
-
-Initialize the model source you need; skip this for a custom Python provider:
+Initialize only the provider sources you need; skip this for a standalone
+custom Python provider or an existing external model service:
 
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
+git submodule status --recursive
 ```
 
-Copy the robot and model templates:
+Copy both component templates into the non-recursive discovery directory:
 
 ```bash
-mkdir -p config/local/models
+mkdir -p config/local
+chmod 700 config/local
 cp config/deployment/robot.example.json config/local/my-robot.json
-cp config/deployment/models/python.example.json config/local/models/my-model.json
+cp config/deployment/models/python.example.json config/local/my-model.json
+chmod 600 config/local/my-robot.json config/local/my-model.json
 ```
 
-The committed templates deliberately use non-routable documentation addresses and `/path/to/...` placeholders. They validate the configuration shape but must not be run unchanged.
+Committed templates contain documentation-only network addresses and
+`/path/to/...` placeholders. Replace every host, SSH setting, ROS interface,
+work directory, checkpoint, observation mapping, action dimension, lifecycle
+operation, and physical limit. Never run a template unchanged on hardware.
 
-Replace the example hosts, SSH auth, ROS setup, bring-up, readiness, lifecycle operations, model environment, checkpoint, observation mapping, action dimensions, and safety limits with device-specific values. Never use example limits unchanged on hardware.
-
-Compose and validate:
+Compose and validate a Recipe:
 
 ```bash
 export ROBOT_SSH_PASSWORD='<robot-password>'
 
 bash embodit.sh recipe-compose \
   config/local/my-robot.json \
-  config/local/models/my-model.json \
+  config/local/my-model.json \
   --output /tmp/my-deployment.json
 
 bash embodit.sh recipe-validate /tmp/my-deployment.json
+bash embodit.sh recipe-run /tmp/my-deployment.json --mode dry_run
 ```
 
-The recommended path is the “Robot deployment” workspace: select both configs, run the read-only preflight, then start the model and robot link. Equivalent CLI commands are:
+`recipe-run --mode live` can send real actions. It requires an interactive
+terminal, always starts in Dry Run, and requires the server-issued one-time
+phrase within 60 seconds before promotion to Live. Use it only after read-only
+preflight, model preparation, action-shape/limit verification, and an independent
+hardware safety rehearsal. The complete procedure is in the
+[deployment guide](docs/deployment/README.md).
+
+## Security and privacy
+
+- The service has no built-in TLS or multi-user RBAC. Keep it on localhost or a
+  trusted private network. Never expose its HTTP port directly to the public
+  Internet; use an authenticated TLS reverse proxy or an SSH tunnel when remote
+  access is necessary.
+- On localhost, `DATA_ROOT` is an initial browser location, not a security
+  boundary. Non-loopback listeners automatically enable path confinement unless
+  explicitly overridden.
+- Anyone holding the bearer token can use data and deployment APIs. Protect
+  `.embodit/token`, rotate `EMBODY_TOKEN` after suspected disclosure, and treat
+  `.embodit/`, `.embodit_cache/`, logs, reports, and Recipes as sensitive.
+- The core workspace contains no analytics or automatic cloud upload. During
+  deployment, observations, images, state, and prompts are sent to the selected
+  model host through the configured connection.
+- Recipes, custom Python adapters/providers, checkpoints, submodules, datasets,
+  and native media parsers must be treated as trusted inputs and run with least
+  privilege.
+
+Read [SECURITY.md](SECURITY.md) before LAN access or robot deployment.
+
+## Documentation
+
+| Document | Scope |
+|---|---|
+| [Data guide](docs/data/README.md) | Formats, review, labels, QC, conversion, merge, augmentation, jobs, and cleanup |
+| [QC standard](docs/data/QC_STANDARD.zh-CN.md) | Detector semantics, calibration, and acceptance guidance (Chinese) |
+| [Deployment guide](docs/deployment/README.md) | Robot/Model Config fields, Recipe lifecycle, safety, offline evaluation, Dry Run, and Live |
+| [Architecture](docs/architecture.md) | Module boundaries, extension points, and tests |
+| [Configuration guide](config/README.md) | Committed templates versus private local configuration |
+| [Third-party components](third_party/README.md) | Pinned source integrations, model/SAM3 ownership, and license boundaries |
+| [Contributing](CONTRIBUTING.md) | Development setup, checks, and pull-request expectations |
+| [Security policy](SECURITY.md) | Supported versions, reporting, threat model, and robot safety |
+| [Changelog](CHANGELOG.md) | Release-level changes |
+
+## Development
 
 ```bash
-bash embodit.sh recipe-run /tmp/my-deployment.json --mode dry_run
-bash embodit.sh recipe-run /tmp/my-deployment.json --mode live
-bash embodit.sh recipe-stop /tmp/my-deployment.json
-bash embodit.sh recipe-stop /tmp/my-deployment.json --emergency
+uv sync --frozen --extra dev
+UV_CACHE_DIR=/tmp/embodit-uv-cache uv run --no-sync pytest -q
+python3 -m compileall -q backend
+bash -n embodit.sh
+git diff --check
 ```
 
-See the [robot deployment guide](docs/deployment/README.md) for the complete integration procedure and field reference.
+Node.js 20 is used for the dependency-free frontend regression checks. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the complete command set and module
+boundaries.
 
-## TODO
+## Roadmap
 
-The project roadmap will be added here.
+Priorities before 1.0 include broader golden-dataset QC calibration, more
+dataset and robot adapters, reproducible provider provisioning, expanded
+cross-platform validation, and stronger release/security automation. Roadmap
+items are not compatibility guarantees; behavior may change while the project
+is pre-1.0.
 
-## Contributing
+## License and third-party software
 
-Issues, features, robot/model adapters, documentation, and fixes are welcome. See the [architecture guide](docs/architecture.md) for extension points.
-
-## License
-
-[MIT](LICENSE)
+Embodit-owned source is licensed under the [MIT License](LICENSE). Git
+submodules, model weights, checkpoints, datasets, SAM3, FFmpeg builds, and other
+third-party assets retain their own licenses and usage terms. Embodit does not
+redistribute provider checkpoints or SAM3 weights. Review
+[third_party/README.md](third_party/README.md) and the license attached to every
+asset before use or redistribution.

@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from datasets.frames import episode_frame_source
 from datasets.payload import EpisodePayload
 from datasets.registry import get_writer, open_dataset
 from datasets.view import FORMAT_LABELS, DatasetView
@@ -28,12 +29,10 @@ STATE_KEYS = ("observation.state", "state", "states", "obs.state")
 def _emit(progress_callback: ProgressCallback | None, **payload: Any) -> None:
     if progress_callback is None:
         return
-    try:
-        progress_callback(payload)
-    except Exception:  # noqa: BLE001
-        import logging
-
-        logging.getLogger(__name__).exception("progress callback failed")
+    # The worker uses the progress callback as a cooperative cancellation
+    # boundary.  Propagating callback failures is intentional: swallowing one
+    # could let a cancelled conversion continue writing its output.
+    progress_callback(payload)
 
 
 def _pick_series_key(
@@ -64,10 +63,24 @@ def iter_episode_payloads(
     progress_callback: ProgressCallback | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield normalized episode dicts one at a time."""
-    indices = episode_indices if episode_indices is not None else [ep.episode_index for ep in view.episodes]
-    index_set = set(indices)
-    selected = [ep for ep in view.episodes if ep.episode_index in index_set]
+    requested = (
+        episode_indices if episode_indices is not None else [ep.episode_index for ep in view.episodes]
+    )
+    indices = list(dict.fromkeys(int(index) for index in requested))
+    episodes_by_index = {ep.episode_index: ep for ep in view.episodes}
+    missing = [index for index in indices if index not in episodes_by_index]
+    if missing:
+        raise ValueError(f"选择中包含不存在的 episode：{missing[:20]}")
+    # Preserve the requested order so downstream 0..N renumbering (including
+    # exported labels) has one deterministic old→new mapping.
+    selected = [episodes_by_index[index] for index in indices]
     total = len(selected)
+    video_ref_counts: dict[str, int] = {}
+    for source_episode in view.episodes:
+        for camera in source_episode.cameras.values():
+            if camera.kind == "video" and camera.path:
+                path_key = str((Path(view.path) / camera.path).resolve())
+                video_ref_counts[path_key] = video_ref_counts.get(path_key, 0) + 1
 
     state_key = mapping.get("state_key")
     action_key = mapping.get("action_key")
@@ -90,7 +103,20 @@ def iter_episode_payloads(
         )
         for cam_key, cam in ep.cameras.items():
             if cam.kind == "video" and cam.path:
-                payload.video_paths[cam_key] = str(Path(view.path) / cam.path)
+                source_path = (Path(view.path) / cam.path).resolve()
+                if video_ref_counts.get(str(source_path), 0) > 1:
+                    # LeRobot v3 may store several episodes in one MP4 shard.
+                    # Linking/copying that shard would expose every frame as
+                    # the current episode, so stream only this episode's
+                    # timestamp window and let the target writer re-encode it.
+                    frame_source = episode_frame_source(adapter, view, ep, cam_key)
+                    if frame_source is None:
+                        raise RuntimeError(
+                            f"episode {ep.episode_index} 相机 {cam_key} 的共享视频无法按 episode 切片"
+                        )
+                    payload.images[cam_key] = frame_source.iter_rgb()
+                else:
+                    payload.video_paths[cam_key] = str(source_path)
             elif cam.kind == "topic" and cam.topic and hasattr(adapter, "materialize_topic_video"):
                 try:
                     mp4 = adapter.materialize_topic_video(ep.episode_index, cam.topic)

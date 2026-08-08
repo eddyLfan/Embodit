@@ -25,10 +25,28 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+if __package__:
+    from .path_safety import resolve_inside, validate_camera_key
+else:  # Support direct ``python lerobot_v3_lib.py ...`` execution.
+    from path_safety import resolve_inside, validate_camera_key
+
 
 VIDEO_COLUMN = re.compile(r"^videos/(.+)/(chunk_index|file_index|from_timestamp|to_timestamp)$")
 STAT_COLUMN = re.compile(r"^stats/(.+)/(min|max|mean|std|count|q01|q10|q50|q90|q99)$")
 STAT_METRICS = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
+
+
+def _validate_relative_path(value: str, *, what: str) -> str:
+    path = Path(value)
+    if (
+        not value
+        or path.is_absolute()
+        or "\\" in value
+        or any(part in {".", ".."} for part in path.parts)
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise ValueError(f"{what} 必须是安全的相对路径：{value!r}")
+    return value
 
 
 def main() -> None:
@@ -54,14 +72,20 @@ def main() -> None:
 
 def validate_dataset(root: Path) -> dict[str, Any]:
     root = root.expanduser().resolve()
-    info_path = root / "meta" / "info.json"
+    info_path = resolve_inside(root, root / "meta" / "info.json", what="info.json")
     if not info_path.is_file():
         raise ValueError(f"所选目录不是 LeRobot 数据集，缺少：{info_path}")
     info = json.loads(info_path.read_text(encoding="utf-8"))
     if str(info.get("codebase_version", "")) not in {"v3.0", "v3"}:
         raise ValueError(f"目前只支持 LeRobot v3.0，检测到：{info.get('codebase_version', 'unknown')}")
-    episode_files = sorted(root.glob("meta/episodes/chunk-*/*.parquet"))
-    data_files = sorted(root.glob("data/chunk-*/*.parquet"))
+    episode_files = [
+        resolve_inside(root, path, what="episode metadata")
+        for path in sorted(root.glob("meta/episodes/chunk-*/*.parquet"))
+    ]
+    data_files = [
+        resolve_inside(root, path, what="data shard")
+        for path in sorted(root.glob("data/chunk-*/*.parquet"))
+    ]
     if not episode_files:
         raise ValueError("数据集缺少 meta/episodes Parquet 文件")
     if not data_files:
@@ -91,6 +115,7 @@ def inspect_dataset(root: Path) -> dict[str, Any]:
             start = float(row[f"videos/{key}/from_timestamp"])
             end = float(row[f"videos/{key}/to_timestamp"])
             relative = format_video_path(info["video_path"], key, chunk, file_index)
+            resolve_inside(root, root / relative, what="video shard")
             videos[key] = {
                 "path": relative,
                 "fromTimestamp": start,
@@ -155,7 +180,7 @@ def create_dataset(source: Path, output: Path, selection_path: Path, media_mode:
         os.replace(temporary, output)
         result["output"] = str(output)
         return result
-    except Exception:
+    except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
 
@@ -195,7 +220,11 @@ def build_dataset(
             }
         )
         candidates = [
-            source / data_path_tpl.format(chunk_index=chunk, file_index=file_index)
+            resolve_inside(
+                source,
+                source / format_data_path(data_path_tpl, chunk, file_index),
+                what="data shard",
+            )
             for chunk, file_index in pairs
         ]
         if all(path.is_file() for path in candidates):
@@ -274,14 +303,21 @@ def copy_static_metadata(source: Path, target: Path) -> None:
     for item in source_meta.iterdir():
         if item.name in dynamic:
             continue
+        source_item = resolve_inside(source, item, what="static metadata")
+        if source_item.is_dir():
+            for nested in source_item.rglob("*"):
+                resolve_inside(source, nested, what="static metadata")
         destination = target_meta / item.name
-        if item.is_dir():
-            shutil.copytree(item, destination)
+        if source_item.is_dir():
+            shutil.copytree(source_item, destination)
         else:
-            shutil.copy2(item, destination)
+            shutil.copy2(source_item, destination)
     report = source / "conversion_report.txt"
     if report.is_file():
-        shutil.copy2(report, target / report.name)
+        shutil.copy2(
+            resolve_inside(source, report, what="conversion report"),
+            target / report.name,
+        )
 
 
 def write_episode_metadata(table: pa.Table, target: Path, chunk_size: int) -> None:
@@ -353,11 +389,18 @@ def preserve_video_shards(
 
     linked = 0
     copied = 0
+    reserved_outputs = {
+        (target / "meta" / "info.json").resolve(),
+        (target / "meta" / "stats.json").resolve(),
+        (target / "selection_manifest.json").resolve(),
+    }
     for relative in sorted(referenced):
-        source_file = source / relative
-        target_file = target / relative
+        source_file = resolve_inside(source, source / relative, what="video shard")
+        target_file = resolve_inside(target, target / relative, what="video output")
         if not source_file.is_file():
             raise FileNotFoundError(f"缺少 episode 引用的视频文件：{source_file}")
+        if target_file in reserved_outputs or target_file.exists() or target_file.is_symlink():
+            raise FileExistsError(f"视频输出路径与已有数据冲突：{target_file}")
         target_file.parent.mkdir(parents=True, exist_ok=True)
         if media_mode == "hardlink":
             try:
@@ -489,12 +532,25 @@ def discover_video_keys(columns: Iterable[str]) -> list[str]:
     for column in columns:
         match = VIDEO_COLUMN.match(column)
         if match:
-            keys.add(match.group(1))
+            keys.add(validate_camera_key(match.group(1)))
     return sorted(keys)
 
 
 def format_video_path(template: str, key: str, chunk: int, file_index: int) -> str:
-    return template.format(video_key=key, chunk_index=chunk, file_index=file_index)
+    key = validate_camera_key(key)
+    try:
+        value = template.format(video_key=key, chunk_index=chunk, file_index=file_index)
+    except (IndexError, KeyError, ValueError) as error:
+        raise ValueError(f"video_path 模板无效：{template!r}") from error
+    return _validate_relative_path(value, what="video_path")
+
+
+def format_data_path(template: str, chunk: int, file_index: int) -> str:
+    try:
+        value = template.format(chunk_index=chunk, file_index=file_index)
+    except (IndexError, KeyError, ValueError) as error:
+        raise ValueError(f"data_path 模板无效：{template!r}") from error
+    return _validate_relative_path(value, what="data_path")
 
 
 def any_number_greater_than_zero(value: Any) -> bool:

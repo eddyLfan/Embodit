@@ -6,20 +6,20 @@ import os
 import signal
 import subprocess
 import sys
-import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from jobs_common import (
+    claim_job_launch,
     delete_job,
     ensure_jobs_dir,
     list_jobs,
     now_iso,
     read_job,
     refresh_job_liveness,
-    update_job,
+    refresh_stored_job,
+    update_job_if_status,
     worker_alive,
     write_job,
 )
@@ -65,35 +65,54 @@ def create_job(
 
 def launch_detached_worker(job_id: str, jobs_dir: Path | None = None) -> dict[str, Any]:
     root = ensure_jobs_dir(jobs_dir or default_jobs_dir())
-    job = read_job(root, job_id)
-    if job is None:
-        raise FileNotFoundError(job_id)
+    claimed, job = claim_job_launch(root, job_id)
+    if not claimed:
+        return job
     backend_root = Path(__file__).resolve().parents[1]
     worker = backend_root / "qc" / "worker.py"
     log_path = Path(job["logPath"])
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join([str(backend_root), env.get("PYTHONPATH", "")])
-    with log_path.open("a", encoding="utf-8") as log_handle:
-        process = subprocess.Popen(
-            [sys.executable, str(worker), "--job-id", job_id, "--jobs-dir", str(root)],
-            cwd="/tmp",
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
+    try:
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            process = subprocess.Popen(
+                [sys.executable, str(worker), "--job-id", job_id, "--jobs-dir", str(root)],
+                cwd="/tmp",
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except Exception as error:
+        update_job_if_status(
+            root,
+            job_id,
+            {"queued"},
+            status="failed",
+            message=f"QC worker 启动失败：{error}",
+            launching=False,
         )
-    return update_job(root, job_id, status="queued", message="QC worker 已启动", pid=process.pid)
+        raise
+    return update_job_if_status(
+        root,
+        job_id,
+        {"queued", "running", "paused"},
+        message="QC worker 已启动",
+        pid=process.pid,
+        launching=False,
+    )
 
 
 def pause_job(root: Path, job_id: str) -> dict[str, Any]:
-    job = read_job(root, job_id)
-    if job is None:
-        raise FileNotFoundError(job_id)
-    if job.get("status") in {"queued", "running"}:
-        return update_job(root, job_id, status="paused", message="扫描已暂停")
-    return job
+    return update_job_if_status(
+        root,
+        job_id,
+        {"queued", "running"},
+        status="paused",
+        message="扫描已暂停",
+    )
 
 
 def resume_job(root: Path, job_id: str) -> dict[str, Any]:
@@ -103,7 +122,24 @@ def resume_job(root: Path, job_id: str) -> dict[str, Any]:
     if job.get("status") != "paused":
         return job
     if worker_alive(job):
-        return update_job(root, job_id, status="running", message="扫描继续")
+        return update_job_if_status(
+            root,
+            job_id,
+            {"paused"},
+            status="running",
+            message="扫描继续",
+        )
+    queued = update_job_if_status(
+        root,
+        job_id,
+        {"paused"},
+        status="queued",
+        message="正在重启 QC worker",
+        pid=None,
+        launching=False,
+    )
+    if queued.get("status") != "queued":
+        return queued
     return launch_detached_worker(job_id, root)
 
 
@@ -113,8 +149,19 @@ def cancel_job(root: Path, job_id: str) -> dict[str, Any]:
         raise FileNotFoundError(job_id)
     if job.get("status") not in {"queued", "running", "paused"}:
         return job
-    pid = job.get("pid")
-    if pid and worker_alive(job):
+    cancelled = update_job_if_status(
+        root,
+        job_id,
+        {"queued", "running", "paused"},
+        status="cancelled",
+        message="扫描已取消",
+        launching=False,
+    )
+    if cancelled.get("status") != "cancelled":
+        return cancelled
+    pid = cancelled.get("pid")
+    live_job = {**cancelled, "pid": pid}
+    if pid and worker_alive(live_job):
         try:
             os.killpg(int(pid), signal.SIGTERM)
         except OSError:
@@ -122,4 +169,4 @@ def cancel_job(root: Path, job_id: str) -> dict[str, Any]:
                 os.kill(int(pid), signal.SIGTERM)
             except OSError:
                 pass
-    return update_job(root, job_id, status="cancelled", message="扫描已取消", pid=None)
+    return update_job_if_status(root, job_id, {"cancelled"}, pid=None, launching=False)

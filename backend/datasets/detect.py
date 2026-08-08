@@ -117,15 +117,15 @@ def resolve_dataset_path(path: Path) -> Path:
         return path
     fmt = detect_format(path)
     if fmt == FORMAT_HDF5:
-        files = collect_hdf5_files(path)
         top = list(path.glob("*.hdf5")) + list(path.glob("*.h5"))
-        if len(top) == 1 and len(files) == 1:
+        # collect_hdf5_files() always prefers top-level files, so one direct
+        # match is sufficient; avoid a second full directory scan here.
+        if len(top) == 1:
             return top[0]
     if fmt == FORMAT_MCAP:
-        files = collect_mcap_files(path)
         # Only collapse to a single file when the directory literally holds one top-level mcap.
         top = list(path.glob("*.mcap"))
-        if len(top) == 1 and len(files) == 1:
+        if len(top) == 1:
             return top[0]
     return path
 

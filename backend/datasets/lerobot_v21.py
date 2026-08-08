@@ -16,6 +16,7 @@ import pyarrow.parquet as pq
 
 from . import media
 from .base import DatasetAdapter, DatasetWriter
+from .path_safety import resolve_inside, validate_camera_key
 from .view import FORMAT_LEROBOT_V21, CameraRef, DatasetView, EpisodeView
 
 
@@ -31,7 +32,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _load_info(root: Path) -> dict[str, Any]:
-    info_path = root / "meta" / "info.json"
+    info_path = resolve_inside(root, root / "meta" / "info.json", what="info.json")
     if not info_path.is_file():
         raise ValueError(f"不是 LeRobot 数据集，缺少：{info_path}")
     info = json.loads(info_path.read_text(encoding="utf-8"))
@@ -54,17 +55,26 @@ class LeRobotV21Adapter(DatasetAdapter):
         parquet_index: dict[int, Path] = {}
         for path in self.path.glob("data/chunk-*/episode_*.parquet"):
             try:
-                parquet_index[int(path.stem.split("_")[-1])] = path
+                episode_index = int(path.stem.split("_")[-1])
             except ValueError:
                 continue
+            parquet_index[episode_index] = resolve_inside(
+                self.path,
+                path,
+                what="data shard",
+            )
         video_index: dict[tuple[str, int], Path] = {}
         for path in self.path.glob("videos/chunk-*/*/episode_*.mp4"):
-            key = path.parent.name
+            key = validate_camera_key(path.parent.name)
             try:
                 idx = int(path.stem.split("_")[-1])
             except ValueError:
                 continue
-            video_index[(key, idx)] = path
+            video_index[(key, idx)] = resolve_inside(
+                self.path,
+                path,
+                what="video shard",
+            )
         self._parquet_index = parquet_index
         self._video_index = video_index
 
@@ -80,7 +90,10 @@ class LeRobotV21Adapter(DatasetAdapter):
 
     @classmethod
     def detect(cls, path: Path) -> bool:
-        info_path = path / "meta" / "info.json"
+        try:
+            info_path = resolve_inside(path, path / "meta" / "info.json", what="info.json")
+        except ValueError:
+            return False
         if not info_path.is_file():
             return False
         try:
@@ -94,11 +107,17 @@ class LeRobotV21Adapter(DatasetAdapter):
         fps = float(info.get("fps") or 0)
         features = info.get("features") or {}
         video_keys = [
-            key
+            validate_camera_key(key)
             for key, feat in features.items()
             if isinstance(feat, dict) and feat.get("dtype") == "video"
         ]
-        episodes_meta = _read_jsonl(self.path / "meta" / "episodes.jsonl")
+        episodes_meta = _read_jsonl(
+            resolve_inside(
+                self.path,
+                self.path / "meta" / "episodes.jsonl",
+                what="episode metadata",
+            )
+        )
         if not episodes_meta:
             # Infer from data parquet files (row counts come from parquet
             # metadata; the data pages are never read).
@@ -187,6 +206,9 @@ class LeRobotV21Adapter(DatasetAdapter):
         media_mode: str = "hardlink",
         mapping: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        from . import stats as stats_mod
+        from . import tabular
+
         info = _load_info(self.path)
         output = output.expanduser().resolve()
         if output.exists():
@@ -201,10 +223,18 @@ class LeRobotV21Adapter(DatasetAdapter):
             old_to_new = {old: new for new, old in enumerate(selected)}
             total_frames = 0
             episode_rows: list[dict[str, Any]] = []
+            episode_stats_rows: list[dict[str, Any]] = []
+            stats_collector = stats_mod.StatsCollector()
             linked = copied = 0
             episodes_meta_by_index = {
                 int(row.get("episode_index", -1)): row
-                for row in _read_jsonl(self.path / "meta" / "episodes.jsonl")
+                for row in _read_jsonl(
+                    resolve_inside(
+                        self.path,
+                        self.path / "meta" / "episodes.jsonl",
+                        what="episode metadata",
+                    )
+                )
             }
             video_index = self._episode_video_index()
             for old in selected:
@@ -212,13 +242,35 @@ class LeRobotV21Adapter(DatasetAdapter):
                 new_idx = old_to_new[old]
                 dest_parquet = temporary / "data" / "chunk-000" / f"episode_{new_idx:06d}.parquet"
                 table = pq.read_table(src_parquet)
+                if "index" in table.column_names:
+                    pos = table.schema.get_field_index("index")
+                    field = table.schema.field(pos)
+                    table = table.set_column(
+                        pos,
+                        field,
+                        pa.array(range(total_frames, total_frames + table.num_rows), type=field.type),
+                    )
                 if "episode_index" in table.column_names:
                     pos = table.schema.get_field_index("episode_index")
                     field = table.schema.field(pos)
                     table = table.set_column(pos, field, pa.array([new_idx] * table.num_rows, type=field.type))
+
+                episode_collector = stats_mod.StatsCollector()
+                for name in table.column_names:
+                    try:
+                        values = tabular.column_to_ndarray(table[name])
+                    except (TypeError, ValueError, pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                        # Text, struct and other non-numeric columns do not have
+                        # LeRobot normalization statistics.
+                        continue
+                    stats_collector.update(name, values)
+                    episode_collector.update(name, values)
                 pq.write_table(table, dest_parquet, compression="zstd")
                 length = table.num_rows
                 total_frames += length
+                episode_stats_rows.append(
+                    {"episode_index": new_idx, "stats": episode_collector.to_stats_dict()}
+                )
                 tasks: list[str] = []
                 meta_row = episodes_meta_by_index.get(old)
                 if meta_row:
@@ -249,11 +301,23 @@ class LeRobotV21Adapter(DatasetAdapter):
                 for row in episode_rows:
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-            # copy static meta
-            for name in ("tasks.jsonl", "episodes_stats.jsonl", "stats.json"):
+            # tasks are static. Statistics are data-dependent and must be
+            # regenerated after filtering and episode/index renumbering.
+            for name in ("tasks.jsonl",):
                 src = self.path / "meta" / name
                 if src.is_file():
-                    shutil.copy2(src, temporary / "meta" / name)
+                    shutil.copy2(
+                        resolve_inside(self.path, src, what="static metadata"),
+                        temporary / "meta" / name,
+                    )
+
+            with (temporary / "meta" / "episodes_stats.jsonl").open("w", encoding="utf-8") as handle:
+                for row in episode_stats_rows:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            (temporary / "meta" / "stats.json").write_text(
+                json.dumps(stats_collector.to_stats_dict(), ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
             new_info = dict(info)
             new_info["codebase_version"] = "v2.1"
@@ -285,7 +349,7 @@ class LeRobotV21Adapter(DatasetAdapter):
                 "hardlinkedVideoFiles": linked,
                 "copiedVideoFiles": copied,
             }
-        except Exception:
+        except BaseException:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
 
@@ -352,6 +416,7 @@ class LeRobotV21Writer(DatasetWriter):
                 all_tasks.update(ep.get("tasks") or [])
                 images = ep.get("images") or {}
                 for cam in sorted(set(ep.get("video_paths") or {}) | set(images)):
+                    validate_camera_key(cam)
                     dest = temporary / "videos" / "chunk-000" / cam / f"episode_{new_index:06d}.mp4"
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     src = (ep.get("video_paths") or {}).get(cam)
@@ -427,6 +492,6 @@ class LeRobotV21Writer(DatasetWriter):
                 "totalFrames": total_frames,
                 "format": FORMAT_LEROBOT_V21,
             }
-        except Exception:
+        except BaseException:
             shutil.rmtree(temporary, ignore_errors=True)
             raise

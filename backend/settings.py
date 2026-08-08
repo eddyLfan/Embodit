@@ -22,7 +22,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _default_sam3_checkpoint() -> Path:
-    """Prefer repo-local checkpoints/sam3.pt; no company path baked in."""
+    """Return an explicit override or the repository-local checkpoint path."""
     override = os.environ.get("AUGMENT_SAM3_CHECKPOINT", "").strip()
     if override:
         return Path(override).expanduser().resolve()

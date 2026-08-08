@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 from . import lerobot_v3_lib as lib
 from . import media
 from .base import DatasetAdapter, DatasetWriter
+from .path_safety import resolve_inside, validate_camera_key
 from .view import FORMAT_LEROBOT_V3, CameraRef, DatasetView, EpisodeView
 
 
@@ -94,9 +95,16 @@ class LeRobotV3Adapter(DatasetAdapter):
         meta = self._episode_meta().get(episode_index)
         data_path_tpl = str(info.get("data_path") or "")
         if meta is not None and data_path_tpl and "data/chunk_index" in meta and "data/file_index" in meta:
-            candidate = Path(info["_root"]) / data_path_tpl.format(
-                chunk_index=int(meta["data/chunk_index"]),
-                file_index=int(meta["data/file_index"]),
+            root = Path(info["_root"])
+            candidate = resolve_inside(
+                root,
+                root
+                / lib.format_data_path(
+                    data_path_tpl,
+                    int(meta["data/chunk_index"]),
+                    int(meta["data/file_index"]),
+                ),
+                what="data shard",
             )
             if candidate.is_file():
                 return [candidate]
@@ -215,6 +223,22 @@ class LeRobotV3Writer(DatasetWriter):
                     length = length or int(action.shape[0])
                 if length <= 0:
                     continue
+                current_state_dim = (
+                    int(state.reshape(length, -1).shape[-1]) if state is not None else None
+                )
+                current_action_dim = (
+                    int(action.reshape(length, -1).shape[-1]) if action is not None else None
+                )
+                if state_dim is not None and current_state_dim not in {None, state_dim}:
+                    raise ValueError(
+                        f"episode {ep.get('episode_index')}: observation.state 维度 "
+                        f"{current_state_dim} 与先前维度 {state_dim} 不一致"
+                    )
+                if action_dim is not None and current_action_dim not in {None, action_dim}:
+                    raise ValueError(
+                        f"episode {ep.get('episode_index')}: action 维度 "
+                        f"{current_action_dim} 与先前维度 {action_dim} 不一致"
+                    )
                 table = tabular.episode_frame_table(
                     episode_index=new_index,
                     length=length,
@@ -223,6 +247,15 @@ class LeRobotV3Writer(DatasetWriter):
                     state=state,
                     action=action,
                 )
+                # A streaming writer cannot discover future optional columns
+                # before it opens the ParquetWriter. Keep both canonical
+                # fields in the schema from episode one and use typed nulls
+                # until values appear; otherwise a later action/state column
+                # is silently discarded by align_to_schema().
+                optional_type = pa.list_(pa.float64())
+                for column in ("observation.state", "action"):
+                    if column not in table.column_names:
+                        table = table.append_column(column, pa.nulls(length, optional_type))
                 if data_writer is None:
                     data_schema = table.schema
                     data_writer = pq.ParquetWriter(data_path, data_schema, compression="zstd")
@@ -230,10 +263,10 @@ class LeRobotV3Writer(DatasetWriter):
                     table = tabular.align_to_schema(table, data_schema)
                 data_writer.write_table(table)
                 if state is not None:
-                    state_dim = state_dim or int(np.asarray(state).reshape(length, -1).shape[-1])
+                    state_dim = state_dim or current_state_dim
                     collector.update("observation.state", np.asarray(state)[:length])
                 if action is not None:
-                    action_dim = action_dim or int(np.asarray(action).reshape(length, -1).shape[-1])
+                    action_dim = action_dim or current_action_dim
                     collector.update("action", np.asarray(action)[:length])
                 all_tasks.update(ep.get("tasks") or [])
                 global_index += length
@@ -255,6 +288,7 @@ class LeRobotV3Writer(DatasetWriter):
                 ep_file = new_index % 1000
                 images = ep.get("images") or {}
                 for cam in sorted(set(ep.get("video_paths") or {}) | set(images)):
+                    validate_camera_key(cam)
                     video_keys.add(cam)
                     rel = f"videos/{cam}/chunk-{ep_chunk:03d}/file-{ep_file:03d}.mp4"
                     dest = temporary / rel
@@ -337,7 +371,7 @@ class LeRobotV3Writer(DatasetWriter):
                 "format": FORMAT_LEROBOT_V3,
                 "createdAt": datetime.now(timezone.utc).isoformat(),
             }
-        except Exception:
+        except BaseException:
             if data_writer is not None:
                 try:
                     data_writer.close()

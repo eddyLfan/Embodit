@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,28 +39,41 @@ def load_labels(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError:
-            # Tolerate corrupt lines instead of failing the whole file.
-            continue
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                # Tolerate corrupt lines instead of failing the whole file.
+                continue
     return rows
+
+
+def _save_labels_unlocked(path: Path, labels: list[dict[str, Any]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    validated = [validate_label(item) for item in labels]
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            for item in validated:
+                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return path
 
 
 def save_labels(path: Path, labels: list[dict[str, Any]]) -> Path:
     path = path.expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    validated = [validate_label(item) for item in labels]
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    with temporary.open("w", encoding="utf-8") as handle:
-        for item in validated:
-            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-    os.replace(temporary, path)
-    return path
+    with _file_lock(path):
+        return _save_labels_unlocked(path, labels)
 
 
 def identity(item: dict[str, Any]) -> tuple:
@@ -95,7 +109,7 @@ def upsert_label(path: Path, label: dict[str, Any]) -> list[dict[str, Any]]:
         new_id = identity(label)
         kept = [item for item in labels if identity(item) != new_id]
         kept.append(label)
-        save_labels(path, kept)
+        _save_labels_unlocked(path, kept)
     return kept
 
 
@@ -107,7 +121,7 @@ def delete_label(path: Path, label: dict[str, Any]) -> list[dict[str, Any]]:
         labels = load_labels(path)
         target_id = identity(probe)
         kept = [item for item in labels if identity(item) != target_id]
-        save_labels(path, kept)
+        _save_labels_unlocked(path, kept)
     return kept
 
 

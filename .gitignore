@@ -40,12 +40,20 @@ labels.jsonl
 *.h5
 *.hdf5
 *.parquet
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+/data/
+/outputs/
 
-SAM_checkpoints/*.pt
-SAM_checkpoints/*.pth
+# Model weights and generated experiment artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
 SAM_checkpoints/*.bin
 
 checkpoints/*
-
-# Maintainer-only regression tests are kept outside the public repository.
-tests/

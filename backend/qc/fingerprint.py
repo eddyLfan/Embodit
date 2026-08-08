@@ -21,18 +21,36 @@ def _stat_payload(path: Path) -> dict[str, Any]:
         return {"path": str(path), "missing": True}
 
 
+def _record_file(files: dict[str, dict[str, Any]], path: Path) -> None:
+    """Add one file stat without re-statting shared episode resources."""
+
+    key = str(path)
+    if key not in files:
+        files[key] = _stat_payload(path)
+
+
 def dataset_fingerprint(dataset: Path, view: Any) -> str:
     dataset = dataset.expanduser().resolve()
     files: dict[str, dict[str, Any]] = {}
     if dataset.is_file():
-        files[str(dataset)] = _stat_payload(dataset)
+        _record_file(files, dataset)
         root = dataset.parent
     else:
         root = dataset
         for relative in ("meta/info.json", "meta/episodes.jsonl", "meta/tasks.jsonl"):
             candidate = root / relative
             if candidate.exists():
-                files[str(candidate)] = _stat_payload(candidate)
+                _record_file(files, candidate)
+        parquet_patterns = {
+            "lerobot_v21": ("data/chunk-*/*.parquet",),
+            "lerobot_v3": (
+                "meta/episodes/chunk-*/*.parquet",
+                "data/chunk-*/*.parquet",
+            ),
+        }
+        for pattern in parquet_patterns.get(view.format_id, ()):
+            for candidate in root.glob(pattern):
+                _record_file(files, candidate)
     episodes = []
     for ep in view.episodes:
         cameras = {}
@@ -46,7 +64,7 @@ def dataset_fingerprint(dataset: Path, view: Any) -> str:
             }
             if cam.path:
                 target = root / cam.path
-                files.setdefault(str(target), _stat_payload(target))
+                _record_file(files, target)
             cameras[key] = item
         extras = {}
         for key in ("hdf5File", "mcapFile", "demoKey"):
@@ -55,7 +73,7 @@ def dataset_fingerprint(dataset: Path, view: Any) -> str:
                 extras[key] = str(value)
                 if key.endswith("File"):
                     target = Path(value)
-                    files.setdefault(str(target), _stat_payload(target))
+                    _record_file(files, target)
         episodes.append(
             {
                 "index": ep.episode_index,

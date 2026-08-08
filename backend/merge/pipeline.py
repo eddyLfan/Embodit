@@ -24,6 +24,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from datasets.registry import open_dataset
+from datasets.path_safety import resolve_inside, validate_camera_key
 from datasets.view import (
     FORMAT_HDF5,
     FORMAT_LABELS,
@@ -39,12 +40,9 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 def _emit(callback: ProgressCallback | None, **payload: Any) -> None:
     if callback is None:
         return
-    try:
-        callback(payload)
-    except Exception:  # noqa: BLE001
-        import logging
-
-        logging.getLogger(__name__).exception("merge progress callback failed")
+    # Worker cancellation is delivered through this callback. Let callback
+    # failures unwind the merge so its staging cleanup can run.
+    callback(payload)
 
 
 def _canonical(value: Any) -> Any:
@@ -294,6 +292,8 @@ def _actual_output(output: Path, format_id: str) -> Path:
 
 def _copy_or_link(source: Path, destination: Path, media_mode: str) -> str:
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"媒体输出路径发生冲突：{destination}")
     if media_mode == "hardlink":
         try:
             os.link(source, destination)
@@ -458,6 +458,7 @@ def _merge_v21(
             for (camera, ep_index), source_video in video_index.items():
                 if ep_index != old_index:
                     continue
+                validate_camera_key(camera)
                 destination = target / "videos" / f"chunk-{chunk:03d}" / camera / f"episode_{new_index:06d}.mp4"
                 outcome = _copy_or_link(source_video, destination, media_mode)
                 linked += outcome == "linked"
@@ -520,8 +521,15 @@ def _merge_v3(
     for item in (baseline_root / "meta").iterdir():
         if item.name in {"info.json", "stats.json", "episodes", "tasks.jsonl", "tasks.parquet", "tasks"}:
             continue
+        source_item = resolve_inside(baseline_root, item, what="static metadata")
+        if source_item.is_dir():
+            for nested in source_item.rglob("*"):
+                resolve_inside(baseline_root, nested, what="static metadata")
         destination = target / "meta" / item.name
-        shutil.copytree(item, destination) if item.is_dir() else shutil.copy2(item, destination)
+        if source_item.is_dir():
+            shutil.copytree(source_item, destination)
+        else:
+            shutil.copy2(source_item, destination)
 
     tasks, task_maps = _task_maps(adapters, views)
     episode_rows: list[dict[str, Any]] = []
@@ -567,7 +575,28 @@ def _merge_v3(
                     destination_relative = lib.format_video_path(
                         info["video_path"], camera, destination_chunk, destination_file
                     )
-                    outcome = _copy_or_link(source_root / relative, target / destination_relative, media_mode)
+                    source_video = resolve_inside(
+                        source_root,
+                        source_root / relative,
+                        what="video shard",
+                    )
+                    destination_video = resolve_inside(
+                        target,
+                        target / destination_relative,
+                        what="video output",
+                    )
+                    if (
+                        _is_inside((target / "meta").resolve(), destination_video)
+                        or destination_video
+                        in {
+                            (target / "labels.jsonl").resolve(),
+                            (target / "merge_manifest.json").resolve(),
+                        }
+                    ):
+                        raise ValueError(
+                            f"video_path 与保留输出路径冲突：{destination_relative}"
+                        )
+                    outcome = _copy_or_link(source_video, destination_video, media_mode)
                     linked += outcome == "linked"
                     copied += outcome == "copied"
                 destination_chunk, destination_file = video_destinations[key]
@@ -582,7 +611,19 @@ def _merge_v3(
     episode_table = pa.Table.from_pylist(episode_rows, schema=episode_schema)
     lib.write_episode_metadata(episode_table, target, int(info.get("chunks_size") or 1000))
 
-    output_data = target / str(info["data_path"]).format(chunk_index=0, file_index=0)
+    output_relative = lib.format_data_path(str(info["data_path"]), 0, 0)
+    output_data = resolve_inside(target, target / output_relative, what="data output")
+    if (
+        _is_inside((target / "meta").resolve(), output_data)
+        or _is_inside((target / "videos").resolve(), output_data)
+        or output_data in {
+            (target / "labels.jsonl").resolve(),
+            (target / "merge_manifest.json").resolve(),
+        }
+    ):
+        raise ValueError(f"data_path 与保留输出路径冲突：{output_relative}")
+    if output_data.exists() or output_data.is_symlink():
+        raise FileExistsError(f"data_path 输出已存在：{output_data}")
     output_data.parent.mkdir(parents=True, exist_ok=True)
     writer: pq.ParquetWriter | None = None
     written = 0

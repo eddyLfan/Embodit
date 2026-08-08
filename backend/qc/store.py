@@ -368,9 +368,9 @@ def summary(path: Path) -> dict[str, Any]:
             """
             SELECT COUNT(*) AS episodes,
                    SUM(integrity_status='invalid') AS invalid,
-                   SUM(auto_decision='pass') AS passed,
-                   SUM(auto_decision='review') AS review,
-                   SUM(auto_decision='quarantine') AS quarantine,
+                   SUM(COALESCE(manual_decision, auto_decision)='pass') AS passed,
+                   SUM(COALESCE(manual_decision, auto_decision)='review') AS review,
+                   SUM(COALESCE(manual_decision, auto_decision)='quarantine') AS quarantine,
                    AVG(quality_score) AS average_quality,
                    AVG(usable_ratio) AS average_usable,
                    AVG(coverage) AS average_coverage
@@ -442,8 +442,11 @@ def summary(path: Path) -> dict[str, Any]:
     }
 
 
-def query_episodes(path: Path, filters: dict[str, Any] | None = None) -> dict[str, Any]:
-    filters = filters or {}
+def _episode_query_parts(
+    filters: dict[str, Any],
+) -> tuple[str, list[Any], str, str]:
+    """Build the validated SQL fragments shared by page and selection queries."""
+
     where: list[str] = []
     values: list[Any] = []
     if filters.get("integrityStatus") in {"valid", "invalid", "unknown"}:
@@ -489,6 +492,12 @@ def query_episodes(path: Path, filters: dict[str, Any] | None = None) -> dict[st
     }
     sort = allowed_sort.get(str(filters.get("sort")), "e.episode_index")
     direction = "DESC" if str(filters.get("direction")).lower() == "desc" else "ASC"
+    return clause, values, sort, direction
+
+
+def query_episodes(path: Path, filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    filters = filters or {}
+    clause, values, sort, direction = _episode_query_parts(filters)
     limit = min(500, max(1, int(filters.get("limit") or 100)))
     offset = max(0, int(filters.get("offset") or 0))
     with report_connection(path, writable=False) as db:
@@ -500,41 +509,55 @@ def query_episodes(path: Path, filters: dict[str, Any] | None = None) -> dict[st
                 [*values, limit, offset],
             )
         ]
-        for row in rows:
+        issues_by_episode: dict[int, list[dict[str, Any]]] = {
+            int(row["episodeIndex"]): [] for row in rows
+        }
+        if issues_by_episode:
+            marks = ",".join("?" for _ in issues_by_episode)
             issue_rows = db.execute(
                 """
-                SELECT f.issue_code, f.severity, COUNT(*) AS count FROM findings f
+                SELECT f.episode_index, f.issue_code, f.severity, COUNT(*) AS count
+                FROM findings f
                 LEFT JOIN finding_reviews r ON r.finding_id=f.finding_id
-                WHERE f.episode_index=?
+                WHERE f.episode_index IN ("""
+                + marks
+                + """)
                   AND COALESCE(r.review_status, 'unreviewed') != 'rejected'
-                GROUP BY f.issue_code, f.severity ORDER BY count DESC
+                GROUP BY f.episode_index, f.issue_code, f.severity
+                ORDER BY f.episode_index, count DESC, f.issue_code
                 """,
-                (row["episodeIndex"],),
+                list(issues_by_episode),
             ).fetchall()
+            for item in issue_rows:
+                issues_by_episode[int(item["episode_index"])].append(
+                    {
+                        "issueCode": item["issue_code"],
+                        "severity": item["severity"],
+                        "count": item["count"],
+                    }
+                )
+        for row in rows:
+            issue_rows = issues_by_episode[int(row["episodeIndex"])]
             row["findingCount"] = sum(int(item["count"]) for item in issue_rows)
-            row["issues"] = [
-                {"issueCode": item["issue_code"], "severity": item["severity"], "count": item["count"]}
-                for item in issue_rows
-            ]
+            row["issues"] = issue_rows
     return {"total": total, "offset": offset, "limit": limit, "episodes": rows}
 
 
 def selected_episode_indices(path: Path, filters: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return an unpaginated selection for export, with invalid rows separated."""
     filters = dict(filters or {})
-    page_size = 500
-    offset = 0
+    clause, values, sort, direction = _episode_query_parts(filters)
     selected: list[int] = []
     invalid: list[int] = []
-    while True:
-        page = query_episodes(path, {**filters, "limit": page_size, "offset": offset})
-        rows = page["episodes"]
+    with report_connection(path, writable=False) as db:
+        rows = db.execute(
+            f"SELECT e.episode_index, e.integrity_status "
+            f"FROM episodes e{clause} ORDER BY {sort} {direction}",
+            values,
+        )
         for row in rows:
-            index = int(row["episodeIndex"])
-            (invalid if row["integrityStatus"] == "invalid" else selected).append(index)
-        offset += len(rows)
-        if not rows or offset >= int(page["total"]):
-            break
+            index = int(row["episode_index"])
+            (invalid if row["integrity_status"] == "invalid" else selected).append(index)
     return {
         "episodes": selected,
         "invalidEpisodes": invalid,
@@ -627,16 +650,107 @@ def review_episode(path: Path, episode_index: int, decision: str | None, note: s
     return {"episodeIndex": int(episode_index), "manualDecision": decision, "note": note}
 
 
-def report_csv(path: Path, kind: str) -> str:
-    output = io.StringIO()
+def _report_csv_page(
+    path: Path,
+    kind: str,
+    batch_size: int,
+    page_cursor: int | tuple[int, float | None, str] | None,
+) -> tuple[list[str], list[tuple[Any, ...]], int | tuple[int, float | None, str] | None]:
+    """Read one keyset-paginated CSV page and close SQLite before returning."""
+
     with report_connection(path, writable=False) as db:
         if kind == "findings":
-            rows = db.execute("SELECT * FROM findings ORDER BY episode_index, start_s").fetchall()
+            order = "ORDER BY episode_index, start_s IS NOT NULL, start_s, finding_id"
+            if page_cursor is None:
+                cursor = db.execute(f"SELECT * FROM findings {order} LIMIT ?", (batch_size,))
+            else:
+                episode_index, start_s, finding_id = page_cursor
+                if start_s is None:
+                    cursor = db.execute(
+                        f"""
+                        SELECT * FROM findings
+                        WHERE episode_index > ?
+                           OR (episode_index = ? AND (
+                               (start_s IS NULL AND finding_id > ?)
+                               OR start_s IS NOT NULL
+                           ))
+                        {order} LIMIT ?
+                        """,
+                        (episode_index, episode_index, finding_id, batch_size),
+                    )
+                else:
+                    cursor = db.execute(
+                        f"""
+                        SELECT * FROM findings
+                        WHERE episode_index > ?
+                           OR (episode_index = ? AND start_s IS NOT NULL AND (
+                               start_s > ? OR (start_s = ? AND finding_id > ?)
+                           ))
+                        {order} LIMIT ?
+                        """,
+                        (
+                            episode_index,
+                            episode_index,
+                            start_s,
+                            start_s,
+                            finding_id,
+                            batch_size,
+                        ),
+                    )
         else:
-            rows = db.execute("SELECT * FROM episodes ORDER BY episode_index").fetchall()
-        if not rows:
-            return ""
+            if page_cursor is None:
+                cursor = db.execute(
+                    "SELECT * FROM episodes ORDER BY episode_index LIMIT ?",
+                    (batch_size,),
+                )
+            else:
+                cursor = db.execute(
+                    "SELECT * FROM episodes WHERE episode_index > ? "
+                    "ORDER BY episode_index LIMIT ?",
+                    (int(page_cursor), batch_size),
+                )
+        columns = [str(column[0]) for column in (cursor.description or ())]
+        sqlite_rows = cursor.fetchall()
+        rows = [tuple(row) for row in sqlite_rows]
+        next_cursor: int | tuple[int, float | None, str] | None = None
+        if sqlite_rows:
+            last = sqlite_rows[-1]
+            if kind == "findings":
+                next_cursor = (
+                    int(last["episode_index"]),
+                    None if last["start_s"] is None else float(last["start_s"]),
+                    str(last["finding_id"]),
+                )
+            else:
+                next_cursor = int(last["episode_index"])
+    return columns, rows, next_cursor
+
+
+def report_csv_chunks(path: Path, kind: str, *, batch_size: int = 1_000) -> Iterator[str]:
+    """Yield bounded CSV chunks without retaining SQLite objects across yields."""
+    if batch_size < 1:
+        raise ValueError("batch_size 必须大于 0")
+
+    page_cursor: int | tuple[int, float | None, str] | None = None
+    wrote_header = False
+    while True:
+        columns, rows, next_cursor = _report_csv_page(path, kind, batch_size, page_cursor)
+        if not columns or not rows:
+            return
+
+        output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(rows[0].keys())
-        writer.writerows([tuple(row) for row in rows])
-    return output.getvalue()
+        if not wrote_header:
+            writer.writerow(columns)
+            wrote_header = True
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+        writer.writerows(rows)
+        page_cursor = next_cursor
+        yield output.getvalue()
+
+
+def report_csv(path: Path, kind: str) -> str:
+    """Compatibility helper for callers that explicitly require one string."""
+    return "".join(report_csv_chunks(path, kind))

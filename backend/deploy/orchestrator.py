@@ -36,6 +36,9 @@ from .recipe import (
 from .transport import CommandRunner, LocalCommandRunner, RecipeSshRunner, RemoteResult, require_remote_ok
 
 
+OFFLINE_INFERENCE_TIMEOUT_S = 30.0
+
+
 class OrchestrationState(str, Enum):
     PENDING = "pending"
     STARTING = "starting"
@@ -205,7 +208,11 @@ class DeploymentOrchestration:
         self.root.mkdir(parents=True, exist_ok=True)
         self.root.chmod(0o700)
         self.state = OrchestrationState.PENDING
-        self.mode = recipe.runtime.default_mode
+        # Live is never a startup mode.  A Recipe may keep ``default_mode=live``
+        # as a request for an interactive caller (for example the CLI), but the
+        # orchestration itself always enters Dry Run first.  The only transition
+        # to Live is ``promote_live`` after a short-lived arm challenge.
+        self.mode = "dry_run"
         self.current_step: str | None = None
         self.last_error: str | None = None
         self.created_ns = time.time_ns()
@@ -224,6 +231,7 @@ class DeploymentOrchestration:
         self._stop_requested = threading.Event()
         self._monitor_stop = threading.Event()
         self._maintenance = threading.Event()
+        self._offline_inference_active = False
         self._thread: threading.Thread | None = None
         self._arm_token: str | None = None
         self._arm_expires_ns = 0
@@ -287,6 +295,10 @@ class DeploymentOrchestration:
 
     def start(self, *, task_prompt: str | None = None) -> dict[str, Any]:
         with self._lock:
+            if self._offline_inference_active:
+                raise ValueError("离线评测正在进行，不能启动本体链路")
+            if self.state == OrchestrationState.FAULT and self._has_active_components_unlocked():
+                raise ValueError("故障部署仍有活动组件，请先停止并清理后再启动")
             if self._thread is not None and self._thread.is_alive():
                 return self.snapshot()
             if self.state not in {
@@ -299,6 +311,8 @@ class DeploymentOrchestration:
             resume_after_model = self.state == OrchestrationState.MODEL_READY and self.components["model"]["active"]
             if task_prompt is not None:
                 self._set_task_prompt(task_prompt)
+            self.mode = "dry_run"
+            self._invalidate_arm_unlocked()
             self._stop_requested.clear()
             self._monitor_stop.clear()
             self.last_error = None
@@ -318,58 +332,93 @@ class DeploymentOrchestration:
         client_config = dict(self.recipe.robot.client.config or {})
         client_config["task_prompt"] = normalized_prompt
         self.recipe.robot.client.config = client_config
+        self._invalidate_arm_unlocked()
         return normalized_prompt
 
-    def start_evaluation(self, *, task_prompt: str) -> dict[str, Any]:
-        """Start or resume real evaluation while keeping the resident model untouched."""
-        with self._lock:
-            prompt = self._set_task_prompt(task_prompt)
-            if self.state == OrchestrationState.MODEL_READY and self.components["model"]["active"]:
-                self._stop_requested.clear()
-                self._monitor_stop.clear()
-                self.last_error = None
-                self.mode = "live"
-                self.state = OrchestrationState.STARTING
-                self._thread = threading.Thread(
-                    target=self._run_after_model,
-                    daemon=True,
-                    name=f"evaluation-{self.id[:8]}",
-                )
-                self._thread.start()
-                self._record("evaluation_requested", prompt=prompt, modelPrepared=True)
-                return self.snapshot()
-            if self.state != OrchestrationState.DRY_RUN:
-                raise ValueError("只有模型就绪或已暂停的部署可以开始真机评测")
-            self._maintenance.set()
-            self._record("evaluation_resume_requested", prompt=prompt)
+    def _invalidate_arm_unlocked(self) -> None:
+        """Invalidate any confirmation issued for an earlier Dry Run state."""
+        self._arm_token = None
+        self._arm_expires_ns = 0
+
+    def _recover_client_switch(
+        self,
+        *,
+        previous_state: OrchestrationState,
+        previous_mode: str,
+        previous_config: dict[str, Any],
+        failure_label: str,
+        failure: Exception,
+    ) -> None:
+        """Stop a failed replacement Client and restore its last known-good configuration."""
+        def restore_previous_state() -> None:
+            with self._lock:
+                self.state = previous_state
+                self.mode = previous_mode
+                self.recipe.robot.client.config = json.loads(json.dumps(previous_config))
+
+        stop_errors: list[str] = []
         try:
             self.robot_manager.stop("client")
-            self.components["client"]["active"] = False
-            self.mode = "live"
+        except Exception as stop_error:  # noqa: BLE001
+            stop_errors.append(f"停止新 Client 失败：{stop_error}")
+        self.components["client"]["active"] = False
+        restore_previous_state()
+        try:
             self._start_client()
             self._wait_client_health()
-        except Exception as error:
-            self.mode = "dry_run"
-            self.last_error = f"恢复真机评测失败：{error}"
-            if not self.components["client"]["active"]:
-                try:
-                    self._start_client()
-                    self._wait_client_health()
-                except Exception as recovery_error:  # noqa: BLE001
-                    self._record("evaluation_resume_recovery_failed", reason=str(recovery_error))
-            raise
-        finally:
-            self._maintenance.clear()
+        except Exception as recovery_error:  # noqa: BLE001
+            try:
+                self.robot_manager.stop("client")
+            except Exception as stop_error:  # noqa: BLE001
+                stop_errors.append(f"停止恢复 Client 失败：{stop_error}")
+            self.components["client"]["active"] = False
+            details = "；".join(
+                [
+                    f"{failure_label}：{failure}",
+                    f"恢复原 Client 失败：{recovery_error}",
+                    *stop_errors,
+                ]
+            )
+            self.last_error = details
+            self._monitor_stop.set()
+            monitor = self._thread
+            if monitor is not None and monitor is not threading.current_thread():
+                monitor.join(timeout=5)
+            self._rollback(emergency=True, preserve_model=True)
+            with self._lock:
+                self.state = OrchestrationState.FAULT
+                self.last_error = details
+                self._record("client_switch_recovery_failed", reason=details)
+            raise RuntimeError(details) from failure
+        restore_previous_state()
+        if stop_errors:
+            self._record("client_switch_stop_warning", errors=stop_errors)
+        self._record("client_switch_recovered", failure=failure_label)
+
+    def start_evaluation(self, *, task_prompt: str) -> dict[str, Any]:
+        """Backward-compatible evaluation entry point that can only reach Dry Run.
+
+        Live activation intentionally remains a separate ``arm_challenge`` /
+        ``promote_live`` operation.  Keeping this endpoint as a safe alias avoids
+        turning older clients into an arming bypass.
+        """
         with self._lock:
-            self.state = OrchestrationState.RUNNING
-            self._record("evaluation_resumed", prompt=prompt)
-            return self.snapshot()
+            if self._offline_inference_active:
+                raise ValueError("离线评测正在进行，不能开始真机评测")
+            if self.state == OrchestrationState.MODEL_READY and self.components["model"]["active"]:
+                self._record("legacy_evaluation_downgraded", targetMode="dry_run")
+                return self.start(task_prompt=task_prompt)
+            if self.state != OrchestrationState.DRY_RUN or self.mode != "dry_run":
+                raise ValueError("只有模型就绪或 Dry Run 部署可以准备评测")
+            self._record("legacy_evaluation_downgraded", targetMode="dry_run")
+        return self.update_task_prompt(task_prompt)
 
     def update_task_prompt(self, task_prompt: str) -> dict[str, Any]:
         """Switch prompts by restarting only the lightweight robot client."""
         with self._lock:
-            current_config = self.recipe.robot.client.config or {}
-            previous_prompt = str(current_config.get("task_prompt") or current_config.get("default_prompt") or "")
+            previous_state = self.state
+            previous_mode = self.mode
+            previous_config = json.loads(json.dumps(self.recipe.robot.client.config or {}))
             prompt = self._set_task_prompt(task_prompt)
             if self.state == OrchestrationState.MODEL_READY:
                 self._record("prompt_updated", prompt=prompt, clientRestarted=False)
@@ -387,14 +436,14 @@ class DeploymentOrchestration:
             self._start_client()
             self._wait_client_health()
         except Exception as error:
-            self._set_task_prompt(previous_prompt or prompt)
-            if not self.components["client"]["active"]:
-                try:
-                    self._start_client()
-                    self._wait_client_health()
-                except Exception as recovery_error:  # noqa: BLE001
-                    self._record("prompt_switch_recovery_failed", reason=str(recovery_error))
             self.last_error = f"切换 Prompt 失败：{error}"
+            self._recover_client_switch(
+                previous_state=previous_state,
+                previous_mode=previous_mode,
+                previous_config=previous_config,
+                failure_label="切换 Prompt 失败",
+                failure=error,
+            )
             raise
         finally:
             self._maintenance.clear()
@@ -404,12 +453,16 @@ class DeploymentOrchestration:
 
     def prepare_model(self) -> dict[str, Any]:
         with self._lock:
+            if self.state == OrchestrationState.FAULT and self._has_active_components_unlocked():
+                raise ValueError("故障部署仍有活动组件，请先停止并清理后再准备模型")
             if self._thread is not None and self._thread.is_alive():
                 return self.snapshot()
             if self.state == OrchestrationState.MODEL_READY and self.components["model"]["active"]:
                 return self.snapshot()
             if self.state not in {OrchestrationState.PENDING, OrchestrationState.STOPPED, OrchestrationState.FAULT}:
                 raise ValueError(f"当前状态不能单独启动模型：{self.state.value}")
+            self.mode = "dry_run"
+            self._invalidate_arm_unlocked()
             self._stop_requested.clear()
             self.last_error = None
             self.state = OrchestrationState.STARTING
@@ -420,7 +473,7 @@ class DeploymentOrchestration:
 
     def _run_model_only(self) -> None:
         try:
-            self._step("precheck", self._precheck)
+            self._step("precheck", self._precheck_model_only)
             self._step("model", self._start_model)
             self._step("model_health", self._wait_model_health)
             with self._lock:
@@ -461,6 +514,8 @@ class DeploymentOrchestration:
 
     def _run_after_model(self) -> None:
         try:
+            if self._robot_home is None:
+                self._step("robot_precheck", self._precheck_robot_only)
             self._run_after_model_steps()
         except StopRequested:
             self._record("start_cancelled")
@@ -476,6 +531,8 @@ class DeploymentOrchestration:
                 self._rollback(emergency=False)
 
     def _run_after_model_steps(self, *, include_tunnel_credentials: bool = True) -> None:
+        if self.mode != "dry_run":
+            raise RuntimeError("部署启动链路只能进入 Dry Run；Live 必须通过确认门控")
         if include_tunnel_credentials:
             self._step("tunnel_credentials", self._ensure_tunnel_credentials)
         self._step("tunnel", self._start_tunnel)
@@ -513,7 +570,7 @@ class DeploymentOrchestration:
             item.update({"status": "passed", "finishedNs": time.time_ns()})
             self._record("step_passed", step=name)
 
-    def _precheck(self) -> None:
+    def _precheck_hosts(self, names: tuple[str, ...]) -> None:
         probe = (
             "import json,platform,shutil; "
             "print(json.dumps({'hostname':platform.node(),'python':platform.python_version(),"
@@ -521,7 +578,8 @@ class DeploymentOrchestration:
             "'ssh':shutil.which('ssh'),'ssh_keygen':shutil.which('ssh-keygen'),"
             "'ssh_keyscan':shutil.which('ssh-keyscan')}))"
         )
-        for name, runner in self._runners.items():
+        for name in names:
+            runner = self._runners[name]
             result = require_remote_ok(runner.run(["python3", "-c", probe]), f"探测主机 {name}")
             info = json.loads(result.stdout)
             if not info.get("systemctl") or not info.get("systemd_run"):
@@ -537,8 +595,19 @@ class DeploymentOrchestration:
                     raise RuntimeError(
                         f"本地模型主机 user={host.user} 与 Embodit 运行用户 {actual_user} 不一致"
                     )
-        self._model_home = self.model_manager.home()
-        self._robot_home = self.robot_manager.home()
+            if name == self.model_host_name:
+                self._model_home = self.model_manager.home()
+            if name == self.robot_host_name:
+                self._robot_home = self.robot_manager.home()
+
+    def _precheck(self) -> None:
+        self._precheck_hosts(tuple(self._runners))
+
+    def _precheck_model_only(self) -> None:
+        self._precheck_hosts((self.model_host_name,))
+
+    def _precheck_robot_only(self) -> None:
+        self._precheck_hosts((self.robot_host_name,))
 
     def read_only_preflight(self) -> dict[str, Any]:
         """Probe deployment prerequisites without starting or changing services.
@@ -1594,7 +1663,7 @@ else: raise SystemExit('Python Robot Adapter readiness timeout: ' + last)
             expected = f"LIVE {self.recipe.deployment_id} {self._arm_token or ''}"
             if time.monotonic_ns() > self._arm_expires_ns or not secrets.compare_digest(confirmation.strip(), expected):
                 raise ValueError("Live 确认短语无效或已过期")
-            if self.state != OrchestrationState.DRY_RUN:
+            if self.state != OrchestrationState.DRY_RUN or self.mode != "dry_run":
                 raise ValueError("部署当前不处于 Dry Run")
             if self.dry_run_safety is not None and (
                 not self.dry_run_safety.get("passed")
@@ -1604,8 +1673,13 @@ else: raise SystemExit('Python Robot Adapter readiness timeout: ' + last)
                     "最近一次 Dry Run 动作校验未通过："
                     + str(self.dry_run_safety.get("error") or "未知安全错误")
                 )
-            self._arm_token = None
+            previous_state = self.state
+            previous_mode = self.mode
+            previous_config = json.loads(json.dumps(self.recipe.robot.client.config or {}))
+            self._invalidate_arm_unlocked()
             self._maintenance.set()
+            self.state = OrchestrationState.STARTING
+            self._record("live_start_requested")
         try:
             self.robot_manager.stop("client")
             self.components["client"]["active"] = False
@@ -1613,10 +1687,14 @@ else: raise SystemExit('Python Robot Adapter readiness timeout: ' + last)
             self._start_client()
             self._wait_client_health()
         except Exception as error:
-            self.mode = "dry_run"
             self.last_error = f"切换 Live 失败：{error}"
-            self.state = OrchestrationState.FAULT
-            self._rollback(emergency=True, preserve_model=True)
+            self._recover_client_switch(
+                previous_state=previous_state,
+                previous_mode=previous_mode,
+                previous_config=previous_config,
+                failure_label="切换 Live 失败",
+                failure=error,
+            )
             raise
         finally:
             self._maintenance.clear()
@@ -1824,7 +1902,9 @@ else: raise SystemExit('Python Robot Adapter readiness timeout: ' + last)
                 OrchestrationState.RUNNING,
             }:
                 raise ValueError("当前部署状态不能切换推理调度")
+            previous_state = self.state
             was_running = self.state == OrchestrationState.RUNNING
+            previous_mode = self.mode
             self.recipe.robot.client.config = config
             self.scheduler_status = None
             self._record(
@@ -1845,15 +1925,15 @@ else: raise SystemExit('Python Robot Adapter readiness timeout: ' + last)
             self._start_client()
             self._wait_client_health()
         except Exception as error:
-            self.recipe.robot.client.config = previous_config
             self.scheduler_status = None
-            if not self.components["client"]["active"]:
-                try:
-                    self._start_client()
-                    self._wait_client_health()
-                except Exception as recovery_error:  # noqa: BLE001
-                    self._record("scheduler_update_recovery_failed", reason=str(recovery_error))
             self.last_error = f"切换推理调度失败：{error}"
+            self._recover_client_switch(
+                previous_state=previous_state,
+                previous_mode=previous_mode,
+                previous_config=previous_config,
+                failure_label="切换推理调度失败",
+                failure=error,
+            )
             raise
         finally:
             self._maintenance.clear()
@@ -2072,6 +2152,13 @@ else: raise SystemExit('Python Robot Adapter readiness timeout: ' + last)
         manager = self.model_manager if component == "model" else self.robot_manager
         return manager.logs(component, lines)
 
+    def _has_active_components_unlocked(self) -> bool:
+        return any(bool(value.get("active")) for value in self.components.values())
+
+    def has_active_components(self) -> bool:
+        with self._lock:
+            return self._has_active_components_unlocked()
+
     def _check_stop(self) -> None:
         if self._stop_requested.is_set():
             raise StopRequested()
@@ -2135,6 +2222,75 @@ else: raise SystemExit('Python Robot Adapter readiness timeout: ' + last)
                 "recordPath": str(self._record_path),
             }
 
+    def infer_observations(self, observations: dict[str, Any]) -> dict[str, Any]:
+        """Run an out-of-band inference on the resident model service.
+
+        This path is used by offline dataset evaluation and deliberately talks
+        to the model on its own host, so it does not require or mutate the
+        robot-side tunnel/client loop.
+        """
+        with self._lock:
+            if not self.components.get("model", {}).get("active"):
+                raise ValueError("模型服务尚未启动")
+            if self.state != OrchestrationState.MODEL_READY:
+                raise ValueError("离线评测要求模型已就绪且本体观测/控制链路已断开")
+            if self._offline_inference_active:
+                raise ValueError("已有离线评测正在进行")
+            self._offline_inference_active = True
+        try:
+            return self._infer_observations(observations)
+        finally:
+            with self._lock:
+                self._offline_inference_active = False
+
+    def _infer_observations(self, observations: dict[str, Any]) -> dict[str, Any]:
+        bind = self.recipe.tunnel.remote_bind
+        if bind in {"0.0.0.0", "::", "[::]"}:
+            bind = "127.0.0.1"
+        endpoint = f"http://{bind}:{self.recipe.tunnel.remote_port}/infer"
+        payload = json.dumps(
+            {
+                "protocolVersion": 2,
+                "deploymentId": self.recipe.deployment_id,
+                "mode": "offline_evaluation",
+                "capturedMonotonicNs": time.monotonic_ns(),
+                "observations": observations,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        script = r"""
+import json, sys, urllib.error, urllib.request
+url = sys.argv[1]
+body = sys.stdin.buffer.read()
+request = urllib.request.Request(url, data=body, headers={'Content-Type':'application/json','Accept':'application/json'})
+try:
+    with urllib.request.urlopen(request, timeout=float(sys.argv[2])) as response:
+        payload = response.read(int(sys.argv[3]) + 1)
+        if len(payload) > int(sys.argv[3]): raise SystemExit('模型响应过大')
+        sys.stdout.buffer.write(payload)
+except urllib.error.HTTPError as error:
+    detail = error.read(4000).decode('utf-8', errors='replace')
+    raise SystemExit(f'模型 HTTP {error.code}: {detail}')
+""".strip()
+        timeout = OFFLINE_INFERENCE_TIMEOUT_S
+        result = require_remote_ok(
+            self.model_runner.run(
+                ["python3", "-c", script, endpoint, str(timeout), "10000000"],
+                input_data=payload,
+                timeout=timeout + 5,
+            ),
+            "离线模型推理",
+        )
+        try:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("模型返回了非法 JSON") from error
+        if not isinstance(response, dict):
+            raise RuntimeError("模型响应必须是对象")
+        self._record("offline_inference", observationKeys=sorted(observations))
+        return response
+
     def manifest(self) -> dict[str, Any]:
         return {"orchestration": self.snapshot(), "recipe": redact_recipe(self.recipe.model_dump(mode="json"))}
 
@@ -2158,7 +2314,10 @@ class OrchestrationRegistry:
                 existing
                 for existing in self._items.values()
                 if existing.recipe.deployment_id == recipe.deployment_id
-                and existing.state not in {OrchestrationState.STOPPED, OrchestrationState.FAULT}
+                and (
+                    existing.state not in {OrchestrationState.STOPPED, OrchestrationState.FAULT}
+                    or existing.has_active_components()
+                )
             ]
             if active:
                 raise ValueError(f"Deployment 已有活动编排：{active[0].id}")
@@ -2180,7 +2339,10 @@ class OrchestrationRegistry:
         with self._lock:
             items = list(self._items.values())
         for item in items:
-            if item.state not in {OrchestrationState.STOPPED, OrchestrationState.FAULT}:
+            if (
+                item.state not in {OrchestrationState.STOPPED, OrchestrationState.FAULT}
+                or item.has_active_components()
+            ):
                 try:
                     item.stop(emergency=True, wait_s=10)
                 except Exception:  # noqa: BLE001

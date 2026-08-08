@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import struct
@@ -24,6 +25,26 @@ from .view import FORMAT_MCAP, CameraRef, DatasetView, EpisodeView
 
 _video_locks: dict[str, threading.Lock] = {}
 _video_locks_guard = threading.Lock()
+
+
+def _new_staging_file(output: Path) -> Path:
+    """Create a unique same-directory file for no-overwrite publication."""
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{output.name}.building-",
+        suffix=output.suffix,
+        dir=output.parent,
+    )
+    os.close(descriptor)
+    return Path(name)
+
+
+def _publish_staging_file(staging: Path, output: Path) -> None:
+    """Publish ``staging`` atomically without replacing a concurrent target."""
+    try:
+        os.link(staging, output)
+    except FileExistsError as error:
+        raise FileExistsError(f"目标已存在：{output}") from error
+    staging.unlink()
 
 
 def _require_mcap():
@@ -988,40 +1009,48 @@ class McapAdapter(DatasetAdapter):
             raise FileExistsError(f"目标已存在：{output}")
         output.parent.mkdir(parents=True, exist_ok=True)
 
-        with output.open("wb") as dst:
-            writer = Writer(dst)
-            writer.start()
-            schema_ids: dict[tuple[str, bytes], int] = {}
-            channel_ids: dict[str, int] = {}
-            for idx in selected:
-                file_path, ep = self._episode_mcap(idx)
-                start_ns, end_ns = _episode_window(ep)
-                with file_path.open("rb") as src:
-                    reader = make_reader(src)
-                    for schema, channel, message in reader.iter_messages():
-                        if _outside_window(message.log_time, start_ns, end_ns):
-                            continue
-                        schema_key = (schema.name if schema else "", schema.data if schema else b"")
-                        if schema and schema_key not in schema_ids:
-                            schema_ids[schema_key] = writer.register_schema(
-                                name=schema.name,
-                                encoding=schema.encoding,
-                                data=schema.data,
+        staging = _new_staging_file(output)
+        try:
+            with staging.open("wb") as dst:
+                writer = Writer(dst)
+                writer.start()
+                schema_ids: dict[tuple[str, bytes], int] = {}
+                channel_ids: dict[str, int] = {}
+                for idx in selected:
+                    file_path, ep = self._episode_mcap(idx)
+                    start_ns, end_ns = _episode_window(ep)
+                    with file_path.open("rb") as src:
+                        reader = make_reader(src)
+                        for schema, channel, message in reader.iter_messages():
+                            if _outside_window(message.log_time, start_ns, end_ns):
+                                continue
+                            schema_key = (schema.name if schema else "", schema.data if schema else b"")
+                            if schema and schema_key not in schema_ids:
+                                schema_ids[schema_key] = writer.register_schema(
+                                    name=schema.name,
+                                    encoding=schema.encoding,
+                                    data=schema.data,
+                                )
+                            if channel.topic not in channel_ids:
+                                channel_ids[channel.topic] = writer.register_channel(
+                                    topic=channel.topic,
+                                    message_encoding=channel.message_encoding,
+                                    schema_id=schema_ids.get(schema_key, 0) if schema else 0,
+                                    metadata=dict(channel.metadata or {}),
+                                )
+                            writer.add_message(
+                                channel_id=channel_ids[channel.topic],
+                                log_time=message.log_time,
+                                data=message.data,
+                                publish_time=message.publish_time,
                             )
-                        if channel.topic not in channel_ids:
-                            channel_ids[channel.topic] = writer.register_channel(
-                                topic=channel.topic,
-                                message_encoding=channel.message_encoding,
-                                schema_id=schema_ids.get(schema_key, 0) if schema else 0,
-                                metadata=dict(channel.metadata or {}),
-                            )
-                        writer.add_message(
-                            channel_id=channel_ids[channel.topic],
-                            log_time=message.log_time,
-                            data=message.data,
-                            publish_time=message.publish_time,
-                        )
-            writer.finish()
+                writer.finish()
+                dst.flush()
+                os.fsync(dst.fileno())
+            _publish_staging_file(staging, output)
+        except BaseException:
+            staging.unlink(missing_ok=True)
+            raise
         return {
             "output": str(output),
             "totalEpisodes": len(selected),
@@ -1065,7 +1094,7 @@ class McapWriter(DatasetWriter):
         meta: dict[str, Any],
         mapping: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """``episodes`` may be any iterable; messages stream directly to disk."""
+        """Stream episodes into a staging file, then publish atomically."""
         try:
             from mcap.writer import Writer
         except ImportError as error:
@@ -1087,96 +1116,104 @@ class McapWriter(DatasetWriter):
         fps = float(meta.get("fps") or mapping.get("fps") or 30.0)
         gap_ns = int(3.0 * 1e9)
 
-        with output.open("wb") as handle:
-            writer = Writer(handle)
-            writer.start()
-            schema_id = writer.register_schema(
-                name="float64_array",
-                encoding="",
-                data=b"",
-            )
-            state_ch = writer.register_channel(
-                topic=state_topic,
-                message_encoding="raw",
-                schema_id=schema_id,
-            )
-            action_ch = writer.register_channel(
-                topic=action_topic,
-                message_encoding="raw",
-                schema_id=schema_id,
-            )
-            image_schema_id = writer.register_schema(
-                name="foxglove.CompressedImage",
-                encoding="protobuf",
-                data=_foxglove_compressed_image_descriptor(),
-            )
-            image_channels: dict[str, int] = {}
+        staging = _new_staging_file(output)
+        try:
+            with staging.open("wb") as handle:
+                writer = Writer(handle)
+                writer.start()
+                schema_id = writer.register_schema(
+                    name="float64_array",
+                    encoding="",
+                    data=b"",
+                )
+                state_ch = writer.register_channel(
+                    topic=state_topic,
+                    message_encoding="raw",
+                    schema_id=schema_id,
+                )
+                action_ch = writer.register_channel(
+                    topic=action_topic,
+                    message_encoding="raw",
+                    schema_id=schema_id,
+                )
+                image_schema_id = writer.register_schema(
+                    name="foxglove.CompressedImage",
+                    encoding="protobuf",
+                    data=_foxglove_compressed_image_descriptor(),
+                )
+                image_channels: dict[str, int] = {}
 
-            def image_channel(camera: str) -> int:
-                if camera not in image_channels:
-                    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", camera).strip("_") or "camera"
-                    topic = str(camera_topics.get(camera) or f"/camera/{safe}/compressed")
-                    image_channels[camera] = writer.register_channel(
-                        topic=topic,
-                        message_encoding="protobuf",
-                        schema_id=image_schema_id,
-                        metadata={"camera": camera, "format": "jpeg"},
-                    )
-                return image_channels[camera]
+                def image_channel(camera: str) -> int:
+                    if camera not in image_channels:
+                        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", camera).strip("_") or "camera"
+                        topic = str(camera_topics.get(camera) or f"/camera/{safe}/compressed")
+                        image_channels[camera] = writer.register_channel(
+                            topic=topic,
+                            message_encoding="protobuf",
+                            schema_id=image_schema_id,
+                            metadata={"camera": camera, "format": "jpeg"},
+                        )
+                    return image_channels[camera]
 
-            cursor_ns = 0
-            total_episodes = 0
-            total_frames = 0
-            for ep in episodes:
-                state = ep.get("state")
-                action = ep.get("action")
-                length = int(ep.get("length") or 0)
-                if state is not None:
-                    state = np.asarray(state, dtype=np.float64)
-                    length = length or int(state.shape[0])
-                if action is not None:
-                    action = np.asarray(action, dtype=np.float64)
-                    length = length or int(action.shape[0])
-                camera_streams: dict[str, Any] = {
-                    str(camera): iter(frames)
-                    for camera, frames in (ep.get("images") or {}).items()
-                }
-                for camera, path in (ep.get("video_paths") or {}).items():
-                    camera_streams[str(camera)] = iter(decode_mp4_frames(Path(path)))
-                dt_ns = int(1e9 / fps) if fps > 0 else 33_000_000
-                for i in range(length):
-                    t = cursor_ns + i * dt_ns
+                cursor_ns = 0
+                total_episodes = 0
+                total_frames = 0
+                for ep in episodes:
+                    state = ep.get("state")
+                    action = ep.get("action")
+                    length = int(ep.get("length") or 0)
                     if state is not None:
-                        writer.add_message(
-                            channel_id=state_ch,
-                            log_time=t,
-                            data=np.asarray(state[i], dtype=np.float64).tobytes(),
-                            publish_time=t,
-                        )
+                        state = np.asarray(state, dtype=np.float64)
+                        length = length or int(state.shape[0])
                     if action is not None:
-                        writer.add_message(
-                            channel_id=action_ch,
-                            log_time=t,
-                            data=np.asarray(action[i], dtype=np.float64).tobytes(),
-                            publish_time=t,
-                        )
-                    for camera, frames in camera_streams.items():
-                        try:
-                            frame = next(frames)
-                        except StopIteration as error:
-                            raise ValueError(
-                                f"episode {ep.get('episode_index')} 相机 {camera} 少于声明的 {length} 帧"
-                            ) from error
-                        writer.add_message(
-                            channel_id=image_channel(camera),
-                            log_time=t,
-                            data=_encode_jpeg_compressed_image(frame, camera, jpeg_quality, t),
-                            publish_time=t,
-                        )
-                cursor_ns += length * dt_ns + gap_ns
-                total_episodes += 1
-                total_frames += length
-            writer.finish()
+                        action = np.asarray(action, dtype=np.float64)
+                        length = length or int(action.shape[0])
+                    camera_streams: dict[str, Any] = {
+                        str(camera): iter(frames)
+                        for camera, frames in (ep.get("images") or {}).items()
+                    }
+                    for camera, path in (ep.get("video_paths") or {}).items():
+                        camera_streams[str(camera)] = iter(decode_mp4_frames(Path(path)))
+                    dt_ns = int(1e9 / fps) if fps > 0 else 33_000_000
+                    for i in range(length):
+                        t = cursor_ns + i * dt_ns
+                        if state is not None:
+                            writer.add_message(
+                                channel_id=state_ch,
+                                log_time=t,
+                                data=np.asarray(state[i], dtype=np.float64).tobytes(),
+                                publish_time=t,
+                            )
+                        if action is not None:
+                            writer.add_message(
+                                channel_id=action_ch,
+                                log_time=t,
+                                data=np.asarray(action[i], dtype=np.float64).tobytes(),
+                                publish_time=t,
+                            )
+                        for camera, frames in camera_streams.items():
+                            try:
+                                frame = next(frames)
+                            except StopIteration as error:
+                                raise ValueError(
+                                    f"episode {ep.get('episode_index')} 相机 {camera} 少于声明的 {length} 帧"
+                                ) from error
+                            writer.add_message(
+                                channel_id=image_channel(camera),
+                                log_time=t,
+                                data=_encode_jpeg_compressed_image(frame, camera, jpeg_quality, t),
+                                publish_time=t,
+                            )
+                    cursor_ns += length * dt_ns + gap_ns
+                    total_episodes += 1
+                    total_frames += length
+                writer.finish()
+                handle.flush()
+                os.fsync(handle.fileno())
+            _publish_staging_file(staging, output)
+        except BaseException:
+            staging.unlink(missing_ok=True)
+            raise
         return {
             "output": str(output),
             "totalEpisodes": total_episodes,

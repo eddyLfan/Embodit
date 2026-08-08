@@ -23,6 +23,32 @@ def print_json(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2), flush=True)
 
 
+def promote_live_interactively(
+    item: DeploymentOrchestration,
+    *,
+    input_stream=None,
+    output_stream=None,
+) -> dict:
+    """Require an attached terminal and the server-issued phrase before Live."""
+    input_stream = input_stream or sys.stdin
+    output_stream = output_stream or sys.stdout
+    if not getattr(input_stream, "isatty", lambda: False)():
+        raise ValueError("Live 模式需要交互式终端完成 Dry Run 后的短语确认")
+    challenge = item.arm_challenge()
+    phrase = challenge["phrase"]
+    expires = challenge["expiresInSeconds"]
+    print(
+        f"Dry Run 已就绪。若要进入 Live，请在 {expires} 秒内原样输入：\n{phrase}",
+        file=output_stream,
+        flush=True,
+    )
+    print("> ", end="", file=output_stream, flush=True)
+    confirmation = input_stream.readline()
+    if not confirmation:
+        raise ValueError("未收到 Live 确认；部署保持 Dry Run")
+    return item.promote_live(confirmation)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="embodit-recipe")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -73,8 +99,12 @@ def main() -> None:
             print_json({"valid": True, "recipe": redact_recipe(recipe.model_dump(mode="json"))})
             return
 
-        if getattr(args, "mode", None):
-            recipe.runtime.default_mode = args.mode
+        requested_mode = getattr(args, "mode", None) or recipe.runtime.default_mode
+        if args.command == "run" and requested_mode == "live" and not sys.stdin.isatty():
+            raise ValueError("--mode live 需要交互式终端；非交互运行请使用 --mode dry_run")
+        # The orchestration core always starts read-only.  ``requested_mode``
+        # only tells this CLI whether to ask for an arm phrase after Dry Run.
+        recipe.runtime.default_mode = "dry_run"
         item = DeploymentOrchestration(
             recipe,
             settings.CACHE_DIR / "deploy" / "orchestrations" / recipe.deployment_id,
@@ -101,6 +131,7 @@ def main() -> None:
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGTERM, request_stop)
         item.start()
+        live_promoted = requested_mode != "live"
         last_signature = None
         while True:
             snapshot = item.snapshot()
@@ -110,6 +141,12 @@ def main() -> None:
                 last_signature = signature
             if snapshot["state"] == "fault":
                 raise SystemExit(1)
+            if snapshot["state"] == "dry_run" and not live_promoted:
+                snapshot = promote_live_interactively(item)
+                live_promoted = True
+                print_json(snapshot)
+                last_signature = None
+                continue
             if snapshot["state"] in {"dry_run", "running"} and args.no_follow:
                 return
             if snapshot["state"] == "stopped" or stopping:

@@ -23,11 +23,11 @@
     <nav class="layer-switch" aria-label="平台工作台">
       <button id="openDataWorkspace" class="layer-tab active" type="button" data-layer="data" aria-current="page">
         <span class="layer-tab-icon">▦</span>
-        <span><strong data-i18n="dataWorkspace">数据工作台</strong><small data-i18n="dataWorkspaceHint">浏览、质检、标注与处理</small></span>
+        <span><strong data-i18n="dataWorkspace">数据工作台</strong></span>
       </button>
       <button id="openDeployment" class="layer-tab" type="button" data-layer="deploy">
         <span class="layer-tab-icon">◉</span>
-        <span><strong data-i18n="deployWorkspace">真机部署</strong><small data-i18n="deployWorkspaceHint">连接、测模、运行与观测</small></span>
+        <span><strong data-i18n="deployWorkspace">真机部署</strong></span>
       </button>
     </nav>
     <div class="header-right">
@@ -46,7 +46,7 @@
   <div id="dataWorkspace" class="primary-workspace">
   <main id="chooser" class="chooser">
     <section class="chooser-card">
-      <div class="section-title"><div><h2 data-i18n="chooseTitle">选择数据集</h2><p data-i18n="chooseDesc">支持 LeRobot v2.1 / v3、HDF5、MCAP</p></div></div>
+      <div class="section-title"><div><h2 data-i18n="chooseTitle">选择数据集</h2></div></div>
       <div class="path-bar">
         <button id="goParent" data-i18n-title="parentDir" title="上一级">↑</button>
         <input id="pathInput" spellcheck="false" placeholder="/path/to/dataset">
@@ -207,15 +207,13 @@
       <div class="deployment-page-title modal-title">
         <div class="deployment-title-copy">
           <h2 id="deploymentTitle" data-i18n="deployTitle">真机部署工作台</h2>
-          <p data-i18n="deployDesc">本体连接、模型常驻、Prompt 切换、真机评测与实时模型 I/O 观测。</p>
         </div>
         <div class="deployment-title-status">
-          <div class="deployment-page-status"><i></i><span data-i18n="deployControlPlaneReady">部署控制面已就绪</span></div>
           <span id="deploymentState" class="deployment-state">disconnected</span>
         </div>
       </div>
       <div class="deployment-safety-bar">
-        <strong>实验模式</strong><span>模型服务常驻；评测可直接开始、暂停和继续，Prompt 可随时快速切换。</span>
+        <strong>实验模式</strong><span>真机运行前确认急停可用。</span>
         <div class="deployment-safety-actions">
           <button id="stopDeployment" hidden disabled>关闭部署</button>
         </div>
@@ -223,7 +221,7 @@
       <div class="deployment-layout">
         <aside class="deployment-config-pane" aria-label="部署配置">
           <div class="deployment-sidebar-head">
-            <div class="deployment-pane-title"><strong>部署操作</strong><small>按顺序完成真机任务</small></div>
+            <div class="deployment-pane-title"><strong>部署操作</strong></div>
           </div>
           <div class="deployment-config-scroll">
             <div class="deployment-operation-flow">
@@ -239,7 +237,7 @@
                       <button id="disconnectDeploymentRobot" type="button" disabled>断开</button>
                     </span>
                   </div>
-                  <small id="deploymentRobotDetail" class="deployment-status-detail">未建立观测链路</small>
+                  <small id="deploymentRobotDetail" class="deployment-status-detail"></small>
                 </div>
               </section>
               <section class="deployment-operation-step">
@@ -254,7 +252,7 @@
                       <button id="closeDeploymentModel" type="button" disabled>关闭</button>
                     </span>
                   </div>
-                  <small id="deploymentModelDetail" class="deployment-status-detail">模型服务未启动</small>
+                  <small id="deploymentModelDetail" class="deployment-status-detail"></small>
                 </div>
               </section>
               <section class="deployment-operation-step">
@@ -297,11 +295,30 @@
                     <button id="moveDeploymentPose" type="button" disabled>一键回位</button>
                     <button id="deleteDeploymentPose" type="button" disabled>删除记录</button>
                   </div>
-                  <small id="deploymentPoseHint" class="deployment-status-detail">连接本体并获得关节观测后可记录</small>
+                  <small id="deploymentPoseHint" class="deployment-status-detail">连接后可记录</small>
                 </div>
               </section>
               <section class="deployment-operation-step deployment-run-step">
                 <div class="deployment-step-number">6</div>
+                <div class="deployment-step-body">
+                  <span class="deployment-step-label" data-i18n="deployOfflineTitle">离线评测</span>
+                  <input id="deploymentOfflineDataset" data-i18n-placeholder="deployOfflineDatasetPlaceholder" placeholder="数据集绝对路径" autocomplete="off" spellcheck="false">
+                  <div class="deployment-offline-load-actions">
+                    <button id="useCurrentOfflineDataset" type="button" data-i18n="deployOfflineUseCurrent">使用当前数据集</button>
+                    <button id="loadDeploymentOfflineDataset" type="button" data-i18n="deployOfflineLoad">载入</button>
+                  </div>
+                  <div class="deployment-offline-frame-grid">
+                    <label><span data-i18n="deployOfflineEntry">数据条目</span><select id="deploymentOfflineEpisode" disabled><option value="" data-i18n="deployOfflineLoadFirst">请先载入</option></select></label>
+                    <label><span data-i18n="deployOfflineStartFrame">起始帧</span><input id="deploymentOfflineFrame" type="number" min="0" value="0" disabled></label>
+                  </div>
+                  <div class="deployment-prompt-actions">
+                    <small id="deploymentOfflineHint" data-i18n="deployOfflineChooseFrame">选择数据与起始帧</small>
+                    <button id="runDeploymentOfflineEvaluation" class="primary" type="button" disabled data-i18n="deployOfflineRun">运行对比</button>
+                  </div>
+                </div>
+              </section>
+              <section class="deployment-operation-step deployment-run-step">
+                <div class="deployment-step-number">7</div>
                 <div class="deployment-step-body">
                   <span class="deployment-step-label">真机评测</span>
                   <div class="deployment-run-actions">
@@ -360,10 +377,19 @@
             <div class="deployment-pane-title"><strong>模型 I/O 观测</strong><small id="deploymentResultHint" data-i18n="deployReady">等待操作</small></div>
           </div>
           <div class="deployment-observation-stage">
+            <div id="deploymentOfflineResult" class="deployment-offline-result hidden">
+              <div class="deployment-offline-result-head">
+                <div><strong data-i18n="deployOfflineResultTitle">离线动作轨迹对比</strong><small id="deploymentOfflineResultMeta">—</small></div>
+                <button id="closeDeploymentOfflineResult" type="button" data-i18n="deployOfflineBackLive">返回实时观测</button>
+              </div>
+              <div id="deploymentOfflineSummary" class="deployment-offline-summary"></div>
+              <div id="deploymentOfflineCameraGrid" class="deployment-camera-grid"></div>
+              <div class="deployment-offline-legend"><span><i class="predicted"></i><span data-i18n="deployOfflinePredicted">模型输出</span></span><span><i class="truth"></i><span data-i18n="deployOfflineRecorded">真实动作</span></span></div>
+              <div id="deploymentOfflineDimensionGrid" class="deployment-offline-dimension-grid"></div>
+            </div>
             <div id="deploymentModelIoPlaceholder" class="deployment-observation-placeholder">
               <span class="deployment-observation-mark" aria-hidden="true"><i></i><i></i><i></i></span>
               <strong>等待模型 I/O</strong>
-              <p>机器人客户端启动后，这里只展示实际送入模型的观测和模型返回的动作</p>
             </div>
             <div id="deploymentModelIo" class="deployment-model-io hidden">
               <section class="deployment-io-section">
@@ -429,7 +455,7 @@
   <div id="autoFilterDialog" class="modal hidden">
     <section class="modal-card qc-report-card" role="dialog" aria-modal="true" aria-labelledby="autoFilterDialogTitle">
       <div class="modal-title">
-        <div><h2 id="autoFilterDialogTitle" data-i18n="autoFilterTitle">自动质检</h2><p data-i18n="autoFilterDesc">配置扫描；完成后直接在筛选页时间轴复核异常片段。</p></div>
+        <div><h2 id="autoFilterDialogTitle" data-i18n="autoFilterTitle">自动质检</h2></div>
         <button id="closeAutoFilter" data-i18n="close">关闭</button>
       </div>
       <section class="qc-launch">
@@ -485,7 +511,6 @@
       <div class="modal-title">
         <div>
           <h2 id="exportDialogTitle" data-i18n="exportOptionsTitle">导出选项</h2>
-          <p data-i18n="exportOptionsDesc">确认导出范围、格式和服务器保存位置后启动后台任务。</p>
         </div>
         <button id="closeExport" data-i18n="close">关闭</button>
       </div>
@@ -587,7 +612,6 @@
       <div class="modal-title">
         <div>
           <h2 id="mergeDialogTitle" data-i18n="mergeTitle">合并数据集</h2>
-          <p data-i18n="mergeDesc">按列表顺序合并同格式、兼容 schema 的数据集，源数据保持不变。</p>
         </div>
         <button id="closeMerge" data-i18n="close">关闭</button>
       </div>
@@ -634,7 +658,6 @@
       <div class="modal-title">
         <div>
           <h2 id="augmentDialogTitle" data-i18n="augmentTitle">数据增强</h2>
-          <p data-i18n="augmentDesc">先配置并生成一条测试预览，确认效果后再批量写出新数据集。</p>
         </div>
         <button id="closeAugment" data-i18n="close">关闭</button>
       </div>

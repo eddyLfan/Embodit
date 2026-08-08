@@ -38,10 +38,11 @@ and supplied through the model config's `checkpoint` field.
 Install each provider by following the README at its pinned revision. Keep one
 environment per provider, for example `openpi`, `lerobot`, and `starvla`; their
 PyTorch/CUDA and transitive dependency pins are not merged into Embodit's web
-environment. The model host must contain the same Embodit checkout (the public
-templates mark this as `/path/to/Embodit`) and the selected environment before first use.
-After that one-time provisioning, a deployment only needs the provider and a
-checkpoint.
+environment. For these built-in providers, the model host must contain the
+pinned Embodit checkout (the public templates mark this as `/path/to/Embodit`)
+and the selected environment before first use. Custom Python and external
+providers do not require that checkout. After one-time provisioning, a built-in
+deployment only needs the provider configuration and a checkpoint.
 
 ### Checkpoint expectations
 
@@ -91,9 +92,10 @@ Color augmentation additionally uses **SAM3** from Meta:
 - Checkpoint access: follow the upstream repository and its linked Hugging Face page
 
 SAM3 source code and model weights are not redistributed by Embodit. Install
-SAM3 into a separate environment, select it with `AUGMENT_PYTHON`, and point
-`AUGMENT_SAM3_CHECKPOINT` at a checkpoint you are authorized to use. By using
-SAM3 you accept its upstream license and usage restrictions.
+SAM3 into a separate environment, select it with `AUGMENT_PYTHON`, and place an
+authorized checkpoint at the default repository path `checkpoints/sam3.pt` or
+set `AUGMENT_SAM3_CHECKPOINT` to its absolute path. By using SAM3 you accept its
+upstream license and usage restrictions.
 
 The readiness check verifies required package metadata and imports PyTorch only
 to confirm CUDA availability and GPU count. Model weights are loaded only by

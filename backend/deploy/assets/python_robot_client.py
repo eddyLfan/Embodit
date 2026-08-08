@@ -800,6 +800,7 @@ def run(config: dict[str, Any]) -> None:
         request_after_steps = scheduler.get("requestAfterSteps")
         actions = actions[:action_steps]
         next_action_at = time.monotonic()
+        last_applied_action: list[float] | None = None
         apply_latencies_ms: list[float] = []
         schedule_lags_ms: list[float] = []
         while not stopping["value"] and (maximum_steps is None or steps < maximum_steps):
@@ -814,6 +815,7 @@ def run(config: dict[str, Any]) -> None:
                 schedule_lags_ms.append(max(0.0, (applied_at - next_action_at) * 1000))
                 apply_started = time.perf_counter()
                 call_with_timeout(adapter.apply_action, watchdog_timeout_s, "apply_action()", action)
+                last_applied_action = list(action)
                 apply_latencies_ms.append((time.perf_counter() - apply_started) * 1000)
                 del apply_latencies_ms[:-200]
                 del schedule_lags_ms[:-200]
@@ -880,9 +882,17 @@ def run(config: dict[str, Any]) -> None:
                 next_action_at = time.monotonic()
 
             safety_error = None
+            safety_baseline = observations.get(baseline_key)
+            safety_config = config["action"]
+            if inference_mode == "asynchronous":
+                if last_applied_action is None:
+                    raise RuntimeError("异步动作连续性检查缺少最后已执行动作")
+                safety_baseline = last_applied_action
+                safety_config = dict(config["action"])
+                safety_config["initial_max_step"] = list(safety_config["max_step"])
             try:
                 next_actions = validate_action(
-                    next_actions, config["action"], observations.get(baseline_key)
+                    next_actions, safety_config, safety_baseline
                 )
             except ActionSafetyError as error:
                 # Reject only this chunk and hold the latest measured model state.
@@ -892,7 +902,7 @@ def run(config: dict[str, Any]) -> None:
                 last_safety_error = safety_error
                 safety_rejections += 1
                 next_actions = hold_action_chunk(
-                    config["action"], observations.get(baseline_key)
+                    config["action"], safety_baseline
                 )
             status.remember_model_io(model_io)
             trajectory.record_inference(model_io)

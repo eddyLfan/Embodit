@@ -15,13 +15,16 @@ from typing import Any
 
 from jobs_common import (  # noqa: F401  (re-exported for callers)
     cancel_job,
+    claim_job_launch,
     ensure_jobs_dir,
     job_path,
     list_jobs,
     now_iso,
     read_job,
     refresh_job_liveness,
+    refresh_stored_job,
     update_job,
+    update_job_if_status,
     write_job,
 )
 from jobs_common import delete_job as _delete_job
@@ -75,9 +78,9 @@ def create_job(
 def launch_detached_worker(job_id: str, jobs_dir: Path | None = None) -> dict[str, Any]:
     """Spawn an independent convert worker that survives parent / terminal exit."""
     jobs_dir = ensure_jobs_dir(jobs_dir or default_jobs_dir())
-    job = read_job(jobs_dir, job_id)
-    if job is None:
-        raise FileNotFoundError(job_id)
+    claimed, job = claim_job_launch(jobs_dir, job_id)
+    if not claimed:
+        return job
 
     backend_root = Path(__file__).resolve().parents[1]  # backend/
     worker = backend_root / "convert" / "worker.py"
@@ -87,33 +90,45 @@ def launch_detached_worker(job_id: str, jobs_dir: Path | None = None) -> dict[st
     env = os.environ.copy()
     env["PYTHONPATH"] = str(backend_root) + os.pathsep + env.get("PYTHONPATH", "")
 
-    with log_path.open("a", encoding="utf-8") as log_handle:
-        log_handle.write(f"\n==== launch {now_iso()} ====\n")
-        log_handle.flush()
-        process = subprocess.Popen(  # noqa: S603
-            [
-                sys.executable,
-                str(worker),
-                "--job-id",
-                job_id,
-                "--jobs-dir",
-                str(jobs_dir),
-            ],
-            cwd=str(backend_root),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,  # detach from web server / terminal session
-            close_fds=True,
+    try:
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(f"\n==== launch {now_iso()} ====\n")
+            log_handle.flush()
+            process = subprocess.Popen(  # noqa: S603
+                [
+                    sys.executable,
+                    str(worker),
+                    "--job-id",
+                    job_id,
+                    "--jobs-dir",
+                    str(jobs_dir),
+                ],
+                cwd=str(backend_root),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,  # detach from web server / terminal session
+                close_fds=True,
+            )
+    except Exception as error:
+        update_job_if_status(
+            jobs_dir,
+            job_id,
+            {"queued"},
+            status="failed",
+            message=f"后台 worker 启动失败：{error}",
+            launching=False,
         )
+        raise
 
-    return update_job(
+    return update_job_if_status(
         jobs_dir,
         job_id,
-        status="queued",
+        {"queued", "running"},
         message="后台 worker 已启动",
         pid=process.pid,
+        launching=False,
     )
 
 

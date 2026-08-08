@@ -20,13 +20,16 @@ from typing import Any
 from augment.capabilities import config_fingerprint
 from augment.paths import DEFAULT_JOBS_DIR, DEFAULT_PREVIEW_DIR, SAM3_CHECKPOINT
 from jobs_common import (  # noqa: F401  (re-exported for callers)
+    claim_job_launch,
     ensure_jobs_dir,
     job_path,
     list_jobs,
     now_iso,
     read_job,
     refresh_job_liveness,
+    refresh_stored_job,
     update_job,
+    update_job_if_status,
     worker_alive,
     write_job,
 )
@@ -71,8 +74,20 @@ def cancel_job(jobs_dir: Path, job_id: str) -> dict[str, Any]:
     if job.get("status") not in {"queued", "running"}:
         return job
 
-    pid = job.get("pid")
-    if pid and worker_alive(job):
+    cancelled = update_job_if_status(
+        jobs_dir,
+        job_id,
+        {"queued", "running"},
+        status="cancelled",
+        message="任务已取消",
+        launching=False,
+    )
+    if cancelled.get("status") != "cancelled":
+        return cancelled
+
+    pid = cancelled.get("pid")
+    live_job = {**cancelled, "pid": pid}
+    if pid and worker_alive(live_job):
         try:
             os.killpg(int(pid), signal.SIGTERM)
         except OSError:
@@ -81,7 +96,7 @@ def cancel_job(jobs_dir: Path, job_id: str) -> dict[str, Any]:
             except OSError:
                 pass
         time.sleep(0.8)
-        live = dict(job)
+        live = dict(cancelled)
         live["pid"] = pid
         if worker_alive(live):
             try:
@@ -96,12 +111,13 @@ def cancel_job(jobs_dir: Path, job_id: str) -> dict[str, Any]:
     message = "任务已取消"
     if cleaned:
         message = f"任务已取消，已清理未完成产物（{len(cleaned)}）"
-    return update_job(
+    return update_job_if_status(
         jobs_dir,
         job_id,
-        status="cancelled",
+        {"cancelled"},
         message=message,
         pid=None,
+        launching=False,
         result={"cleaned": cleaned, "cancelled": True},
     )
 
@@ -165,9 +181,9 @@ def resolve_worker_python(aug_type: str) -> str:
 
 def launch_detached_worker(job_id: str, jobs_dir: Path | None = None) -> dict[str, Any]:
     jobs_dir = ensure_jobs_dir(jobs_dir or default_jobs_dir())
-    job = read_job(jobs_dir, job_id)
-    if job is None:
-        raise FileNotFoundError(job_id)
+    claimed, job = claim_job_launch(jobs_dir, job_id)
+    if not claimed:
+        return job
 
     backend_root = Path(__file__).resolve().parents[1]
     worker = backend_root / "augment" / "worker.py"
@@ -181,33 +197,45 @@ def launch_detached_worker(job_id: str, jobs_dir: Path | None = None) -> dict[st
     env["AUGMENT_SAM3_CHECKPOINT"] = os.environ.get("AUGMENT_SAM3_CHECKPOINT", str(SAM3_CHECKPOINT))
     env["CUDA_VISIBLE_DEVICES"] = str(int(job.get("gpuId") or 0))
 
-    with log_path.open("a", encoding="utf-8") as log_handle:
-        log_handle.write(f"\n==== launch {now_iso()} python={python_bin} ====\n")
-        log_handle.flush()
-        process = subprocess.Popen(  # noqa: S603
-            [
-                python_bin,
-                str(worker),
-                "--job-id",
-                job_id,
-                "--jobs-dir",
-                str(jobs_dir),
-            ],
-            cwd="/tmp",
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
+    try:
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(f"\n==== launch {now_iso()} python={python_bin} ====\n")
+            log_handle.flush()
+            process = subprocess.Popen(  # noqa: S603
+                [
+                    python_bin,
+                    str(worker),
+                    "--job-id",
+                    job_id,
+                    "--jobs-dir",
+                    str(jobs_dir),
+                ],
+                cwd="/tmp",
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except Exception as error:
+        update_job_if_status(
+            jobs_dir,
+            job_id,
+            {"queued"},
+            status="failed",
+            message=f"后台 worker 启动失败：{error}",
+            launching=False,
         )
+        raise
 
-    return update_job(
+    return update_job_if_status(
         jobs_dir,
         job_id,
-        status="queued",
+        {"queued", "running"},
         message="后台 worker 已启动",
         pid=process.pid,
+        launching=False,
     )
 
 

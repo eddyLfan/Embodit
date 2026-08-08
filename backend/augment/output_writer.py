@@ -12,13 +12,14 @@ from typing import Any
 import numpy as np
 
 from augment.video_io import encode_video_mp4
+from datasets.payload import validate_camera_key
 from datasets.stats import StatsCollector
 from datasets.tabular import episode_frame_table
 
 
 def _safe_cam(camera: str) -> str:
-    """Sanitize a camera key for filesystem paths (feature keys keep the original)."""
-    return camera.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    """Validate a camera key before using it as a filesystem component."""
+    return validate_camera_key(camera)
 
 
 class AugmentDatasetWriter:

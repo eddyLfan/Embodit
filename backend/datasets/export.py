@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from labels.store import default_labels_path, load_labels, save_labels
 
 from datasets.registry import open_dataset
 from datasets.view import FORMAT_LABELS
@@ -62,10 +63,8 @@ def export_dataset(
 
     if target == source_format:
         if progress_callback is not None:
-            try:
-                progress_callback({"stage": "export", "progress": 0.2, "message": "同格式子集导出…"})
-            except Exception:  # noqa: BLE001
-                pass
+            # Detached workers use this boundary to abort a cancelled export.
+            progress_callback({"stage": "export", "progress": 0.2, "message": "同格式子集导出…"})
         result = adapter.export_subset(output, episode_indices, media_mode=media_mode, mapping=mapping)
     else:
         result = convert_dataset(
@@ -106,9 +105,26 @@ def export_dataset(
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     if labels_path and labels_path.is_file():
-        dest = manifest_path.parent / "labels.jsonl"
-        shutil.copy2(labels_path, dest)
+        old_to_new = {old: new for new, old in enumerate(episode_indices)}
+        exported_labels: list[dict[str, Any]] = []
+        for label in load_labels(labels_path):
+            try:
+                old_index = int(label.get("episode_index"))
+            except (TypeError, ValueError):
+                continue
+            if old_index not in old_to_new:
+                continue
+            exported = dict(label)
+            exported["episode_index"] = old_to_new[old_index]
+            exported_labels.append(exported)
+        # A file dataset's labels live next to that exact file
+        # (``sample.hdf5.labels.jsonl``), never in the generic parent-level
+        # ``labels.jsonl`` which may belong to a different dataset.
+        dest = default_labels_path(out)
+        save_labels(dest, exported_labels)
         manifest["labels_copied"] = str(dest)
+        manifest["labels_count"] = len(exported_labels)
+        manifest["episode_index_mapping"] = {str(old): new for old, new in old_to_new.items()}
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     result["manifest"] = str(manifest_path)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 import traceback
 from pathlib import Path
@@ -13,8 +14,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from convert.jobs import read_job, update_job  # noqa: E402
+from convert.jobs import read_job, update_job_if_status  # noqa: E402
 from convert.pipeline import convert_dataset  # noqa: E402
+
+
+class ConversionCancelled(BaseException):
+    """Asynchronous worker cancellation that normal data fallbacks cannot swallow."""
+
+    pass
 
 
 def main() -> int:
@@ -32,14 +39,25 @@ def main() -> int:
 
     job_kind = str(job.get("kind") or "convert")
 
-    update_job(
+    claimed = update_job_if_status(
         jobs_dir,
         job_id,
+        {"queued", "running"},
         status="running",
         message="合并中…" if job_kind == "merge" else "转换中…",
         progress=0.01,
         pid=os.getpid(),
+        launching=False,
     )
+    if claimed.get("status") != "running":
+        return 0
+
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def cancel_conversion(_signum, _frame):
+        raise ConversionCancelled("任务已取消")
+
+    signal.signal(signal.SIGTERM, cancel_conversion)
 
     # Throttle progress writes: each update rewrites the whole job JSON, so
     # cap at one write per 0.5s (episode-boundary updates always pass).
@@ -54,12 +72,10 @@ def main() -> int:
             return
         last_write["t"] = now
         last_write["current"] = current
-        finished_count = int(
-            result.get("episodes") or result.get("totalEpisodes") or job.get("total") or 0
-        )
-        update_job(
+        updated = update_job_if_status(
             jobs_dir,
             job_id,
+            {"running"},
             status="running",
             message=str(payload.get("message") or "转换中…"),
             progress=float(payload.get("progress") or 0.0),
@@ -67,6 +83,8 @@ def main() -> int:
             total=int(payload.get("total") or 0),
             pid=os.getpid(),
         )
+        if updated.get("status") == "cancelled":
+            raise ConversionCancelled("任务已取消")
 
     try:
         if job_kind == "export":
@@ -84,26 +102,15 @@ def main() -> int:
                 progress_callback=on_progress,
             )
         elif job_kind == "merge":
-            import signal
-
             from merge.pipeline import merge_datasets
 
-            previous_handler = signal.getsignal(signal.SIGTERM)
-
-            def cancel_merge(_signum, _frame):
-                raise KeyboardInterrupt("merge cancelled")
-
-            signal.signal(signal.SIGTERM, cancel_merge)
-            try:
-                result = merge_datasets(
-                    [Path(path) for path in (job.get("sources") or [])],
-                    Path(job["output"]),
-                    media_mode=str(job.get("mediaMode") or "hardlink"),
-                    copy_labels=bool(job.get("copyLabels", True)),
-                    progress_callback=on_progress,
-                )
-            finally:
-                signal.signal(signal.SIGTERM, previous_handler)
+            result = merge_datasets(
+                [Path(path) for path in (job.get("sources") or [])],
+                Path(job["output"]),
+                media_mode=str(job.get("mediaMode") or "hardlink"),
+                copy_labels=bool(job.get("copyLabels", True)),
+                progress_callback=on_progress,
+            )
         else:
             result = convert_dataset(
                 Path(job["dataset"]),
@@ -113,9 +120,13 @@ def main() -> int:
                 mapping=job.get("mapping") or {},
                 progress_callback=on_progress,
             )
-        update_job(
+        finished_count = int(
+            result.get("episodes") or result.get("totalEpisodes") or job.get("total") or 0
+        )
+        updated = update_job_if_status(
             jobs_dir,
             job_id,
+            {"running"},
             status="completed",
             message="合并导出完成" if job_kind == "merge" else "转换完成",
             progress=1.0,
@@ -124,18 +135,27 @@ def main() -> int:
             result=result,
             pid=os.getpid(),
         )
+        if updated.get("status") == "cancelled":
+            print("cancelled", job_id)
+            return 0
         print("completed", job_id)
+        return 0
+    except ConversionCancelled:
+        print("cancelled", job_id)
         return 0
     except Exception as error:  # noqa: BLE001
         traceback.print_exc()
-        update_job(
+        update_job_if_status(
             jobs_dir,
             job_id,
+            {"queued", "running"},
             status="failed",
             message=f"{type(error).__name__}: {error}",
             pid=os.getpid(),
         )
         return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

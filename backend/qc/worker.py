@@ -7,6 +7,7 @@ import argparse
 import os
 import signal
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -15,7 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from qc.detectors.base import ScanCancelled  # noqa: E402
-from qc.jobs import read_job, update_job  # noqa: E402
+from qc.jobs import read_job, update_job_if_status  # noqa: E402
 from qc.pipeline import run_scan  # noqa: E402
 
 
@@ -38,14 +39,26 @@ def main() -> int:
     signal.signal(signal.SIGINT, on_signal)
     if job.get("status") == "cancelled":
         return 0
-    update_job(
+    claimed = update_job_if_status(
         jobs_dir,
         job_id,
+        {"queued", "running"},
         status="running",
         message="自动质检中…",
         progress=0.01,
         pid=os.getpid(),
+        launching=False,
     )
+    if claimed.get("status") == "paused":
+        claimed = update_job_if_status(
+            jobs_dir,
+            job_id,
+            {"queued", "running", "paused"},
+            pid=os.getpid(),
+            launching=False,
+        )
+    if claimed.get("status") not in {"running", "paused"}:
+        return 0
 
     def cancelled() -> bool:
         live = read_job(jobs_dir, job_id) or {}
@@ -58,9 +71,10 @@ def main() -> int:
     def progress(payload: dict) -> None:
         if cancelled():
             raise ScanCancelled("扫描已取消")
-        update_job(
+        update_job_if_status(
             jobs_dir,
             job_id,
+            {"queued", "running"},
             status="running",
             message=str(payload.get("message") or "自动质检中…"),
             progress=float(payload.get("progress") or 0.0),
@@ -74,6 +88,15 @@ def main() -> int:
             pid=os.getpid(),
         )
 
+    # Honor a pause/cancel that raced with process startup before opening and
+    # fingerprinting a potentially very large dataset.
+    while paused():
+        if cancelled():
+            return 0
+        time.sleep(0.25)
+    if cancelled():
+        return 0
+
     try:
         result = run_scan(
             Path(job["dataset"]),
@@ -85,35 +108,52 @@ def main() -> int:
             cancelled=cancelled,
             paused=paused,
         )
-        if cancelled():
+        # Finalization must participate in the pause state machine. A pause can
+        # land after the check but before the conditional completion write; in
+        # that case keep this worker alive, wait for resume/cancel, and retry.
+        while True:
+            while paused():
+                if cancelled():
+                    return 0
+                time.sleep(0.25)
+            if cancelled():
+                return 0
+            completed = update_job_if_status(
+                jobs_dir,
+                job_id,
+                {"running"},
+                status="completed",
+                message="自动质检完成" + ("（复用缓存）" if result.get("cached") else ""),
+                progress=1.0,
+                current=int(result.get("totalEpisodes") or 0),
+                total=int(result.get("totalEpisodes") or 0),
+                reportPath=result["reportPath"],
+                result=result,
+                pid=os.getpid(),
+            )
+            if completed.get("status") == "paused":
+                continue
             return 0
-        update_job(
+    except ScanCancelled:
+        update_job_if_status(
             jobs_dir,
             job_id,
-            status="completed",
-            message="自动质检完成" + ("（复用缓存）" if result.get("cached") else ""),
-            progress=1.0,
-            current=int(result.get("totalEpisodes") or 0),
-            total=int(result.get("totalEpisodes") or 0),
-            reportPath=result["reportPath"],
-            result=result,
-            pid=os.getpid(),
+            {"queued", "running", "paused"},
+            status="cancelled",
+            message="扫描已取消",
+            pid=None,
         )
-        return 0
-    except ScanCancelled:
-        if (read_job(jobs_dir, job_id) or {}).get("status") != "cancelled":
-            update_job(jobs_dir, job_id, status="cancelled", message="扫描已取消", pid=None)
         return 0
     except Exception as error:  # noqa: BLE001
         traceback.print_exc()
-        if (read_job(jobs_dir, job_id) or {}).get("status") != "cancelled":
-            update_job(
-                jobs_dir,
-                job_id,
-                status="failed",
-                message=f"{type(error).__name__}: {error}",
-                pid=os.getpid(),
-            )
+        update_job_if_status(
+            jobs_dir,
+            job_id,
+            {"queued", "running", "paused"},
+            status="failed",
+            message=f"{type(error).__name__}: {error}",
+            pid=os.getpid(),
+        )
         return 1
 
 

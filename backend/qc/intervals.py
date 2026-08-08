@@ -2,9 +2,27 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 
 import numpy as np
+
+
+def _finite(value: float, name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} 必须是有限数值") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{name} 必须是有限数值")
+    return number
+
+
+def _nonnegative(value: float, name: str) -> float:
+    number = _finite(value, name)
+    if number < 0:
+        raise ValueError(f"{name} 不能为负数")
+    return number
 
 
 def mask_to_intervals(
@@ -16,10 +34,16 @@ def mask_to_intervals(
     context_seconds: float = 0.0,
     duration: float | None = None,
 ) -> list[tuple[float, float]]:
+    rate = _finite(fps, "fps")
+    if rate <= 0:
+        raise ValueError("fps 必须大于 0")
+    minimum = _nonnegative(minimum_seconds, "minimum_seconds")
+    merge_gap = _nonnegative(merge_gap_seconds, "merge_gap_seconds")
+    context = _nonnegative(context_seconds, "context_seconds")
+    maximum = _nonnegative(duration, "duration") if duration is not None else None
     values = np.asarray(list(mask), dtype=bool)
     if values.size == 0 or not np.any(values):
         return []
-    rate = max(float(fps), 1e-6)
     indices = np.flatnonzero(values)
     runs: list[tuple[int, int]] = []
     start = previous = int(indices[0])
@@ -31,11 +55,13 @@ def mask_to_intervals(
         previous = current
     runs.append((start, previous + 1))
 
-    minimum_frames = max(1, int(round(max(0.0, minimum_seconds) * rate)))
+    # A run must actually reach the configured minimum duration. Conversely,
+    # a merge gap must not exceed its configured maximum duration.
+    minimum_frames = max(1, int(math.ceil(minimum * rate)))
     runs = [(a, b) for a, b in runs if b - a >= minimum_frames]
     if not runs:
         return []
-    merge_frames = max(0, int(round(max(0.0, merge_gap_seconds) * rate)))
+    merge_frames = int(math.floor(merge_gap * rate))
     merged = [runs[0]]
     for start, end in runs[1:]:
         old_start, old_end = merged[-1]
@@ -43,20 +69,25 @@ def mask_to_intervals(
             merged[-1] = (old_start, end)
         else:
             merged.append((start, end))
-    context = max(0.0, float(context_seconds))
-    maximum = float(duration) if duration is not None else values.size / rate
-    return [
-        (max(0.0, start / rate - context), min(maximum, end / rate + context))
-        for start, end in merged
-    ]
+    maximum = maximum if maximum is not None else values.size / rate
+    intervals: list[tuple[float, float]] = []
+    for start, end in merged:
+        clipped_start = max(0.0, min(maximum, start / rate - context))
+        clipped_end = max(0.0, min(maximum, end / rate + context))
+        if clipped_end > clipped_start:
+            intervals.append((clipped_start, clipped_end))
+    return intervals
 
 
 def union_duration(intervals: Iterable[tuple[float, float]], duration: float) -> float:
-    normalized = sorted(
-        (max(0.0, float(a)), min(float(duration), float(b)))
-        for a, b in intervals
-        if b > a
-    )
+    maximum = _nonnegative(duration, "duration")
+    normalized: list[tuple[float, float]] = []
+    for raw_start, raw_end in intervals:
+        start = max(0.0, min(maximum, _finite(raw_start, "interval start")))
+        end = max(0.0, min(maximum, _finite(raw_end, "interval end")))
+        if end > start:
+            normalized.append((start, end))
+    normalized.sort()
     if not normalized:
         return 0.0
     total = 0.0

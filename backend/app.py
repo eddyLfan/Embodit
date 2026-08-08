@@ -4,18 +4,36 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sys
+import tempfile
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
+from urllib.parse import urlencode
 
 import uvicorn
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import (
+    Cookie,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Path as ApiPath,
+    Query,
+    Request,
+)
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent
@@ -62,8 +80,7 @@ from convert.jobs import (  # noqa: E402
     launch_detached_worker as launch_convert_worker,
     list_jobs as list_convert_jobs,
     read_job as read_convert_job,
-    refresh_job_liveness as refresh_convert_liveness,
-    write_job as write_convert_job,
+    refresh_stored_job as refresh_convert_job,
 )
 from augment.algorithms import parse_prompts  # noqa: E402
 from augment.capabilities import capabilities_payload, config_fingerprint  # noqa: E402
@@ -76,7 +93,7 @@ from augment.jobs import (  # noqa: E402
     launch_detached_worker as launch_augment_worker,
     list_jobs as list_augment_jobs,
     read_job as read_augment_job,
-    refresh_job_liveness as refresh_augment_liveness,
+    refresh_stored_job as refresh_augment_job,
     write_job as write_augment_job,
 )
 import settings  # noqa: E402
@@ -92,6 +109,7 @@ from datasets.export import (  # noqa: E402
 from datasets.registry import open_dataset  # noqa: E402
 from datasets.view import FORMAT_LABELS, SUPPORTED_FORMATS  # noqa: E402
 from deploy.orchestrator import DeploymentOrchestration, OrchestrationRegistry  # noqa: E402
+from deploy.offline_evaluation import evaluate_dataset_frame  # noqa: E402
 from deploy.recipe import (  # noqa: E402
     compose_recipe as compose_deployment_recipe,
     parse_deployment_config,
@@ -120,21 +138,22 @@ from qc.jobs import (  # noqa: E402
     list_jobs as list_qc_jobs,
     pause_job as pause_qc_job,
     read_job as read_qc_job,
-    refresh_job_liveness as refresh_qc_liveness,
+    refresh_stored_job as refresh_qc_job,
     resume_job as resume_qc_job,
-    write_job as write_qc_job,
 )
 from qc.paths import find_report as find_qc_report  # noqa: E402
 from qc.store import (  # noqa: E402
     episode_detail as qc_episode_detail,
     query_episodes as query_qc_episodes,
-    report_csv as qc_report_csv,
+    report_csv_chunks as qc_report_csv_chunks,
     review_episode as review_qc_episode,
     review_finding as review_qc_finding,
     selected_episode_indices as qc_selected_episode_indices,
     summary as qc_summary,
 )
 
+
+JobIdPath = Annotated[str, ApiPath(pattern=r"^[A-Za-z0-9_-]{1,128}$")]
 
 
 class InspectRequest(BaseModel):
@@ -294,6 +313,14 @@ class DeploymentOrchestrationLogsRequest(BaseModel):
     component: str
     lines: int = Field(default=100, ge=1, le=1000)
 
+
+class DeploymentOfflineEvaluationRequest(BaseModel):
+    dataset: str = Field(min_length=1)
+    episodeIndex: int = Field(ge=0)
+    frameIndex: int = Field(default=0, ge=0)
+    taskPrompt: str | None = Field(default=None, max_length=2000)
+
+
 def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     browse_root = existing_root(browse_root)
     images_root = web_root.parent / "images"
@@ -314,8 +341,10 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        yield
-        deployment_orchestrations.stop_all()
+        try:
+            yield
+        finally:
+            await run_in_threadpool(deployment_orchestrations.stop_all)
 
     app = FastAPI(
         title="Embodit · Embodied Intelligence Toolkit",
@@ -342,14 +371,113 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             raise HTTPException(status_code=403, detail=f"{what}超出允许的根目录：{browse_root}")
         return resolved
 
+    def review_sidecar(raw: str | Path) -> Path:
+        target = sandboxed(raw, what="进度文件路径")
+        if not target.name.endswith(".review.json"):
+            raise HTTPException(status_code=400, detail="进度文件必须是 .review.json sidecar")
+        return target
+
+    @contextmanager
+    def lock_review_sidecar(target: Path):
+        """Serialize ownership checks and publication across processes."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = target.with_name(f".{target.name}.lock")
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def read_progress_document(target: Path) -> dict[str, Any]:
+        try:
+            document = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise HTTPException(status_code=400, detail=f"进度文件无法解析：{error}") from error
+        if not isinstance(document, dict):
+            raise HTTPException(status_code=400, detail="进度文件根节点必须是对象")
+        if document.get("version") not in {2, 3}:
+            raise HTTPException(status_code=400, detail="进度文件 version 必须是 2 或 3")
+        if not isinstance(document.get("dataset"), str) or not document["dataset"].strip():
+            raise HTTPException(status_code=400, detail="进度文件 dataset 必须是非空字符串")
+        states = document.get("states")
+        if not isinstance(states, dict) or not all(isinstance(value, str) for value in states.values()):
+            raise HTTPException(status_code=400, detail="进度文件 states 必须是字符串映射")
+        reasons = document.get("quarantineReasons", {})
+        if not isinstance(reasons, dict) or not all(isinstance(value, str) for value in reasons.values()):
+            raise HTTPException(
+                status_code=400,
+                detail="进度文件 quarantineReasons 必须是字符串映射",
+            )
+        normalized = {key: normalize_decision(value) for key, value in states.items()}
+        document["states"] = normalized
+        document["quarantineReasons"] = {
+            key: value.strip()
+            for key, value in reasons.items()
+            if normalized.get(key) == "quarantine" and value.strip()
+        }
+        return document
+
+    def labels_sidecar(dataset_raw: str | Path, requested_raw: str | Path | None) -> Path:
+        dataset = sandboxed(dataset_raw, what="数据集路径")
+        if not (dataset.is_file() or dataset.is_dir()):
+            raise HTTPException(status_code=404, detail=f"数据集不存在：{dataset}")
+        expected = default_labels_path(dataset).resolve()
+        if requested_raw is not None:
+            requested = sandboxed(requested_raw, what="标签文件路径")
+            if requested != expected:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"标签文件必须是该数据集的默认 sidecar：{expected}",
+                )
+        return expected
+
+    security_headers = {
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+    }
+    token_response_headers = {**security_headers, "Cache-Control": "no-store"}
+
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        for name, value in security_headers.items():
+            if name not in response.headers:
+                response.headers[name] = value
+        if request.url.path.startswith("/api/") and "Cache-Control" not in response.headers:
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.get("/", response_class=HTMLResponse)
-    def index(request: Request) -> HTMLResponse:
+    def index(request: Request) -> Response:
         # First visit carries ?token=... which we exchange for an HttpOnly
         # cookie; the token is no longer embedded in the page or asset URLs.
         query_token = request.query_params.get("token")
         cookie_token = request.cookies.get("embodit_token")
         if query_token != token and cookie_token != token:
             raise HTTPException(status_code=401, detail="无效或缺失的访问令牌")
+        if query_token is not None:
+            clean_query = urlencode(
+                [(key, value) for key, value in request.query_params.multi_items() if key != "token"]
+            )
+            target = request.url.path + (f"?{clean_query}" if clean_query else "")
+            response = RedirectResponse(target, status_code=303, headers=token_response_headers)
+            if query_token == token:
+                response.set_cookie(
+                    "embodit_token",
+                    token,
+                    httponly=True,
+                    samesite="lax",
+                    secure=request.url.scheme == "https",
+                    max_age=30 * 24 * 3600,
+                )
+            return response
         page = (web_root / "index.html").read_text(encoding="utf-8")
         page = page.replace("__LEROBOT_TOKEN__", "")
         # Inline i18n so language packs load even if /i18n.js route is missing
@@ -360,16 +488,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
                 "<!--I18N_INLINE-->",
                 f"<script>\n{i18n_path.read_text(encoding='utf-8')}\n</script>",
             )
-        response = HTMLResponse(page, headers={"Cache-Control": "no-store"})
-        if query_token == token and cookie_token != token:
-            response.set_cookie(
-                "embodit_token",
-                token,
-                httponly=True,
-                samesite="lax",
-                max_age=30 * 24 * 3600,
-            )
-        return response
+        return HTMLResponse(page, headers=token_response_headers)
 
     @app.get("/app.js")
     def javascript() -> FileResponse:
@@ -434,9 +553,10 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     async def inspect(request: InspectRequest) -> dict[str, Any]:
         dataset = sandboxed(request.dataset, what="数据集路径")
         try:
-            adapter = open_dataset(dataset)
-            view = await run_in_threadpool(adapter.inspect)
-            return view.to_inspect_dict()
+            def _inspect_dataset() -> dict[str, Any]:
+                return open_dataset(dataset).inspect().to_inspect_dict()
+
+            return await run_in_threadpool(_inspect_dataset)
         except Exception as error:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -445,16 +565,16 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         dataset: str,
         episode: int,
         keys: str | None = None,
-        maxPoints: int | None = None,
+        maxPoints: Annotated[int | None, Query(ge=1, le=10_000)] = None,
     ) -> dict[str, Any]:
+        dataset_path = sandboxed(dataset, what="数据集路径")
+        key_list = [item for item in (keys or "").split(",") if item] or None
+        cap = int(maxPoints) if maxPoints is not None else 0
         try:
-            adapter = open_dataset(sandboxed(dataset, what="数据集路径"))
-            key_list = [item for item in (keys or "").split(",") if item] or None
-            cap = int(maxPoints) if maxPoints else 0
-
             def _load() -> tuple[dict[str, Any], dict[str, int]]:
                 import numpy as np
 
+                adapter = open_dataset(dataset_path)
                 arrays = adapter.get_timeseries(episode, key_list)
                 series: dict[str, Any] = {}
                 lengths: dict[str, int] = {}
@@ -496,11 +616,15 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     @app.get("/api/mcap/video", dependencies=[Depends(authorize)])
     async def mcap_video(dataset: str, episode: int, topic: str) -> FileResponse:
         """Materialize an MCAP CompressedImage topic into a cached MP4 for playback."""
+        dataset_path = sandboxed(dataset, what="数据集路径")
         try:
-            adapter = open_dataset(sandboxed(dataset, what="数据集路径"))
-            if getattr(adapter, "format_id", None) != "mcap":
-                raise ValueError("仅 MCAP 数据集支持 topic 视频预览")
-            path = await run_in_threadpool(adapter.materialize_topic_video, episode, topic)
+            def _materialize() -> Path:
+                adapter = open_dataset(dataset_path)
+                if getattr(adapter, "format_id", None) != "mcap":
+                    raise ValueError("仅 MCAP 数据集支持 topic 视频预览")
+                return adapter.materialize_topic_video(episode, topic)
+
+            path = await run_in_threadpool(_materialize)
         except Exception as error:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(error)) from error
         response = FileResponse(
@@ -514,11 +638,15 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     @app.get("/api/hdf5/video", dependencies=[Depends(authorize)])
     async def hdf5_video(dataset: str, episode: int, camera: str) -> FileResponse:
         """Materialize in-HDF5 image frames into a cached MP4 for playback."""
+        dataset_path = sandboxed(dataset, what="数据集路径")
         try:
-            adapter = open_dataset(sandboxed(dataset, what="数据集路径"))
-            if getattr(adapter, "format_id", None) != "hdf5":
-                raise ValueError("仅 HDF5 数据集支持 frames 视频预览")
-            path = await run_in_threadpool(adapter.materialize_camera_video, episode, camera)
+            def _materialize() -> Path:
+                adapter = open_dataset(dataset_path)
+                if getattr(adapter, "format_id", None) != "hdf5":
+                    raise ValueError("仅 HDF5 数据集支持 frames 视频预览")
+                return adapter.materialize_camera_video(episode, camera)
+
+            path = await run_in_threadpool(_materialize)
         except Exception as error:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(error)) from error
         response = FileResponse(
@@ -531,8 +659,8 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
 
     @app.post("/api/progress/save", dependencies=[Depends(authorize)])
     def save_progress(request: ProgressRequest) -> dict[str, Any]:
-        target = sandboxed(request.path, what="进度文件路径")
-        target.parent.mkdir(parents=True, exist_ok=True)
+        target = review_sidecar(request.path)
+        dataset = sandboxed(request.dataset, what="数据集路径")
         normalized = {key: normalize_decision(value) for key, value in request.states.items()}
         quarantine_reasons = {
             key: str(value).strip()
@@ -541,35 +669,58 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         }
         document = {
             "version": 3,
-            "dataset": request.dataset,
+            "dataset": str(dataset),
             "updatedAt": now_iso(),
             "updatedBy": os.environ.get("USER", "unknown"),
             "states": normalized,
             "quarantineReasons": quarantine_reasons,
         }
-        temporary = target.with_name(f".{target.name}.tmp-{os.getpid()}")
-        temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, target)
+        temporary: Path | None = None
+        try:
+            with lock_review_sidecar(target):
+                if target.exists():
+                    if not target.is_file():
+                        raise HTTPException(status_code=400, detail=f"进度路径不是文件：{target}")
+                    existing = read_progress_document(target)
+                    existing_dataset = Path(existing["dataset"]).expanduser().resolve()
+                    if existing_dataset != dataset:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"进度文件属于其他数据集：{existing_dataset}",
+                        )
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.tmp-",
+                    dir=target.parent,
+                )
+                temporary = Path(temporary_name)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump(document, stream, ensure_ascii=False, indent=2)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, target)
+                temporary = None
+        except HTTPException:
+            raise
+        except OSError as error:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=f"进度文件无法保存：{error}") from error
+        except BaseException:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise
         return {"path": str(target), "states": normalized, "quarantineReasons": quarantine_reasons}
 
     @app.post("/api/progress/load", dependencies=[Depends(authorize)])
     def load_progress(request: ProgressLoadRequest) -> dict[str, Any]:
-        target = sandboxed(request.path, what="进度文件路径")
+        target = review_sidecar(request.path)
         if not target.is_file():
             raise HTTPException(status_code=404, detail=f"进度文件不存在：{target}")
-        document = json.loads(target.read_text(encoding="utf-8"))
-        states = document.get("states") or {}
-        document["states"] = {key: normalize_decision(value) for key, value in states.items()}
-        reasons = document.get("quarantineReasons") or {}
-        document["quarantineReasons"] = {
-            key: str(value).strip()
-            for key, value in reasons.items()
-            if document["states"].get(key) == "quarantine" and str(value).strip()
-        }
-        return document
+        return read_progress_document(target)
 
     @app.post("/api/create", dependencies=[Depends(authorize)])
-    async def create(request: CreateRequest) -> dict[str, Any]:
+    def create(request: CreateRequest) -> dict[str, Any]:
         dataset = sandboxed(request.dataset, what="数据集路径")
         output_path = sandboxed(request.output, what="输出路径")
         if request.mediaMode not in {"hardlink", "copy"}:
@@ -701,27 +852,23 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         }
 
     @app.get("/api/convert/status/{job_id}", dependencies=[Depends(authorize)])
-    def convert_status(job_id: str) -> dict[str, Any]:
-        job = read_convert_job(jobs_dir, job_id)
+    def convert_status(job_id: JobIdPath) -> dict[str, Any]:
+        job = refresh_convert_job(jobs_dir, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="转换任务不存在")
-        refreshed = refresh_convert_liveness(job)
-        if refreshed.get("status") != job.get("status"):
-            write_convert_job(jobs_dir, refreshed)
-        return refreshed
+        return job
 
     @app.get("/api/convert/jobs", dependencies=[Depends(authorize)])
     def convert_jobs_list(limit: int = 30) -> dict[str, Any]:
         rows = []
         for job in list_convert_jobs(jobs_dir, limit=limit):
-            refreshed = refresh_convert_liveness(job)
-            if refreshed.get("status") != job.get("status"):
-                write_convert_job(jobs_dir, refreshed)
-            rows.append(refreshed)
+            refreshed = refresh_convert_job(jobs_dir, str(job.get("jobId") or ""))
+            if refreshed is not None:
+                rows.append(refreshed)
         return {"jobs": rows, "jobsDir": str(jobs_dir)}
 
     @app.post("/api/convert/jobs/{job_id}/dismiss", dependencies=[Depends(authorize)])
-    def convert_job_dismiss(job_id: str) -> dict[str, Any]:
+    def convert_job_dismiss(job_id: JobIdPath) -> dict[str, Any]:
         job = read_convert_job(jobs_dir, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="转换任务不存在")
@@ -731,7 +878,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         return {"ok": deleted, "jobId": job_id}
 
     @app.post("/api/convert/jobs/{job_id}/cancel", dependencies=[Depends(authorize)])
-    def convert_job_cancel(job_id: str) -> dict[str, Any]:
+    def convert_job_cancel(job_id: JobIdPath) -> dict[str, Any]:
         job = read_convert_job(jobs_dir, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="转换任务不存在")
@@ -764,10 +911,11 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         if color_mode == "fixed" and request.colorRgb is not None:
             if len(request.colorRgb) != 3 or any(value < 0 or value > 255 for value in request.colorRgb):
                 raise HTTPException(status_code=400, detail="colorRgb 必须是 0–255 范围内的三个整数")
-        if request.gpuId < 0:
-            raise HTTPException(status_code=400, detail="gpuId 不能为负数")
-        if capabilities is not None and request.gpuId >= capabilities["color"].get("gpuCount", 0):
-            raise HTTPException(status_code=400, detail=f"GPU ID 超出范围：{request.gpuId}")
+        if aug_type == "color":
+            if request.gpuId < 0:
+                raise HTTPException(status_code=400, detail="gpuId 不能为负数")
+            if request.gpuId >= capabilities["color"].get("gpuCount", 0):
+                raise HTTPException(status_code=400, detail=f"GPU ID 超出范围：{request.gpuId}")
         if request.sampleCount is not None and request.sampleCount < 1:
             raise HTTPException(status_code=400, detail="sampleCount 必须是正整数")
         if request.episodes is not None and not request.episodes:
@@ -799,7 +947,9 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
                 ),
                 "brightnessGain": request.brightnessGain,
                 "brightnessGamma": request.brightnessGamma,
-                "gpuId": int(request.gpuId or 0),
+                # Brightness is CPU-only; keep its fingerprint independent of
+                # the color-only GPU selector.
+                "gpuId": int(request.gpuId or 0) if aug_type == "color" else 0,
                 "episodes": request.episodes,
                 "sampleCount": request.sampleCount,
                 "previewEpisode": request.previewEpisode,
@@ -843,27 +993,23 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         return _start_augment_job(request, mode="batch")
 
     @app.get("/api/augment/status/{job_id}", dependencies=[Depends(authorize)])
-    def augment_status(job_id: str) -> dict[str, Any]:
-        job = read_augment_job(augment_jobs_dir, job_id)
+    def augment_status(job_id: JobIdPath) -> dict[str, Any]:
+        job = refresh_augment_job(augment_jobs_dir, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="增强任务不存在")
-        refreshed = refresh_augment_liveness(job)
-        if refreshed.get("status") != job.get("status"):
-            write_augment_job(augment_jobs_dir, refreshed)
-        return refreshed
+        return job
 
     @app.get("/api/augment/jobs", dependencies=[Depends(authorize)])
     def augment_jobs_list(limit: int = 30) -> dict[str, Any]:
         rows = []
         for job in list_augment_jobs(augment_jobs_dir, limit=limit):
-            refreshed = refresh_augment_liveness(job)
-            if refreshed.get("status") != job.get("status"):
-                write_augment_job(augment_jobs_dir, refreshed)
-            rows.append(refreshed)
+            refreshed = refresh_augment_job(augment_jobs_dir, str(job.get("jobId") or ""))
+            if refreshed is not None:
+                rows.append(refreshed)
         return {"jobs": rows, "jobsDir": str(augment_jobs_dir)}
 
     @app.post("/api/augment/jobs/{job_id}/dismiss", dependencies=[Depends(authorize)])
-    def augment_job_dismiss(job_id: str) -> dict[str, Any]:
+    def augment_job_dismiss(job_id: JobIdPath) -> dict[str, Any]:
         job = read_augment_job(augment_jobs_dir, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="增强任务不存在")
@@ -873,14 +1019,14 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         return {"ok": deleted, "jobId": job_id}
 
     @app.post("/api/augment/jobs/{job_id}/cancel", dependencies=[Depends(authorize)])
-    def augment_job_cancel(job_id: str) -> dict[str, Any]:
+    def augment_job_cancel(job_id: JobIdPath) -> dict[str, Any]:
         job = read_augment_job(augment_jobs_dir, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="增强任务不存在")
         return cancel_augment_job(augment_jobs_dir, job_id)
 
     @app.get("/api/augment/preview-asset/{job_id}/{asset_path:path}", dependencies=[Depends(authorize)])
-    def augment_preview_asset(job_id: str, asset_path: str) -> FileResponse:
+    def augment_preview_asset(job_id: JobIdPath, asset_path: str) -> FileResponse:
         job = read_augment_job(augment_jobs_dir, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="增强任务不存在")
@@ -901,14 +1047,12 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
 
     @app.post("/api/labels/load", dependencies=[Depends(authorize)])
     def labels_load(request: LabelsLoadRequest) -> dict[str, Any]:
-        dataset = sandboxed(request.dataset, what="数据集路径")
-        path = sandboxed(request.path, what="标签文件路径") if request.path else default_labels_path(dataset)
+        path = labels_sidecar(request.dataset, request.path)
         return {"path": str(path), "labels": load_labels(path), "presets": preset_tags()}
 
     @app.post("/api/labels/save", dependencies=[Depends(authorize)])
     def labels_save(request: LabelsSaveRequest) -> dict[str, Any]:
-        dataset = sandboxed(request.dataset, what="数据集路径")
-        path = sandboxed(request.path, what="标签文件路径") if request.path else default_labels_path(dataset)
+        path = labels_sidecar(request.dataset, request.path)
         try:
             save_labels(path, request.labels)
         except Exception as error:  # noqa: BLE001
@@ -917,8 +1061,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
 
     @app.post("/api/labels/upsert", dependencies=[Depends(authorize)])
     def labels_upsert(request: LabelUpsertRequest) -> dict[str, Any]:
-        dataset = sandboxed(request.dataset, what="数据集路径")
-        path = sandboxed(request.path, what="标签文件路径") if request.path else default_labels_path(dataset)
+        path = labels_sidecar(request.dataset, request.path)
         label = dict(request.label)
         label.setdefault("updated_at", now_iso())
         label.setdefault("updated_by", os.environ.get("USER", "user"))
@@ -930,8 +1073,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
 
     @app.post("/api/labels/delete", dependencies=[Depends(authorize)])
     def labels_delete(request: LabelUpsertRequest) -> dict[str, Any]:
-        dataset = sandboxed(request.dataset, what="数据集路径")
-        path = sandboxed(request.path, what="标签文件路径") if request.path else default_labels_path(dataset)
+        path = labels_sidecar(request.dataset, request.path)
         try:
             labels = delete_label(path, dict(request.label))
         except Exception as error:  # noqa: BLE001
@@ -975,54 +1117,56 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         target = str(sandboxed(dataset, what="数据集路径")) if dataset else None
         rows = []
         for job in list_qc_jobs(qc_jobs_dir, limit=100):
-            patched = refresh_qc_liveness(job)
-            if patched != job:
-                write_qc_job(qc_jobs_dir, patched)
+            patched = refresh_qc_job(qc_jobs_dir, str(job.get("jobId") or ""))
+            if patched is None:
+                continue
             if target is None or patched.get("dataset") == target:
                 rows.append(patched)
         return {"jobs": rows}
 
     @app.get("/api/qc/scans/{scan_id}/status", dependencies=[Depends(authorize)])
-    def qc_scan_status(scan_id: str) -> dict[str, Any]:
-        job = read_qc_job(qc_jobs_dir, scan_id)
+    def qc_scan_status(scan_id: JobIdPath) -> dict[str, Any]:
+        job = refresh_qc_job(qc_jobs_dir, scan_id)
         if job is None:
             raise HTTPException(status_code=404, detail="QC 任务不存在")
-        patched = refresh_qc_liveness(job)
-        if patched != job:
-            write_qc_job(qc_jobs_dir, patched)
-        return patched
+        return job
 
     @app.post("/api/qc/scans/{scan_id}/pause", dependencies=[Depends(authorize)])
-    def qc_pause(scan_id: str) -> dict[str, Any]:
+    def qc_pause(scan_id: JobIdPath) -> dict[str, Any]:
         try:
             return pause_qc_job(qc_jobs_dir, scan_id)
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
     @app.post("/api/qc/scans/{scan_id}/resume", dependencies=[Depends(authorize)])
-    def qc_resume(scan_id: str) -> dict[str, Any]:
+    def qc_resume(scan_id: JobIdPath) -> dict[str, Any]:
         try:
             return resume_qc_job(qc_jobs_dir, scan_id)
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
     @app.post("/api/qc/scans/{scan_id}/cancel", dependencies=[Depends(authorize)])
-    def qc_cancel(scan_id: str) -> dict[str, Any]:
+    def qc_cancel(scan_id: JobIdPath) -> dict[str, Any]:
         try:
             return cancel_qc_job(qc_jobs_dir, scan_id)
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
     @app.post("/api/qc/scans/{scan_id}/dismiss", dependencies=[Depends(authorize)])
-    def qc_dismiss(scan_id: str) -> dict[str, Any]:
+    def qc_dismiss(scan_id: JobIdPath) -> dict[str, Any]:
+        job = refresh_qc_job(qc_jobs_dir, scan_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="QC 任务不存在")
+        if job.get("status") in {"queued", "running", "paused"}:
+            raise HTTPException(status_code=400, detail="活动中的 QC 任务不能清除，请先取消")
         return {"deleted": delete_qc_job(qc_jobs_dir, scan_id), "jobId": scan_id}
 
     @app.get("/api/qc/scans/{scan_id}/summary", dependencies=[Depends(authorize)])
-    def qc_report_summary(scan_id: str) -> dict[str, Any]:
+    def qc_report_summary(scan_id: JobIdPath) -> dict[str, Any]:
         return qc_summary(resolve_qc_report(scan_id))
 
     @app.post("/api/qc/scans/{scan_id}/episodes/query", dependencies=[Depends(authorize)])
-    def qc_report_episodes(scan_id: str, request: QCQueryRequest) -> dict[str, Any]:
+    def qc_report_episodes(scan_id: JobIdPath, request: QCQueryRequest) -> dict[str, Any]:
         try:
             return query_qc_episodes(resolve_qc_report(scan_id), request.filters)
         except (TypeError, ValueError) as error:
@@ -1032,7 +1176,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         "/api/qc/scans/{scan_id}/episodes/{episode_index}",
         dependencies=[Depends(authorize)],
     )
-    def qc_report_episode(scan_id: str, episode_index: int) -> dict[str, Any]:
+    def qc_report_episode(scan_id: JobIdPath, episode_index: int) -> dict[str, Any]:
         try:
             return qc_episode_detail(resolve_qc_report(scan_id), episode_index)
         except KeyError as error:
@@ -1043,7 +1187,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         dependencies=[Depends(authorize)],
     )
     def qc_finding_review(
-        scan_id: str,
+        scan_id: JobIdPath,
         finding_id: str,
         request: QCFindingReviewRequest,
     ) -> dict[str, Any]:
@@ -1064,7 +1208,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         dependencies=[Depends(authorize)],
     )
     def qc_episode_review(
-        scan_id: str,
+        scan_id: JobIdPath,
         episode_index: int,
         request: QCEpisodeReviewRequest,
     ) -> dict[str, Any]:
@@ -1085,16 +1229,15 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         "/api/qc/scans/{scan_id}/selection/preview",
         dependencies=[Depends(authorize)],
     )
-    def qc_selection_preview(scan_id: str, request: QCQueryRequest) -> dict[str, Any]:
+    def qc_selection_preview(scan_id: JobIdPath, request: QCQueryRequest) -> dict[str, Any]:
         return qc_selected_episode_indices(resolve_qc_report(scan_id), request.filters)
 
     @app.get("/api/qc/scans/{scan_id}/export-report", dependencies=[Depends(authorize)])
-    def qc_export_report(scan_id: str, kind: str = "episodes") -> Response:
+    def qc_export_report(scan_id: JobIdPath, kind: str = "episodes") -> Response:
         if kind not in {"episodes", "findings"}:
             raise HTTPException(status_code=400, detail="kind 只能是 episodes 或 findings")
-        content = qc_report_csv(resolve_qc_report(scan_id), kind)
-        return Response(
-            content,
+        return StreamingResponse(
+            qc_report_csv_chunks(resolve_qc_report(scan_id), kind),
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="qc-{scan_id[:8]}-{kind}.csv"'},
         )
@@ -1243,6 +1386,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
                 "actionLimits": True,
                 "manualArmConfirmation": True,
                 "emergencyStop": True,
+                "offlineSingleFrameEvaluation": True,
             },
         }
 
@@ -1334,6 +1478,49 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             return deployment_orchestrations.get(orchestration_id).snapshot()
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/offline-evaluation",
+        dependencies=[Depends(authorize)],
+    )
+    async def run_deployment_offline_evaluation(
+        orchestration_id: str,
+        request: DeploymentOfflineEvaluationRequest,
+    ) -> dict[str, Any]:
+        try:
+            orchestration = deployment_orchestrations.get(orchestration_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+        dataset_path = sandboxed(request.dataset, what="离线评测数据集路径")
+        client_config = orchestration.recipe.robot.client.config or {}
+        telemetry = client_config.get("telemetry")
+        telemetry = telemetry if isinstance(telemetry, dict) else {}
+        action_telemetry = telemetry.get("action")
+        action_telemetry = action_telemetry if isinstance(action_telemetry, dict) else {}
+        configured_names = action_telemetry.get("names")
+        if not isinstance(configured_names, list):
+            action_config = client_config.get("action")
+            action_config = action_config if isinstance(action_config, dict) else {}
+            configured_names = action_config.get("joints")
+
+        def _evaluate() -> dict[str, Any]:
+            adapter = open_dataset(dataset_path)
+            return evaluate_dataset_frame(
+                adapter,
+                episode_index=request.episodeIndex,
+                frame_index=request.frameIndex,
+                predictor=orchestration.infer_observations,
+                prompt=request.taskPrompt,
+                action_names=configured_names if isinstance(configured_names, list) else None,
+            )
+
+        try:
+            return await run_in_threadpool(_evaluate)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post(
         "/api/deploy/orchestrations/{orchestration_id}/start-dry-run",
@@ -1612,9 +1799,9 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
 
 def existing_root(path: Path) -> Path:
     resolved = path.expanduser().resolve()
-    if resolved.is_dir():
-        return resolved
-    return Path.home().resolve()
+    if not resolved.is_dir():
+        raise ValueError(f"浏览根目录不存在或不是目录：{resolved}")
+    return resolved
 
 
 def is_inside(root: Path, candidate: Path) -> bool:
@@ -1627,8 +1814,6 @@ def is_inside(root: Path, candidate: Path) -> bool:
 
 def default_review_path(dataset: Path) -> Path:
     dataset = dataset.expanduser().resolve()
-    if dataset.is_file():
-        return dataset.with_name(dataset.name + ".review.json")
     return dataset.with_name(dataset.name + ".review.json")
 
 

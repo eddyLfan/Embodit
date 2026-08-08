@@ -52,7 +52,7 @@ Usage: bash embodit.sh <command> [options]
 
 Commands:
   start [DATA_ROOT]    Start Embodit (default data root: current directory)
-  setup                Install all dependencies without starting the service
+  setup                Install locked core dependencies without starting the service
   stop                 Stop Embodit and clean up stray instances
   restart [DATA_ROOT]  Restart Embodit
   status               Show whether Embodit is running
@@ -83,7 +83,7 @@ Examples:
 Optional env vars: EMBODY_ROOT, EMBODY_HOST, EMBODY_PORT,
   EMBODY_PUBLIC_HOST, EMBODY_TOKEN, EMBODY_PROXY, EMBODIT_SANDBOX,
   EMBODIT_PYPI_MIRROR, EMBODIT_CACHE_DIR, EMBODIT_STATE_DIR,
-  EMBODIT_REVIEW_CONFIG,
+  EMBODIT_REVIEW_CONFIG, EMBODIT_HDF5_FPS, EMBODIT_MCAP_GAP_S,
   AUGMENT_PYTHON, AUGMENT_SAM3_CHECKPOINT
 EOF
 }
@@ -493,7 +493,7 @@ Usage: bash embodit.sh clean [--expired|--cache|--all] [--dry-run]
 
   --expired   Apply the configured retention policy (default).
   --cache     Remove all reproducible previews, media, and SAM caches.
-  --all       Remove cache, job history, logs, and QC reports under the cache root.
+  --all       Remove cache, job history, and QC reports under the cache root.
   --dry-run   Print candidates without deleting or migrating anything.
 
 Stop the service before a real cleanup. Dataset outputs, labels, review files,

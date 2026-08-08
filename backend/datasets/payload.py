@@ -12,6 +12,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from .path_safety import validate_camera_key
+
 
 @dataclass
 class EpisodePayload:
@@ -50,6 +52,9 @@ class EpisodePayload:
                     raise ValueError(
                         f"episode {self.episode_index}: {name} 帧数 {arr.shape[0]} 与 length {length} 严重不一致"
                     )
+        camera_keys = set(self.video_paths) | set(self.images)
+        for cam in camera_keys:
+            validate_camera_key(cam)
         for cam, path in self.video_paths.items():
             if not str(path):
                 raise ValueError(f"episode {self.episode_index}: 相机 {cam} 的视频路径为空")
