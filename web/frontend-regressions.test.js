@@ -167,6 +167,41 @@ for (const selector of ['button', 'input', 'select', 'textarea', '.chooser-card'
   );
 }
 
+const collapsedHeader = readEffectiveDeclarations(stylesSource, 'body.header-collapsed');
+assert.equal(collapsedHeader['--header-h'], '36px');
+
+const collapsedSwitch = readEffectiveDeclarations(stylesSource, 'body.header-collapsed .layer-switch');
+assert.equal(collapsedSwitch.padding, '1px');
+assert.equal(collapsedSwitch['border-width'], '1px');
+
+const collapsedTab = readEffectiveDeclarations(stylesSource, 'body.header-collapsed .layer-tab');
+assert.equal(collapsedTab.height, '28px');
+assert.equal(collapsedTab['border-width'], '1px');
+
+for (const selector of [
+  'body.header-collapsed .lang-switch select',
+  'body.header-collapsed .header-toggle',
+]) {
+  assert.equal(
+    readEffectiveDeclarations(stylesSource, selector).height,
+    '28px',
+    `${selector} must fit inside the collapsed header`,
+  );
+}
+
+for (const dimension of ['width', 'height']) {
+  assert.equal(
+    readEffectiveDeclarations(stylesSource, 'body.header-collapsed .brand-logo')[dimension],
+    '24px',
+    `collapsed brand logo ${dimension} must stay compact`,
+  );
+  assert.equal(
+    readEffectiveDeclarations(stylesSource, 'body.header-collapsed .layer-tab-icon')[dimension],
+    '18px',
+    `collapsed layer icon ${dimension} must stay compact`,
+  );
+}
+
 // Only logs, video media, and their camera frames remain dark islands in the light app shell.
 for (const selector of [
   '.video-card',
