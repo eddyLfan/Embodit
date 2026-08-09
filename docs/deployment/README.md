@@ -82,7 +82,9 @@ chmod 600 config/local/my-robot.json config/local/my-model.json
 
 The Web workspace discovers project configs with the non-recursive pattern
 `config/local/*.json`. Keep both files directly in `config/local/`; nested
-directories are not discovered.
+directories are not discovered. Configs saved through the Web UI live under
+`.embodit_cache/deploy/configs/` and take precedence over a project config with
+the same `config_id`; saved Recipes live under `.embodit_cache/deploy/recipes/`.
 
 Do not run either committed template unchanged. After editing both local copies:
 
@@ -196,7 +198,7 @@ Use `['bash','-lc','...']` explicitly for shell pipelines or redirection.
 | `services` | `{name,type}` entries |
 | `actions` | `{name,type}` entries; unavailable for ROS1 readiness |
 
-Topic fields are `name`, exact `type`, `minimum_rate_hz` (`0` disables rate check), `sample_seconds` (`0..15`), and optional ROS2 `maximum_age_ms`. Do not configure freshness for message types without a header.
+Topic fields are `name`, exact `type`, `minimum_rate_hz` (`0` disables rate check), `sample_seconds` (`>0` and `<=15`), and optional ROS2 `maximum_age_ms`. Do not configure freshness for message types without a header.
 
 ### 5.4 Lifecycle operations
 
@@ -384,6 +386,9 @@ Do not set `command` or `health` for managed `python/openpi/lerobot/starvla` pro
 
 ### 8.2 Custom Python model
 
+Start from the minimal [`my_vla.py`](../../examples/deployment/my_vla.py)
+example, or implement the same contract directly:
+
 ```python
 class MyVLA:
     def load(self, checkpoint, **kwargs):
@@ -537,51 +542,8 @@ embodit-client-<deployment-id>.service
 | initial pose | joint order, units, controller state, measured tolerance |
 | client safety | action shape, NaN/Inf, absolute limits, max step, watchdog |
 
-## 13. HTTP API
+## Internal HTTP routes
 
-All endpoints below require the Embodit access token. They are served over plain
-HTTP unless the operator supplies a TLS reverse proxy; follow
-[SECURITY.md](../../SECURITY.md) for network and credential requirements.
-
-```text
-POST        /api/deploy/configs/validate
-POST        /api/deploy/compose
-POST        /api/deploy/recipes/validate
-POST        /api/deploy/recipes/split
-GET/POST    /api/deploy/configs/{kind}
-GET/DELETE  /api/deploy/configs/{kind}/{config_id}
-GET/POST    /api/deploy/recipes
-GET/DELETE  /api/deploy/recipes/{recipe_id}
-GET         /api/deploy/capabilities
-GET         /api/deploy/model-catalog
-POST        /api/deploy/doctor
-POST        /api/deploy/robot-connection
-GET         /api/deploy/examples/{name}
-GET/POST    /api/deploy/orchestrations
-POST        /api/deploy/orchestrations/prepare-model
-GET         /api/deploy/orchestrations/{orchestration_id}
-POST        /api/deploy/orchestrations/{orchestration_id}/offline-evaluation
-POST        /api/deploy/orchestrations/{orchestration_id}/start-dry-run
-POST        /api/deploy/orchestrations/{orchestration_id}/start-evaluation
-POST        /api/deploy/orchestrations/{orchestration_id}/prompt
-POST        /api/deploy/orchestrations/{orchestration_id}/scheduler
-POST        /api/deploy/orchestrations/{orchestration_id}/disconnect-robot
-POST        /api/deploy/orchestrations/{orchestration_id}/close-model
-POST        /api/deploy/orchestrations/{orchestration_id}/poses
-POST        /api/deploy/orchestrations/{orchestration_id}/poses/{pose_id}/move
-DELETE      /api/deploy/orchestrations/{orchestration_id}/poses/{pose_id}
-POST        /api/deploy/orchestrations/{orchestration_id}/arm-challenge
-POST        /api/deploy/orchestrations/{orchestration_id}/start-live
-POST        /api/deploy/orchestrations/{orchestration_id}/stop-evaluation
-POST        /api/deploy/orchestrations/{orchestration_id}/stop
-POST        /api/deploy/orchestrations/{orchestration_id}/emergency-stop
-POST        /api/deploy/orchestrations/{orchestration_id}/logs
-POST        /api/deploy/orchestrations/{orchestration_id}/components/{component}/restart
-GET         /api/deploy/orchestrations/{orchestration_id}/manifest
-```
-
-`start-evaluation` is a compatibility route and only enters or preserves Dry Run;
-it cannot promote an orchestration to Live. Live requires `arm-challenge` followed
-by `start-live` with the exact, unexpired phrase.
-
-Configs are reusable components; Recipe is the runtime protocol. Do not maintain a second execution configuration.
+The Web UI and `embodit.sh` are the supported operator interfaces. Routes under
+`/api/...` are pre-1.0 implementation details and may change without a
+compatibility guarantee; do not build an external control client against them.

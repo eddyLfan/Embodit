@@ -82,7 +82,9 @@ Web UI 可创建 Episode 与区间标签；后端 schema 还接受 Frame 标签�
 
 默认策略保持保守：hard-invalid 或 fatal → `quarantine`；分数 ≥80、可用比例 ≥90%、覆盖率 ≥80% 且没有 error → `pass`；其他情况 → `review`。复核单条 Finding 会更新审计状态，但不会重新计算已保存分数；需要人工覆盖时应设置 Episode 级 QC 决定。
 
-当前 Detector 主要覆盖结构完整性、视觉/信号质量以及部分运动与跨模态规则。完整传感器同步、设备物理限位、任务成功、重复数据、分布漂移和 train/eval 泄漏仍需要设备 Profile 或后续实现。标定方法见 [`QC_STANDARD.zh-CN.md`](QC_STANDARD.zh-CN.md)。
+当前 Detector 主要覆盖结构完整性、视觉/信号质量以及部分运动与跨模态规则。完整传感器同步、设备物理限位、任务成功、重复数据、分布漂移和 train/eval 泄漏仍需设备 Profile 单独处理。
+
+机器人数据不存在跨设备通用的质量阈值。内置默认值只是保守的证据生成起点，不代表质量认证。每种机器人、控制模式和相机布局都应维护独立的标注校准集；自动隔离以低误杀为优先，证据不明确时进入人工复核。报告会保存 Detector 与配置版本，规则变化后不会静默复用不兼容结果。
 
 ## 5. 子集导出与保真边界
 
@@ -162,7 +164,7 @@ bash embodit.sh clean --all
 | `EMBODIT_PREVIEW_TTL_DAYS` | `7` | 预览任务记录与资源 |
 | `EMBODIT_MEDIA_TTL_DAYS` | `7` | 可重建的播放媒体缓存文件 |
 | `EMBODIT_SAM_CACHE_TTL_DAYS` | `30` | SAM3 分割缓存文件 |
-| `EMBODIT_JOB_TTL_DAYS` | `30` | 已结束的 QC、转换和增强任务记录/日志 |
+| `EMBODIT_JOB_TTL_DAYS` | `30` | 已结束的导出、转换、合并、QC 和增强任务记录/日志 |
 | `EMBODIT_TEMP_TTL_DAYS` | `1` | 无引用预览及临时/staging 产物 |
 | `EMBODIT_QC_REPORTS_PER_DATASET` | `5` | 每个数据集保留的最近报告数；旧报告被任务引用时继续保留 |
 | `EMBODIT_MAINTENANCE_INTERVAL_HOURS` | `24` | 定期清理间隔；正值最短按一小时执行，`0` 只关闭定期清理 |
@@ -180,4 +182,4 @@ TTL 或报告数设置为 `0` 时，匹配且未受保护的条目会立即满�
 | 硬链接失败 | 使用 `copy`，或让源/输出位于同一文件系统 |
 | 路径被拒绝 | 使用合适的数据根目录启动；局域网保持沙箱开启 |
 
-扩展边界：数据适配器位于 `backend/datasets/`，QC Detector 位于 `backend/qc/detectors/`，转换位于 `backend/convert/`，增强位于 `backend/augment/`。详见[项目架构](../architecture.zh-CN.md)。
+扩展边界：数据适配器位于 `backend/datasets/`，QC Detector 位于 `backend/qc/detectors/`，转换位于 `backend/convert/`，增强位于 `backend/augment/`。贡献边界统一见 [CONTRIBUTING.md](../../CONTRIBUTING.md)。

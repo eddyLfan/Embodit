@@ -5,9 +5,7 @@ follows [Semantic Versioning](https://semver.org/); `0.x` denotes initial develo
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-08-08
-
-First open-source release.
+First open-source release candidate.
 
 ### Added
 
@@ -20,16 +18,16 @@ First open-source release.
   mode, monitoring, rollback, and software emergency-stop integration.
 - Public Python and dependency-free frontend regression suites with GitHub
   Actions checks.
-- English/Chinese data, deployment, configuration, and architecture guides,
-  plus contribution, security, and third-party documentation.
+- English/Chinese data and deployment guides, plus contribution, security, and
+  third-party documentation.
 
 ### Changed
 
 - Refactored persistent worker state, cancellation, no-overwrite publication,
   path validation, media handling, dataset payloads, and deployment lifecycle
   logic for clearer boundaries and lower request-thread overhead.
-- Rebuilt the static Web UI as a compact, responsive pixel-console interface,
-  removing redundant explanatory copy while preserving safety and field help.
+- Rebuilt the static Web UI as a compact, responsive light interface with
+  system-native typography and restrained visual hierarchy.
 - Recomputed LeRobot v2.1 subset indices and statistics from emitted samples.
 
 ### Fixed

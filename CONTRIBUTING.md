@@ -63,15 +63,17 @@ The main module boundaries are:
 | Service entry | `embodit.sh`, `backend/cache_manager.py` | Environment, process state, logs, cache retention |
 | Tests | `tests/`, `web/frontend-regressions.test.js` | Python and frontend regression coverage |
 
-Read [docs/architecture.md](docs/architecture.md) before changing boundaries.
 Format behavior is documented in [docs/data/README.md](docs/data/README.md), and
-deployment behavior in
-[docs/deployment/README.md](docs/deployment/README.md).
+deployment behavior in [docs/deployment/README.md](docs/deployment/README.md).
+Keep these boundaries explicit:
 
-Keep dependencies one-way where practical: format-specific parsing belongs in
-an adapter, generic conversion works through normalized payloads, route handlers
-validate and dispatch rather than reimplementing domain logic, and the browser
-does not become the authoritative job or safety state store.
+- feature modules do not import `backend/app.py`; routes authenticate, validate,
+  and dispatch instead of reimplementing domain logic;
+- format-specific parsing and publication stay under `backend/datasets/`, while
+  generic workflows consume normalized views and payloads;
+- browse decisions, QC reports, and semantic labels remain independent stores;
+- the browser is not the authoritative job or safety state store, and the
+  robot–model action loop does not run through FastAPI.
 
 ## Implementation Guidelines
 

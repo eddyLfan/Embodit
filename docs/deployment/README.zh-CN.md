@@ -82,7 +82,7 @@ cp config/deployment/models/python.example.json config/local/my-model.json
 chmod 600 config/local/my-robot.json config/local/my-model.json
 ```
 
-页面使用非递归规则 `config/local/*.json` 发现项目配置。两份文件都必须直接放在 `config/local/` 根目录；子目录中的配置不会出现在页面中。
+页面使用非递归规则 `config/local/*.json` 发现项目配置。两份文件都必须直接放在 `config/local/` 根目录；子目录中的配置不会出现在页面中。通过 Web UI 保存的配置位于 `.embodit_cache/deploy/configs/`，与项目配置使用相同 `config_id` 时保存版本优先；保存的 Recipe 位于 `.embodit_cache/deploy/recipes/`。
 
 不要原样运行仓库模板。编辑两份本地副本后：
 
@@ -450,6 +450,8 @@ class RobotAdapter:
 
 ### 8.2 自定义 Python 模型
 
+可从最小示例 [`my_vla.py`](../../examples/deployment/my_vla.py) 开始，或直接实现相同接口：
+
 ```python
 class MyVLA:
     def load(self, checkpoint, **kwargs):
@@ -597,47 +599,7 @@ bash embodit.sh recipe-validate /tmp/my-deployment.json
 | initial pose | 关节顺序、单位、控制器状态、实测容差 |
 | client safety | action shape、NaN/Inf、绝对限位、max_step、watchdog |
 
-## 13. HTTP API
+## 内部 HTTP 路由
 
-以下端点都需要 Embodit 访问 Token。除非运维侧提供 TLS 反向代理，否则它们通过明文 HTTP 提供；网络和凭据要求见 [SECURITY.md](../../SECURITY.md)。
-
-```text
-POST        /api/deploy/configs/validate
-POST        /api/deploy/compose
-POST        /api/deploy/recipes/validate
-POST        /api/deploy/recipes/split
-GET/POST    /api/deploy/configs/{kind}
-GET/DELETE  /api/deploy/configs/{kind}/{config_id}
-GET/POST    /api/deploy/recipes
-GET/DELETE  /api/deploy/recipes/{recipe_id}
-GET         /api/deploy/capabilities
-GET         /api/deploy/model-catalog
-POST        /api/deploy/doctor
-POST        /api/deploy/robot-connection
-GET         /api/deploy/examples/{name}
-GET/POST    /api/deploy/orchestrations
-POST        /api/deploy/orchestrations/prepare-model
-GET         /api/deploy/orchestrations/{orchestration_id}
-POST        /api/deploy/orchestrations/{orchestration_id}/offline-evaluation
-POST        /api/deploy/orchestrations/{orchestration_id}/start-dry-run
-POST        /api/deploy/orchestrations/{orchestration_id}/start-evaluation
-POST        /api/deploy/orchestrations/{orchestration_id}/prompt
-POST        /api/deploy/orchestrations/{orchestration_id}/scheduler
-POST        /api/deploy/orchestrations/{orchestration_id}/disconnect-robot
-POST        /api/deploy/orchestrations/{orchestration_id}/close-model
-POST        /api/deploy/orchestrations/{orchestration_id}/poses
-POST        /api/deploy/orchestrations/{orchestration_id}/poses/{pose_id}/move
-DELETE      /api/deploy/orchestrations/{orchestration_id}/poses/{pose_id}
-POST        /api/deploy/orchestrations/{orchestration_id}/arm-challenge
-POST        /api/deploy/orchestrations/{orchestration_id}/start-live
-POST        /api/deploy/orchestrations/{orchestration_id}/stop-evaluation
-POST        /api/deploy/orchestrations/{orchestration_id}/stop
-POST        /api/deploy/orchestrations/{orchestration_id}/emergency-stop
-POST        /api/deploy/orchestrations/{orchestration_id}/logs
-POST        /api/deploy/orchestrations/{orchestration_id}/components/{component}/restart
-GET         /api/deploy/orchestrations/{orchestration_id}/manifest
-```
-
-`start-evaluation` 是兼容路由，只会进入或保持 Dry Run，不能把 Orchestration 提升到 Live。Live 必须先调用 `arm-challenge`，再用精确且未过期的短语调用 `start-live`。
-
-Config 用于复用，Recipe 用于执行；不要维护两套运行配置。
+Web UI 与 `embodit.sh` 是受支持的操作入口。`/api/...` 路由属于 pre-1.0
+内部实现，可能不提供兼容保证；请勿基于这些路由构建外部控制客户端。

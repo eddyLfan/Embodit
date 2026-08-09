@@ -6,7 +6,6 @@
   <p>
     <a href="docs/data/README.md">Data guide</a> ·
     <a href="docs/deployment/README.md">Deployment guide</a> ·
-    <a href="docs/architecture.md">Architecture</a> ·
     <a href="CONTRIBUTING.md">Contributing</a> ·
     <a href="SECURITY.md">Security</a>
   </p>
@@ -44,7 +43,7 @@ access-control gateway, or independent hardware safety chain.
 
 ### Supported dataset formats
 
-| Format | Browse/QC | Native subset | Cross-format conversion | Strict merge |
+| Format | Browse / applicable QC | Native subset | Cross-format conversion | Strict merge |
 |---|:---:|:---:|:---:|:---:|
 | LeRobot v2.1 | ✓ | ✓ | ✓ | ✓ |
 | LeRobot v3 | ✓ | ✓ | ✓ | ✓ |
@@ -164,11 +163,11 @@ policy are documented in the [data guide](docs/data/README.md).
 
 ## Model and robot workflow
 
-Initialize only the provider sources you need; skip this for a standalone
-custom Python provider or an existing external model service:
+Initialize the provider source you plan to use; skip this for a standalone
+custom Python provider or an existing external model service. For example:
 
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive third_party/models/lerobot
 git submodule status --recursive
 ```
 
@@ -234,10 +233,7 @@ Read [SECURITY.md](SECURITY.md) before LAN access or robot deployment.
 | Document | Scope |
 |---|---|
 | [Data guide](docs/data/README.md) | Formats, review, labels, QC, conversion, merge, augmentation, jobs, and cleanup |
-| [QC standard](docs/data/QC_STANDARD.zh-CN.md) | Detector semantics, calibration, and acceptance guidance (Chinese) |
 | [Deployment guide](docs/deployment/README.md) | Robot/Model Config fields, Recipe lifecycle, safety, offline evaluation, Dry Run, and Live |
-| [Architecture](docs/architecture.md) | Module boundaries, extension points, and tests |
-| [Configuration guide](config/README.md) | Committed templates versus private local configuration |
 | [Third-party components](third_party/README.md) | Pinned source integrations, model/SAM3 ownership, and license boundaries |
 | [Contributing](CONTRIBUTING.md) | Development setup, checks, and pull-request expectations |
 | [Security policy](SECURITY.md) | Supported versions, reporting, threat model, and robot safety |
@@ -245,25 +241,8 @@ Read [SECURITY.md](SECURITY.md) before LAN access or robot deployment.
 
 ## Development
 
-```bash
-uv sync --frozen --extra dev
-UV_CACHE_DIR=/tmp/embodit-uv-cache uv run --no-sync pytest -q
-python3 -m compileall -q backend
-bash -n embodit.sh
-git diff --check
-```
-
-Node.js 20 is used for the dependency-free frontend regression checks. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the complete command set and module
-boundaries.
-
-## Roadmap
-
-Priorities before 1.0 include broader golden-dataset QC calibration, more
-dataset and robot adapters, reproducible provider provisioning, expanded
-cross-platform validation, and stronger release/security automation. Roadmap
-items are not compatibility guarantees; behavior may change while the project
-is pre-1.0.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, module boundaries,
+the complete validation matrix, and pull-request expectations.
 
 ## License and third-party software
 

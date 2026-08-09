@@ -54,6 +54,10 @@ labels.jsonl
 *.ckpt
 *.safetensors
 *.onnx
-SAM_checkpoints/*.bin
+*.bin
 
 checkpoints/*
+
+# Sensitive state migrated from early releases
+/service.url
+/config/token

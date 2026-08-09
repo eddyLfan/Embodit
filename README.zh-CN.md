@@ -6,7 +6,6 @@
   <p>
     <a href="docs/data/README.zh-CN.md">数据指南</a> ·
     <a href="docs/deployment/README.zh-CN.md">部署指南</a> ·
-    <a href="docs/architecture.zh-CN.md">项目架构</a> ·
     <a href="CONTRIBUTING.md">参与贡献</a> ·
     <a href="SECURITY.md">安全策略</a>
   </p>
@@ -35,7 +34,7 @@ Embodit **不替代**数采 SDK、训练框架、机器人驱动、访问控制�
 
 ### 支持的数据格式
 
-| 格式 | 浏览/QC | 原生子集 | 跨格式转换 | 严格合并 |
+| 格式 | 浏览 / 适用项 QC | 原生子集 | 跨格式转换 | 严格合并 |
 |---|:---:|:---:|:---:|:---:|
 | LeRobot v2.1 | ✓ | ✓ | ✓ | ✓ |
 | LeRobot v3 | ✓ | ✓ | ✓ | ✓ |
@@ -134,10 +133,10 @@ QC、转换、合并和增强运行在独立 worker 中，关闭浏览器不会�
 
 ## 模型与机器人工作流
 
-只初始化实际需要的 Provider 源码；独立自定义 Python Provider 或已有外部模型服务可以跳过：
+只初始化实际需要的 Provider 源码；独立自定义 Python Provider 或已有外部模型服务可以跳过。例如使用 LeRobot：
 
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive third_party/models/lerobot
 git submodule status --recursive
 ```
 
@@ -184,10 +183,7 @@ bash embodit.sh recipe-run /tmp/my-deployment.json --mode dry_run
 | 文档 | 内容 |
 |---|---|
 | [数据指南](docs/data/README.zh-CN.md) | 格式、Review、标签、QC、转换、合并、增强、任务与清理 |
-| [QC 标准](docs/data/QC_STANDARD.zh-CN.md) | Detector 语义、标定和准入建议 |
 | [部署指南](docs/deployment/README.zh-CN.md) | 本体/模型配置、Recipe 生命周期、安全、离线评测、Dry Run 与 Live |
-| [项目架构](docs/architecture.zh-CN.md) | 模块边界、扩展点与测试 |
-| [配置指南](config/README.zh-CN.md) | 仓库模板与私有本地配置的边界 |
 | [第三方组件](third_party/README.md) | 固定源码集成、模型/SAM3 归属和许可证边界 |
 | [参与贡献](CONTRIBUTING.md) | 开发环境、检查命令与 Pull Request 要求 |
 | [安全策略](SECURITY.md) | 支持版本、漏洞报告、威胁模型与真机安全 |
@@ -195,19 +191,8 @@ bash embodit.sh recipe-run /tmp/my-deployment.json --mode dry_run
 
 ## 开发
 
-```bash
-uv sync --frozen --extra dev
-UV_CACHE_DIR=/tmp/embodit-uv-cache uv run --no-sync pytest -q
-python3 -m compileall -q backend
-bash -n embodit.sh
-git diff --check
-```
-
-前端无依赖回归使用 Node.js 20。完整命令和模块边界见 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-## 路线图
-
-1.0 前的重点包括：扩大 QC 金标集与分设备标定、增加数据格式和机器人 Adapter、完善 Provider 可复现部署、扩展跨平台验证，以及增强发布与安全自动化。pre-1.0 阶段的路线图不构成兼容性承诺。
+开发环境、模块边界、完整验证矩阵和 Pull Request 要求统一见
+[CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证与第三方软件
 

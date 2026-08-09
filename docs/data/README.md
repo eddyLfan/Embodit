@@ -113,8 +113,14 @@ when a human override is required.
 Current detectors primarily cover structural integrity, visual/signal quality,
 and selected motion/cross-modal checks. Full sensor synchronization, device
 physics limits, task success, duplicate detection, drift, and train/eval leakage
-remain profile-specific work or roadmap items. See
-[`QC_STANDARD.zh-CN.md`](QC_STANDARD.zh-CN.md) for calibration guidance.
+remain profile-specific work.
+
+There is no universal quality threshold for robot data. Treat the bundled
+defaults as conservative evidence-generation starting points, not certification.
+Maintain a labeled calibration set for each robot, control mode, and camera
+layout; prioritize precision for automatic quarantine and send ambiguous cases
+to review. Detector and configuration versions are stored with each report so
+rule changes do not silently reuse incompatible results.
 
 ## 5. Subset export and fidelity
 
@@ -226,7 +232,7 @@ service is running. Configure it before starting Embodit:
 | `EMBODIT_PREVIEW_TTL_DAYS` | `7` | Preview job records and resources |
 | `EMBODIT_MEDIA_TTL_DAYS` | `7` | Reproducible playback-media cache files |
 | `EMBODIT_SAM_CACHE_TTL_DAYS` | `30` | SAM3 segmentation cache files |
-| `EMBODIT_JOB_TTL_DAYS` | `30` | Terminal QC, conversion, and augmentation job records/logs |
+| `EMBODIT_JOB_TTL_DAYS` | `30` | Terminal export, conversion, merge, QC, and augmentation job records/logs |
 | `EMBODIT_TEMP_TTL_DAYS` | `1` | Orphaned previews and temporary/staging artifacts |
 | `EMBODIT_QC_REPORTS_PER_DATASET` | `5` | Latest reports retained per dataset; older reports remain while referenced by a job |
 | `EMBODIT_MAINTENANCE_INTERVAL_HOURS` | `24` | Periodic cleanup interval; positive values are clamped to at least one hour, and `0` disables only periodic cleanup |
@@ -247,4 +253,5 @@ for cleanup. Startup maintenance still runs when the periodic interval is `0`.
 
 Extension boundaries: dataset adapters live in `backend/datasets/`, QC detectors
 in `backend/qc/detectors/`, conversion in `backend/convert/`, and augmentation
-in `backend/augment/`. See [the architecture guide](../architecture.md).
+in `backend/augment/`. Contribution boundaries are summarized in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).

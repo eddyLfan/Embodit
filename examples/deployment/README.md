@@ -1,28 +1,11 @@
-# Deployment Integration Examples
+# Deployment examples / 部署示例
 
-**English** · [中文](README.zh-CN.md)
+- [`my_vla.py`](my_vla.py): minimal custom Python model contract / 自定义 Python 模型最小接口
+- [`ros2_robot_client.example.json`](ros2_robot_client.example.json): standard ROS2 client / 标准 ROS2 Client
+- [`python_robot_adapter.py`](python_robot_adapter.py) and [`python_robot_client.example.json`](python_robot_client.example.json): vendor-SDK adapter / 厂商 SDK 适配
 
-For OpenPI, LeRobot, and StarVLA, begin with the matching template under
-`config/deployment/models/`. Prepare the pinned provider source and an isolated
-runtime, then replace the checkpoint and host placeholders before composing it
-with a Robot Config.
+These files contain placeholders, not verified device settings. Replace every
+host, path, mapping, unit, and physical limit, then complete preflight and Dry
+Run before Live. 示例仅供复制修改，不能原样用于真机；进入 Live 前必须替换全部占位内容并完成预检与 Dry Run。
 
-For a custom model, copy [`my_vla.py`](my_vla.py), implement
-`load(checkpoint)` and `predict(observations)`, and select `provider: python`
-with its `entrypoint`. Embodit supplies and manages the internal `/health` and
-`/infer` Model Runner; custom providers do not need to recreate that server.
-
-The standard ROS2 client uses the robot-side model tunnel, validates actions,
-and sends `FollowJointTrajectory`; start from
-[`ros2_robot_client.example.json`](ros2_robot_client.example.json). If a vendor
-SDK does not expose a compatible ROS interface, use the generic Python adapter:
-[`python_robot_client.example.json`](python_robot_client.example.json) plus
-[`python_robot_adapter.py`](python_robot_adapter.py).
-
-Examples contain placeholders, not verified device settings. Copy private
-Robot/Model Configs directly to the non-recursive `config/local/` directory,
-keep that directory at mode `0700` and its JSON files at mode `0600`, replace
-units, mappings, interfaces, and limits, and complete controlled preflight/Dry
-Run before Live. See the
-[deployment guide](../../docs/deployment/README.md) and
-[third-party notices](../../third_party/README.md).
+Full guide / 完整指南: [English](../../docs/deployment/README.md) · [中文](../../docs/deployment/README.zh-CN.md) · [Third-party notices](../../third_party/README.md)
