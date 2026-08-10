@@ -563,12 +563,6 @@ class RobotConfig(StrictModel):
     tunnel: RobotTunnelConfig
     runtime: RuntimePolicy = Field(default_factory=RuntimePolicy)
 
-    @model_validator(mode="after")
-    def validate_remote_robot(self) -> "RobotConfig":
-        if self.host.connection != "ssh":
-            raise ValueError("本体主机当前必须使用 SSH 连接")
-        return self
-
 
 class ModelConfig(StrictModel):
     version: Literal[1] = 1
@@ -618,8 +612,14 @@ class DeploymentRecipe(StrictModel):
             raise ValueError("tunnel.destination_host 必须与 model.host 相同")
         if self.robot.client.host not in {None, self.robot.host}:
             raise ValueError("robot.client.host 必须为空或与 robot.host 相同")
-        if self.hosts[self.robot.host].connection != "ssh":
-            raise ValueError("本体主机当前必须使用 SSH 连接")
+        if (
+            self.hosts[self.robot.host].connection == "local"
+            and self.hosts[model_host].connection == "local"
+            and self.tunnel.local_port == self.tunnel.remote_port
+        ):
+            raise ValueError(
+                "本体与模型同机时 tunnel.local_port 必须与模型 endpoint.port 不同"
+            )
         if self.robot.client.builtin == "ros2_standard" and self.robot.ros.version != 2:
             raise ValueError("内置 ros2_standard Client 只能用于 ROS2")
         return self

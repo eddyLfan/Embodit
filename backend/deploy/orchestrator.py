@@ -1,9 +1,9 @@
 """Recipe deployment orchestration.
 
 Long-running model, tunnel, ROS and robot-client processes are supervised by
-systemd on their target hosts. The model target may be the Embodit machine
-itself; the robot client still owns the real-time observation/action loop and
-safety checks.
+systemd on their target hosts. Either target may be the Embodit machine itself;
+the robot client still owns the real-time observation/action loop and safety
+checks.
 """
 
 from __future__ import annotations
@@ -92,7 +92,7 @@ class RemoteServiceManager:
         )
         require_remote_ok(
             self.runner.run(["python3", "-c", writer, path, f"{mode:o}"], input_data=payload),
-            f"写入远端文件 {path}",
+            f"写入目标文件 {path}",
         )
 
     def unit_name(self, component: str) -> str:
@@ -593,7 +593,7 @@ class DeploymentOrchestration:
                 actual_user = pwd.getpwuid(os.geteuid()).pw_name
                 if host.user != actual_user:
                     raise RuntimeError(
-                        f"本地模型主机 user={host.user} 与 Embodit 运行用户 {actual_user} 不一致"
+                        f"本地主机 {name} user={host.user} 与 Embodit 运行用户 {actual_user} 不一致"
                     )
             if name == self.model_host_name:
                 self._model_home = self.model_manager.home()

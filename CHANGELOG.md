@@ -14,8 +14,9 @@ First open-source release candidate.
   native-format subsets, cross-format conversion, strict merge, and visual
   augmentation with optional SAM3-assisted effects.
 - Composable Robot/Model Configs, Recipe v2 validation, SSH/systemd
-  orchestration, ROS readiness, Dry Run, offline single-frame evaluation, Live
-  mode, monitoring, rollback, and software emergency-stop integration.
+  orchestration, direct local Robot Host execution, ROS readiness, Dry Run,
+  offline single-frame evaluation, Live mode, monitoring, rollback, and software
+  emergency-stop integration.
 - Public Python and dependency-free frontend regression suites with GitHub
   Actions checks.
 - English/Chinese data and deployment guides, plus contribution, security, and

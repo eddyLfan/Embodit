@@ -53,7 +53,9 @@ Embodit **不替代**数采 SDK、训练框架、机器人驱动、访问控制�
 - 现代桌面浏览器；
 - Git（用于克隆仓库和可选模型子模块）。
 
-机器人部署还要求受管主机可通过 OpenSSH 访问，并具备可用的 systemd manager。ROS、CUDA、SAM3、模型专用 Python 环境、Checkpoint 和厂商 SDK 都是按工作流单独准备的可选组件。
+机器人部署还要求目标主机具备可用的 systemd manager；远端目标必须能通过
+OpenSSH 访问，本体与 Embodit 同机时也可以直接本地执行。ROS、CUDA、SAM3、
+模型专用 Python 环境、Checkpoint 和厂商 SDK 都是按工作流单独准备的可选组件。
 
 Embodit 是应用仓库（`tool.uv.package = false`），不是常规 PyPI 库；`embodit.sh` 是受支持的服务与部署入口。
 

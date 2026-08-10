@@ -33,7 +33,7 @@ class CommandRunner(Protocol):
 
 
 class LocalCommandRunner:
-    """Run model-host commands directly on the Embodit machine."""
+    """Run target-host commands directly on the Embodit machine."""
 
     def run(
         self,
@@ -66,7 +66,7 @@ class RecipeSshRunner:
 
     def __init__(self, host: RecipeHost, known_hosts: Path, askpass_root: Path):
         if host.connection != "ssh":
-            raise ValueError("本地模型主机应使用 LocalCommandRunner")
+            raise ValueError("本地主机应使用 LocalCommandRunner")
         self.host = host
         self.known_hosts = known_hosts.expanduser().resolve()
         self.known_hosts.parent.mkdir(parents=True, exist_ok=True)

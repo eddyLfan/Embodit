@@ -4,75 +4,176 @@
 
 本指南说明如何接入模型、本体和安全配置。Embodit 提供软件接入路径和自动回归测试，但这不代表某个本体、模型或 Checkpoint 已经完成安全验证。每种设备都必须在受控环境中重新确认 SDK/ROS 接口、单位、关节顺序、限位、生命周期操作和故障行为。
 
-## 1. 运行架构
+## 1. 先确认三个逻辑角色
 
-Embodit 是控制面，不进入实时观测/动作链路：
+部署前先确定 Embodit、本体和模型分别运行在哪台机器上：
 
 ```text
-Workstation [Embodit]
-  ├─ local/SSH → Model Host [Model Runner :8000]
-  └─ SSH → Robot Host
-             ├─ SSH local-forward: localhost:8000 → Model Host:8000
-             ├─ ROS Bringup
-             └─ Robot Client: observation → model → validation → controller
+Embodit Host [Web UI / 配置 / 预检 / 编排 / 日志]
+  ├─ local 或 SSH → Model Host [Model Runner / Checkpoint / GPU]
+  └─ local 或 SSH → Robot Host
+                        ├─ ROS Bringup 或厂商 SDK
+                        ├─ Robot Client：采集 observation、校验 action、控制本体
+                        └─ SSH local-forward → Model Host
 ```
 
-模型可以运行在 Embodit 工作电脑或独立 GPU 主机。本体当前必须能够被 Embodit 通过 SSH 管理，并能访问模型端 SSH 地址以建立受限隧道。
+- `local` 永远表示“与 Embodit 进程在同一台机器”，不是“在同一局域网”。
+- `ssh` 表示 Embodit 通过 SSH 管理另一台机器。
+- Robot Host 是运行 ROS/SDK 和 Robot Client 的计算节点；如果厂商控制器不能运行这些程序，应增加 Jetson/IPC 作为 Robot Host。
+- Embodit 只做控制面，不进入实时控制闭环；Robot Client 和本体独立安全链路负责动作执行与安全。
+- 当前推理链路统一由 Robot Host 主动建立到 Model Host 的 SSH 隧道。因此除了 Embodit 能管理目标主机，还必须满足 Robot Host → Model Host 的 SSH 网络可达性。
 
-配置分为：
+配置仍然分为两份可复用组件和一份运行配置：Robot Config、Model Config，以及组合生成的 Recipe v2。
 
-- 本体 Config：主机、ROS、Bringup、readiness、生命周期、初始位姿、Robot Client、限位；
-- 模型 Config：主机、Provider、Checkpoint、Python 环境和服务端口；
-- Recipe v2：组合两份 Config 后生成的唯一运行配置。
+## 2. 按设备情况选择部署模式
 
-模板：
+先按物理设备选择模式，再复制配置文件。下表中的 `local/ssh` 都是相对 Embodit Host 而言。
 
-- [`../../config/deployment/robot.example.json`](../../config/deployment/robot.example.json)
-- [`../../config/deployment/models/python.example.json`](../../config/deployment/models/python.example.json)
-- [`../../config/deployment/models/openpi.example.json`](../../config/deployment/models/openpi.example.json)
-- [`../../config/deployment/models/lerobot.example.json`](../../config/deployment/models/lerobot.example.json)
-- [`../../config/deployment/models/starvla.example.json`](../../config/deployment/models/starvla.example.json)
+| 模式 | 物理位置 | `robot.host.connection` | `model.host.connection` | 适用情况 |
+|---|---|---|---|---|
+| A. 本体侧 Embodit + 云模型 | Embodit 与 Robot Host 同机；模型在云 GPU | `local` | `ssh` | 本体旁有 Jetson/IPC，模型使用百度云等云开发机；推荐的云模型部署 |
+| B. 工作站本地模型 + 远端本体 | Embodit 与模型同工作站；Robot Host 是另一台机器 | `ssh` | `local` | 实验室工作站有 GPU，本体通过网线连接 |
+| C. 三端分离 | Embodit、Robot Host、Model Host 各自独立 | `ssh` | `ssh` | 模型在独立 GPU 服务器，控制面保留在操作工作站 |
+| D. 完全同机 | Embodit、Robot Host、Model Host 在同一台机器 | `local` | `local` | 本体计算机同时有足够 GPU/CPU；当前仍通过本机 SSH 隧道连接模型 |
 
-仓库模板使用 RFC 文档专用地址和 `/path/to/...` 占位路径，只是安全的字段参考，不是可运行部署。必须先复制到 `config/local/`，替换所有主机、用户、路径、接口和限位，并通过预检后再运行 Recipe。
+### 2.1 模式 A：Embodit 与本体同机，模型在云端
 
-Embodit 原生提供的是明文 HTTP 和 Bearer Token，不内置 TLS。不要将服务直接暴露到公网。超出 localhost 访问时，应使用可信私网或 VPN、防火墙限制和正确配置的 TLS 反向代理。启用局域网访问或真机控制前，请阅读仓库[Security Policy](../../SECURITY.md)。
+这是“本体侧 IPC/Jetson 运行 Embodit，百度云等云开发机运行模型”的配置。
 
-## 2. 接入前准备
+网络要求：本体侧机器能主动访问云模型机 SSH；云端不需要主动 SSH 进入本体。
+如果 Embodit 运行在无显示器的 IPC/Jetson 上，从操作电脑通过 SSH 端口转发
+或受保护的局域网访问 Web；不要把 Embodit Web 端口直接暴露到公网。
 
-### 2.1 工作电脑
+Robot Config 的 `host`：
 
-- Linux、Python 3.10+、uv、OpenSSH client；
-- 能访问本体 SSH；模型在远端时也要能访问模型 SSH；
-- 项目目录可写，用于 `.embodit_cache/deploy/` 状态；
-- 本地模型配置中的 `host.user` 必须等于运行 Embodit 的用户。
+```json
+{
+  "connection": "local",
+  "address": "127.0.0.1",
+  "user": "运行-Embodit-的本机用户",
+  "service_manager": "user"
+}
+```
 
-### 2.2 本体端
+Model Config 的 `host`：
 
-- Python 3、OpenSSH client、`ssh-keygen`、`ssh-keyscan`；
-- systemd 和 `systemd-run`；
-- 配置中的 ROS setup 文件；
-- Robot Bringup、topic/service/action 或厂商 Python SDK；
-- 本体侧必须独立执行硬件限位、命令有效期、错误状态和急停。
+```json
+{
+  "connection": "ssh",
+  "address": "云模型机域名或IP",
+  "port": 22,
+  "user": "model",
+  "auth": {
+    "type": "password_env",
+    "environment_variable": "MODEL_SSH_PASSWORD"
+  },
+  "host_key_policy": "accept-new",
+  "service_manager": "user"
+}
+```
 
-### 2.3 模型端
-
-- 所有受管模型进程都需要 systemd，以及配置所指定的运行时可执行文件或命令；
-- 内置 OpenPI、LeRobot、StarVLA Provider 需要带子模块的固定版本 Embodit checkout、独立 Provider 环境和兼容 Checkpoint；
-- 自定义 Python Provider 需要自己的 `workdir`、可导入模块、Python 运行时和 Checkpoint，不要求 Embodit checkout；
-- `external` Provider 需要兼容的受管命令/服务、健康检查和 `/infer` 契约，不要求 Embodit checkout；
-- 远端模型需要 SSH；本地模型由 Embodit 直接执行；
-- `endpoint.bind` 默认 `127.0.0.1`，不应直接暴露到局域网。
-
-内置 Provider 首次使用前初始化固定源码：
+只需设置模型 SSH 凭据：
 
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
-git submodule status --recursive
+export MODEL_SSH_PASSWORD='<model-password>'
 ```
 
-每个 Provider 使用独立 Python/CUDA 环境。上游版本和安装边界见 [`../../third_party/README.md`](../../third_party/README.md)。
+### 2.2 模式 B：Embodit 与模型在工作站，本体独立
 
-## 3. 最短接入流程
+网络要求：Embodit 工作站能 SSH 到 Robot Host；Robot Host 也能 SSH 回 Embodit 工作站，以建立模型隧道。工作站需要 OpenSSH server。
+
+Robot Config 的 `host`：
+
+```json
+{
+  "connection": "ssh",
+  "address": "本体或本体侧IPC的IP",
+  "port": 22,
+  "user": "robot",
+  "auth": {
+    "type": "password_env",
+    "environment_variable": "ROBOT_SSH_PASSWORD"
+  },
+  "host_key_policy": "accept-new",
+  "service_manager": "user"
+}
+```
+
+Model Config 的 `host`：
+
+```json
+{
+  "connection": "local",
+  "address": "本体可访问的工作站局域网IP",
+  "port": 22,
+  "user": "运行-Embodit-的工作站用户",
+  "service_manager": "user"
+}
+```
+
+不要把这里的 `address` 写成 `127.0.0.1`；Robot Host 会使用这个地址 SSH 到工作站。只需设置本体 SSH 凭据，例如：
+
+```bash
+export ROBOT_SSH_PASSWORD='<robot-password>'
+```
+
+### 2.3 模式 C：Embodit、本体和模型三端分离
+
+Robot Config 和 Model Config 都使用 `connection: ssh`。网络必须同时满足：
+
+- Embodit Host → Robot Host SSH；
+- Embodit Host → Model Host SSH；
+- Robot Host → Model Host SSH。
+
+Robot Config 使用模式 B 的 SSH `host`，Model Config 使用模式 A 的 SSH
+`host`，分别填写两台目标主机的地址、用户和认证，然后设置对应凭据：
+
+```bash
+export ROBOT_SSH_PASSWORD='<robot-password>'
+export MODEL_SSH_PASSWORD='<model-password>'
+```
+
+### 2.4 模式 D：Embodit、本体和模型完全同机
+
+两份 Config 的 `host` 都使用 `connection: local`、`address: 127.0.0.1`、相同的本机用户，并删除 `auth`。
+
+当前版本仍用 SSH local-forward 连接 Model Runner，因此还必须：
+
+1. 在本机启用 OpenSSH server；
+2. 将 Robot Config 的 `tunnel.local_port` 与 Model Config 的 `endpoint.port` 配成不同端口，例如 `8001` 和 `8000`；
+3. 确认 GPU、ROS、Robot Client 和 Embodit 不会争抢关键资源。
+
+模式 D 示例端口：
+
+Robot Config：
+
+```json
+{"tunnel":{"local_bind":"127.0.0.1","local_port":8001}}
+```
+
+Model Config：
+
+```json
+{"endpoint":{"bind":"127.0.0.1","port":8000}}
+```
+
+如果设备资源紧张，优先使用模式 A，将模型移到独立 GPU 主机。
+
+### 2.5 所有模式共同的设备要求
+
+| 设备 | 必需条件 |
+|---|---|
+| Embodit Host | Linux、Python 3.10+、uv、OpenSSH client、可写项目目录 |
+| Robot Host | Python 3、systemd/systemd-run、OpenSSH client、ssh-keygen/ssh-keyscan、ROS 或厂商 SDK、独立硬件限位与急停 |
+| 远端 Robot Host | 在上述条件之外，还需 OpenSSH server，允许 Embodit 登录 |
+| Model Host | systemd、Provider 运行环境、Checkpoint；远端模型还需 OpenSSH server |
+| 本地目标 | Config 中的 `host.user` 必须等于运行 Embodit 的用户；使用 user systemd 时 `systemctl --user` 和 `systemd-run --user` 必须可用 |
+
+模型 `endpoint.bind` 默认保持 `127.0.0.1`，不要为了跨机访问而改成公网监听；跨机访问由受限 SSH 隧道完成。
+
+## 3. 按选定模式准备配置并启动
+
+### 3.1 复制配置模板
 
 ```bash
 mkdir -p config/local
@@ -82,39 +183,60 @@ cp config/deployment/models/python.example.json config/local/my-model.json
 chmod 600 config/local/my-robot.json config/local/my-model.json
 ```
 
-页面只使用非递归规则 `config/local/*.json` 发现并展示用户配置。两份文件都必须直接放在 `config/local/` 根目录；子目录、`config/deployment/` 中的仓库示例以及 `.embodit_cache/deploy/configs/` 中的缓存配置都不会出现在选择列表中。保存的 Recipe 位于 `.embodit_cache/deploy/recipes/`。
+模型模板按 Provider 选择：`python.example.json`、`openpi.example.json`、`lerobot.example.json` 或 `starvla.example.json`。仓库模板使用文档地址和 `/path/to/...` 占位符，不能原样运行。
 
-不要原样运行仓库模板。编辑两份本地副本后：
+页面只发现 `config/local/*.json`，两份文件必须直接放在该目录根部。子目录、仓库示例和 `.embodit_cache/deploy/configs/` 缓存不会出现在选择列表中。
+
+### 3.2 修改 Robot Config
+
+先按第 2 节替换 `host`，再逐项修改：
+
+| 区域 | 必须按真实设备填写 |
+|---|---|
+| `robot.ros` | ROS 版本、distro、setup、Domain ID/Master URI |
+| `robot.bringup` / `readiness` | 启动命令、节点、topic/service/action 类型、频率和新鲜度 |
+| `power_on/power_off/hold/stop` | 厂商命令或 ROS service；没有时明确使用 `none` |
+| `initial_pose` | 真实安全位姿、关节顺序、单位和容差 |
+| `robot.client` | `ros2_standard`、`python_adapter` 或自定义 Client，以及观测映射和控制器 |
+| `action.limits` | 设备真实绝对限位、逐步变化限位和动作维度 |
+| `tunnel.local_port` | Robot Client 访问模型的本地端口；模式 D 必须避开模型端口 |
+
+### 3.3 修改 Model Config
+
+先按第 2 节替换 `host`，再填写 Provider、`workdir`、Checkpoint、Python 环境、加载参数和 `endpoint.port`。内置 OpenPI、LeRobot、StarVLA 首次使用前初始化固定源码：
 
 ```bash
-export ROBOT_SSH_PASSWORD='<robot-password>'
-export MODEL_SSH_PASSWORD='<model-password>'  # 远端模型需要
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
+git submodule status --recursive
+```
 
+每个 Provider 使用独立 Python/CUDA 环境；安装和版本边界见 [`../../third_party/README.md`](../../third_party/README.md)。
+
+### 3.4 组合、校验与运行
+
+只导出所选模式实际需要的 `password_env` 变量，然后组合 Recipe：
+
+```bash
 bash embodit.sh recipe-compose \
   config/local/my-robot.json \
   config/local/my-model.json \
   --output /tmp/my-deployment.json
 
 bash embodit.sh recipe-validate /tmp/my-deployment.json
-```
-
-推荐启动网页：
-
-```bash
 bash embodit.sh start
 ```
 
-进入“真机部署”：
+进入“真机部署”后：
 
 1. 选择本体和模型配置；
-2. 运行“预检”；预检只读连接主机，检查 systemd、模型路径/Python、ROS setup，ROS 已运行时检查 graph/type/rate/freshness；
+2. 运行只读预检；
 3. 启动模型并等待 `/health`；
 4. 填写 Prompt，连接本体并进入 Dry Run；
-5. 观察实际模型输入、计划动作、执行动作、延迟和日志；
-6. 需要 Live 时，在网页点击“进入 Live”；CLI 按第 11 节完成交互式解锁；
-7. 暂停/断开/关闭，或在危险情况下执行急停。
+5. 检查模型输入、计划动作、执行动作、延迟和日志；
+6. 所有检查通过后再进入 Live；
+7. 使用暂停、断开、关闭或急停结束运行。
 
-CLI：
+CLI 等价命令：
 
 ```bash
 bash embodit.sh recipe-run /tmp/my-deployment.json --mode dry_run
@@ -123,21 +245,7 @@ bash embodit.sh recipe-stop /tmp/my-deployment.json
 bash embodit.sh recipe-stop /tmp/my-deployment.json --emergency
 ```
 
-CLI 命令与参数：
-
-| 命令或参数 | 行为 |
-|---|---|
-| `recipe-compose ROBOT MODEL` | 将两份组件 Config 组合为 Recipe v2 |
-| `--deployment-id ID` | 用 `ID` 覆盖自动生成的 Deployment ID |
-| `--name NAME` | 覆盖自动生成的显示名称 |
-| `--output FILE` | 将 JSON 写入 `FILE` 并设为 `0600`；省略时输出到 stdout |
-| `recipe-validate FILE` | 只校验并打印脱敏 Recipe，不启动服务 |
-| `recipe-run FILE --mode dry_run` | 启动并保持 Dry Run |
-| `recipe-run FILE --mode live` | 要求 TTY，先启动 Dry Run，再要求输入 60 秒有效的一次性短语后进入 Live |
-| `recipe-run FILE` | 使用 `runtime.default_mode`；即使为 `live` 也必须经过同一 Dry Run 与 TTY 确认门控 |
-| `--no-follow` | Dry Run 就绪或 Live 确认完成后退出；本地/远端受管 systemd 组件继续运行 |
-| `recipe-stop FILE` | 按依赖关系逆序停止活动组件 |
-| `--emergency` | 优先调用 `robot.stop`，再逆序拆除组件 |
+Embodit 使用明文 HTTP 和 Bearer Token，不内置 TLS。不要把 Web 或模型端口直接暴露到公网；跨网访问使用可信私网/VPN、防火墙和带认证的 TLS 反向代理。启用局域网或真机控制前阅读[安全策略](../../SECURITY.md)。
 
 ## 4. 通用主机字段 `host`
 
@@ -145,8 +253,8 @@ CLI 命令与参数：
 
 | 字段 | 必填 | 写法 |
 |---|---:|---|
-| `connection` | 否 | `ssh`（默认）或 `local`；本体只允许 `ssh` |
-| `address` | 是 | SSH 地址；本地模型时填写本体可访问的工作电脑地址 |
+| `connection` | 否 | `ssh`（默认）或 `local`；本体和模型都支持 `local` |
+| `address` | 是 | SSH 地址；本地本体填写 `127.0.0.1`；本地模型且本体远端时，填写本体可访问的工作电脑地址 |
 | `port` | 否 | SSH 端口，默认 `22` |
 | `user` | 是 | 目标主机用户名；不能含空格或 `@` |
 | `auth` | SSH 是 | 见下表；`local` 禁止填写 |
@@ -154,11 +262,23 @@ CLI 命令与参数：
 | `host_key_policy` | 否 | `accept-new` 或 `strict`；稳定环境建议 `strict` |
 | `service_manager` | 否 | `system` 或 `user`；决定使用 system/user systemd |
 
-SSH 认证：
+SSH 认证三选一。
+
+密钥：
 
 ```json
 {"type": "key", "identity_file": "/home/user/.ssh/id_ed25519"}
+```
+
+环境变量密码：
+
+```json
 {"type": "password_env", "environment_variable": "ROBOT_SSH_PASSWORD"}
+```
+
+配置文件内明文密码：
+
+```json
 {"type": "password", "password": "..."}
 ```
 
@@ -171,6 +291,9 @@ SSH 认证：
 
 推荐 `key` 或 `password_env`。直接密码会保存在本地配置文件中；文件权限必须为 `0600`，且不能提交 Git。
 
+`connection: local` 不配置 `auth`，并且只允许使用运行 Embodit 的当前用户。
+本地模式中的命令、文件访问和 systemd 操作都以该用户身份直接执行。
+
 ## 5. 本体 Config 字段
 
 顶层：
@@ -181,7 +304,7 @@ SSH 认证：
 | `kind` | 固定 `robot` |
 | `config_id` | 唯一 ID，`A-Z/a-z/0-9/_.-`，最长 64 |
 | `name` | 页面显示名 |
-| `host` | 本体 SSH，见第 4 节 |
+| `host` | 本体本地/SSH 执行目标，见第 2、4 节 |
 | `robot` | ROS、生命周期和 Client |
 | `tunnel` | 本体到模型端的本地转发 |
 | `runtime` | 停止、回滚和监控策略 |
@@ -357,10 +480,15 @@ class RobotAdapter:
 | `dry_run_observation_source` | `synthetic` 或 `adapter` |
 | `dry_run_observations` | 合成 Dry Run 输入 |
 
-合成值：
+合成向量：
 
 ```json
 {"$synthetic":"vector","length":6,"value":0}
+```
+
+合成图像：
+
+```json
 {"$synthetic":"image","width":224,"height":224,"channels":3,"value":0}
 ```
 
@@ -573,7 +701,7 @@ Web 只会从已就绪且安全检查通过的 Dry Run 发起 Live 切换。CLI 
 
 ## 12. 日志与故障排查
 
-远端 unit：
+受管 systemd unit（可能位于本机或远端）：
 
 ```text
 embodit-model-<deployment-id>.service
@@ -591,7 +719,7 @@ bash embodit.sh recipe-validate /tmp/my-deployment.json
 
 | 失败位置 | 首要检查 |
 |---|---|
-| host/systemd | SSH 认证、host key、用户、system/user manager 权限 |
+| host/systemd | local/SSH 连接方式、SSH 认证与 host key、用户、system/user manager 权限 |
 | model environment | workdir、Python、Checkpoint、CUDA、Provider 依赖 |
 | model health | 权重加载日志、输入 schema、端口占用 |
 | tunnel | 本体到模型 SSH 地址、端口、authorized key 限制 |

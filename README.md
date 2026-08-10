@@ -65,10 +65,11 @@ Core workspace:
 - a modern desktop browser;
 - Git for cloning and optional model submodules.
 
-Robot deployment additionally requires OpenSSH access and a usable systemd
-manager on the managed hosts. ROS, CUDA, SAM3, provider-specific Python
-environments, checkpoints, and vendor SDKs are optional components that must be
-installed separately for the workflows that use them.
+Robot deployment additionally requires a usable systemd manager on each target.
+Remote targets require OpenSSH access; a robot colocated with Embodit may run
+directly as a local target. ROS, CUDA, SAM3, provider-specific Python environments,
+checkpoints, and vendor SDKs are optional components that must be installed
+separately for the workflows that use them.
 
 Embodit is an application repository (`tool.uv.package = false`), not a PyPI
 library. Use `embodit.sh` as the supported service and deployment entry point.

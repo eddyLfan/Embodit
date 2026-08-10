@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import pwd
 import threading
 import time
 from pathlib import Path
@@ -283,12 +284,44 @@ def test_recipe_rejects_tunnel_that_does_not_start_on_robot() -> None:
         parse_recipe(raw)
 
 
-def test_recipe_rejects_local_robot_host() -> None:
+def test_recipe_accepts_local_robot_host_without_ssh_auth() -> None:
     raw = raw_recipe()
     raw["hosts"]["robot"]["connection"] = "local"
     raw["hosts"]["robot"].pop("auth")
-    with pytest.raises(ValueError, match="本体主机.*SSH"):
+    recipe = parse_recipe(raw)
+    assert recipe.hosts["robot"].connection == "local"
+    assert recipe.hosts["robot"].auth is None
+
+
+def test_robot_component_config_accepts_local_host() -> None:
+    raw = json.loads(ROBOT_CONFIG_PATH.read_text(encoding="utf-8"))
+    raw["host"] = {
+        "connection": "local",
+        "address": "127.0.0.1",
+        "user": "embodit",
+        "service_manager": "user",
+    }
+    robot = parse_robot_config(raw)
+    assert robot.host.connection == "local"
+    assert robot.host.auth is None
+
+
+def test_all_local_recipe_requires_distinct_tunnel_and_model_ports() -> None:
+    raw = raw_recipe()
+    for name in ("robot", "model"):
+        raw["hosts"][name] = {
+            "connection": "local",
+            "address": "127.0.0.1",
+            "user": "embodit",
+            "service_manager": "user",
+        }
+    with pytest.raises(ValueError, match="tunnel.local_port.*endpoint.port"):
         parse_recipe(raw)
+
+    raw["tunnel"]["local_port"] = raw["tunnel"]["remote_port"] + 1
+    recipe = parse_recipe(raw)
+    assert recipe.hosts["robot"].connection == "local"
+    assert recipe.hosts["model"].connection == "local"
 
 
 def test_local_model_host_rejects_unused_ssh_auth() -> None:
@@ -697,12 +730,25 @@ def test_local_runner_executes_model_commands_without_ssh() -> None:
     assert result.stdout.strip() == "EMBODIT"
 
 
-def test_orchestration_uses_local_runner_only_for_local_model(tmp_path: Path) -> None:
+def test_orchestration_uses_local_runner_for_local_model(tmp_path: Path) -> None:
     robot = parse_robot_config(json.loads(ROBOT_CONFIG_PATH.read_text(encoding="utf-8")))
     model = parse_model_config(json.loads(MODEL_CONFIG_PATH.read_text(encoding="utf-8")))
     orchestration = DeploymentOrchestration(compose_recipe(robot, model), tmp_path)
     assert isinstance(orchestration.model_runner, LocalCommandRunner)
     assert isinstance(orchestration.robot_runner, RecipeSshRunner)
+
+
+def test_orchestration_uses_local_runner_for_local_robot(tmp_path: Path) -> None:
+    raw = raw_recipe()
+    raw["hosts"]["robot"] = {
+        "connection": "local",
+        "address": "127.0.0.1",
+        "user": "embodit",
+        "service_manager": "user",
+    }
+    orchestration = DeploymentOrchestration(parse_recipe(raw), tmp_path)
+    assert isinstance(orchestration.robot_runner, LocalCommandRunner)
+    assert isinstance(orchestration.model_runner, RecipeSshRunner)
 
 
 def test_remote_wrapper_enables_nounset_after_sourcing_setup() -> None:
@@ -1599,6 +1645,31 @@ def test_api_project_config_source_excludes_saved_configs(tmp_path: Path, monkey
     assert get_config("robot", "robot-a", "project")["config"]["name"] == robot.name
 
 
+def test_api_checks_local_robot_on_embodit_host(tmp_path: Path, monkeypatch) -> None:
+    import settings
+
+    monkeypatch.setattr(settings, "CACHE_DIR", tmp_path / "cache")
+    app = build_app("token", tmp_path, tmp_path)
+    check_connection = _endpoint(app, "/api/deploy/robot-connection")
+    robot, _model = split_recipe(
+        raw_recipe(), robot_config_id="local-robot", model_config_id="vla-a"
+    )
+    raw = robot.model_dump(mode="json")
+    raw["host"] = {
+        "connection": "local",
+        "address": "127.0.0.1",
+        "user": pwd.getpwuid(os.geteuid()).pw_name,
+        "service_manager": "user",
+    }
+
+    result = check_connection(DeploymentConfigRequest(config=raw))
+
+    assert result["connected"] is True
+    assert result["configId"] == "local-robot"
+    assert result["connection"] == "local"
+    assert result["hostname"]
+
+
 def test_api_exposes_orchestration_control_routes(tmp_path: Path) -> None:
     app = build_app("token", tmp_path, tmp_path)
     paths = {getattr(route, "path", "") for route in app.routes}
@@ -1625,6 +1696,7 @@ def test_api_exposes_orchestration_control_routes(tmp_path: Path) -> None:
     capabilities = _endpoint(app, "/api/deploy/capabilities", method="GET")()
     catalog = _endpoint(app, "/api/deploy/model-catalog", method="GET")()
     assert capabilities["features"]["localModelHost"] is True
+    assert capabilities["features"]["localRobotHost"] is True
     assert capabilities["features"]["offlineSingleFrameEvaluation"] is True
     assert capabilities["checkpointModelProviders"] == ["openpi", "lerobot", "starvla"]
     assert capabilities["robotClients"] == ["ros2_standard", "python_adapter", "custom"]

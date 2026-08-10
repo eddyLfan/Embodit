@@ -118,7 +118,11 @@ from deploy.recipe import (  # noqa: E402
     split_recipe as split_deployment_recipe,
 )
 from deploy.store import DeploymentConfigStore, RecipeStore  # noqa: E402
-from deploy.transport import RecipeSshRunner, require_remote_ok  # noqa: E402
+from deploy.transport import (  # noqa: E402
+    LocalCommandRunner,
+    RecipeSshRunner,
+    require_remote_ok,
+)
 from merge.pipeline import preflight_merge  # noqa: E402
 from labels.store import (  # noqa: E402
     default_labels_path,
@@ -1392,6 +1396,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
                 "managedSshTunnel": True,
                 "remoteSystemd": True,
                 "localModelHost": True,
+                "localRobotHost": True,
                 "rosReadiness": True,
                 "continuousLoop": True,
                 "recording": True,
@@ -1422,19 +1427,42 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             if config.kind != "robot":
                 raise ValueError("连接检测仅接受本体配置")
             check_root = deploy_root / "connection-checks" / config.config_id
-            runner = RecipeSshRunner(config.host, check_root / "known_hosts", check_root / "askpass")
+            runner = (
+                LocalCommandRunner()
+                if config.host.connection == "local"
+                else RecipeSshRunner(
+                    config.host,
+                    check_root / "known_hosts",
+                    check_root / "askpass",
+                )
+            )
             result = require_remote_ok(
                 runner.run(
-                    ["python3", "-c", "import platform; print(platform.node())"],
+                    [
+                        "python3",
+                        "-c",
+                        (
+                            "import json,os,platform,pwd; "
+                            "print(json.dumps({'hostname':platform.node(),"
+                            "'user':pwd.getpwuid(os.geteuid()).pw_name}))"
+                        ),
+                    ],
                     timeout=config.host.connect_timeout_s + 5,
                 ),
                 "连接本体",
             )
+            probe = json.loads(result.stdout)
+            if config.host.connection == "local" and probe["user"] != config.host.user:
+                raise ValueError(
+                    f"本地本体主机 user={config.host.user} "
+                    f"与 Embodit 运行用户 {probe['user']} 不一致"
+                )
             return {
                 "connected": True,
                 "configId": config.config_id,
                 "host": config.host.address,
-                "hostname": result.stdout.strip(),
+                "connection": config.host.connection,
+                "hostname": probe["hostname"],
             }
         except Exception as error:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(error)) from error
