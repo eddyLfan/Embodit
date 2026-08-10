@@ -12,7 +12,7 @@ import tempfile
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
 
 import uvicorn
@@ -1296,11 +1296,14 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
         }
 
     @app.get("/api/deploy/configs/{kind}", dependencies=[Depends(authorize)])
-    def list_deployment_configs(kind: str) -> dict[str, Any]:
+    def list_deployment_configs(
+        kind: str,
+        source: Literal["all", "project"] = "all",
+    ) -> dict[str, Any]:
         store = deployment_configs.get(kind)
         if store is None:
             raise HTTPException(status_code=404, detail="部署配置类型不存在")
-        configs = store.list()
+        configs = store.list_discovered() if source == "project" else store.list()
         return {"kind": kind, "configs": configs, "count": len(configs)}
 
     @app.post("/api/deploy/configs/{kind}", dependencies=[Depends(authorize)])
@@ -1314,12 +1317,21 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/api/deploy/configs/{kind}/{config_id}", dependencies=[Depends(authorize)])
-    def get_deployment_config(kind: str, config_id: str) -> dict[str, Any]:
+    def get_deployment_config(
+        kind: str,
+        config_id: str,
+        source: Literal["all", "project"] = "all",
+    ) -> dict[str, Any]:
         store = deployment_configs.get(kind)
         if store is None:
             raise HTTPException(status_code=404, detail="部署配置类型不存在")
         try:
-            return {"config": store.get(config_id), "kind": kind, "version": 1}
+            config = (
+                store.get_discovered(config_id)
+                if source == "project"
+                else store.get(config_id)
+            )
+            return {"config": config, "kind": kind, "version": 1}
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:

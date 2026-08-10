@@ -80,11 +80,12 @@ cp config/deployment/models/python.example.json config/local/my-model.json
 chmod 600 config/local/my-robot.json config/local/my-model.json
 ```
 
-The Web workspace discovers project configs with the non-recursive pattern
-`config/local/*.json`. Keep both files directly in `config/local/`; nested
-directories are not discovered. Configs saved through the Web UI live under
-`.embodit_cache/deploy/configs/` and take precedence over a project config with
-the same `config_id`; saved Recipes live under `.embodit_cache/deploy/recipes/`.
+The Web workspace only discovers and displays user configs with the
+non-recursive pattern `config/local/*.json`. Keep both files directly in
+`config/local/`; nested directories, committed examples under
+`config/deployment/`, and cached configs under `.embodit_cache/deploy/configs/`
+are not shown in the selectors. Saved Recipes live under
+`.embodit_cache/deploy/recipes/`.
 
 Do not run either committed template unchanged. After editing both local copies:
 
@@ -496,19 +497,21 @@ Offline evaluation is not Dry Run or Live:
 
 Every orchestration starts in Dry Run, including a Recipe whose
 `runtime.default_mode` is `live`. Both the Web UI and CLI may promote it to Live
-only after Dry Run is ready and the operator enters the exact server-issued
+only after Dry Run is ready and the latest action safety check passes. The Web
+UI treats the explicit Enter Live click as the transition request and does not
+ask for a second manual phrase. The CLI still requires the exact server-issued
 one-time phrase within its 60-second validity window:
 
 ```text
 LIVE <deployment_id> <6-character uppercase hexadecimal token>
 ```
 
-The Web flow requests this challenge only from a ready Dry Run. CLI
+The Web flow can request Live only from a ready, safety-passing Dry Run. CLI
 `recipe-run --mode live` (and a Recipe default of `live`) requires an interactive
 TTY before starting any service, waits for Dry Run, prints the challenge, and
 reads one exact line. `--no-follow` still requires confirmation before it exits.
 An expired or mismatched phrase leaves the orchestration in Dry Run. There is no
-direct unarmed path to Live.
+path that bypasses Dry Run to reach Live.
 
 ### 11.3 Runtime behavior
 

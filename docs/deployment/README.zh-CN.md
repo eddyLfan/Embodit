@@ -82,7 +82,7 @@ cp config/deployment/models/python.example.json config/local/my-model.json
 chmod 600 config/local/my-robot.json config/local/my-model.json
 ```
 
-页面使用非递归规则 `config/local/*.json` 发现项目配置。两份文件都必须直接放在 `config/local/` 根目录；子目录中的配置不会出现在页面中。通过 Web UI 保存的配置位于 `.embodit_cache/deploy/configs/`，与项目配置使用相同 `config_id` 时保存版本优先；保存的 Recipe 位于 `.embodit_cache/deploy/recipes/`。
+页面只使用非递归规则 `config/local/*.json` 发现并展示用户配置。两份文件都必须直接放在 `config/local/` 根目录；子目录、`config/deployment/` 中的仓库示例以及 `.embodit_cache/deploy/configs/` 中的缓存配置都不会出现在选择列表中。保存的 Recipe 位于 `.embodit_cache/deploy/recipes/`。
 
 不要原样运行仓库模板。编辑两份本地副本后：
 
@@ -111,7 +111,7 @@ bash embodit.sh start
 3. 启动模型并等待 `/health`；
 4. 填写 Prompt，连接本体并进入 Dry Run；
 5. 观察实际模型输入、计划动作、执行动作、延迟和日志；
-6. 需要 Live 时执行第 11 节的一次性短语解锁；
+6. 需要 Live 时，在网页点击“进入 Live”；CLI 按第 11 节完成交互式解锁；
 7. 暂停/断开/关闭，或在危险情况下执行急停。
 
 CLI：
@@ -552,13 +552,13 @@ class MyVLA:
 
 ### 11.2 Dry Run 到 Live 的解锁门控
 
-所有 Orchestration 都从 Dry Run 启动，包括 `runtime.default_mode=live` 的 Recipe。Web 与 CLI 都只能在 Dry Run 就绪后提升到 Live，并要求操作者在 60 秒有效期内原样输入服务端生成的一次性短语：
+所有 Orchestration 都从 Dry Run 启动，包括 `runtime.default_mode=live` 的 Recipe。Web 与 CLI 都只能在 Dry Run 就绪且最近动作安全检查通过后提升到 Live。网页将点击“进入 Live”作为明确的切换请求，不再要求额外手工输入短语；CLI 仍要求操作者在 60 秒有效期内原样输入服务端生成的一次性短语：
 
 ```text
 LIVE <deployment_id> <6 位大写十六进制 token>
 ```
 
-Web 只会从已就绪的 Dry Run 请求该 Challenge。CLI 的 `recipe-run --mode live`（以及默认模式为 `live` 的 Recipe）会在启动任何服务前检查交互式 TTY，随后先等待 Dry Run，再打印 Challenge 并读取一整行精确输入；`--no-follow` 也必须完成确认后才退出。短语过期或不匹配时，Orchestration 保持 Dry Run。系统不存在未解锁直达 Live 的路径。
+Web 只会从已就绪且安全检查通过的 Dry Run 发起 Live 切换。CLI 的 `recipe-run --mode live`（以及默认模式为 `live` 的 Recipe）会在启动任何服务前检查交互式 TTY，随后先等待 Dry Run，再打印 Challenge 并读取一整行精确输入；`--no-follow` 也必须完成确认后才退出。短语过期或不匹配时，Orchestration 保持 Dry Run。系统不存在绕过 Dry Run 直达 Live 的路径。
 
 ### 11.3 运行与停止行为
 

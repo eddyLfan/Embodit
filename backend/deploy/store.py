@@ -144,6 +144,12 @@ class DeploymentConfigStore:
         if path.is_file():
             raw = json.loads(path.read_text(encoding="utf-8"))
             return self._parse(raw).model_dump(mode="json")
+        return self.get_discovered(config_id)
+
+    def get_discovered(self, config_id: str) -> dict[str, Any]:
+        """Return a config discovered from an explicit project config root."""
+        if not SAFE_DEPLOYMENT_ID.fullmatch(config_id):
+            raise ValueError("config_id 非法")
         discovered = self._discover().get(config_id)
         if discovered is None:
             raise KeyError(f"{self.kind} 配置不存在：{config_id}")
@@ -187,6 +193,15 @@ class DeploymentConfigStore:
         for config_id, (payload, _path) in self._discover().items():
             if config_id in saved_ids:
                 continue
+            described = self.describe(payload)
+            described["source"] = "project"
+            values.append(described)
+        return values
+
+    def list_discovered(self) -> list[dict[str, Any]]:
+        """List only configs found in explicit project config roots."""
+        values: list[dict[str, Any]] = []
+        for payload, _path in self._discover().values():
             described = self.describe(payload)
             described["source"] = "project"
             values.append(described)

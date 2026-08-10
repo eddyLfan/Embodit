@@ -642,6 +642,8 @@ def test_component_config_store_discovers_project_configs_and_saved_override(tmp
     )
     assert store.get("robot-a")["config_id"] == "robot-a"
     assert store.list()[0]["source"] == "project"
+    assert store.get_discovered("robot-a")["name"] == robot.name
+    assert store.list_discovered()[0]["source"] == "project"
 
     saved = robot.model_copy(update={"name": "Saved robot"})
     store.save(saved.model_dump(mode="json"))
@@ -649,6 +651,8 @@ def test_component_config_store_discovers_project_configs_and_saved_override(tmp
     assert len([item for item in listed if item["configId"] == "robot-a"]) == 1
     assert listed[0]["source"] == "saved"
     assert store.get("robot-a")["name"] == "Saved robot"
+    assert store.get_discovered("robot-a")["name"] == robot.name
+    assert store.list_discovered()[0]["name"] == robot.name
 
 
 def test_password_ssh_transport_keeps_password_out_of_argv(tmp_path: Path) -> None:
@@ -1565,6 +1569,36 @@ def test_api_saves_components_and_composes_a_recipe(tmp_path: Path, monkeypatch)
     assert result["recipe"]["hosts"]["robot"]["auth"]["password"] == "CHANGE_ME_ROBOT_PASSWORD"
 
 
+def test_api_project_config_source_excludes_saved_configs(tmp_path: Path, monkeypatch) -> None:
+    import settings
+
+    local = tmp_path / "config" / "local"
+    local.mkdir(parents=True)
+    robot, model = split_recipe(raw_recipe(), robot_config_id="robot-a", model_config_id="vla-a")
+    (local / "robot.json").write_text(
+        json.dumps(robot.model_dump(mode="json")), encoding="utf-8"
+    )
+    (local / "model.json").write_text(
+        json.dumps(model.model_dump(mode="json")), encoding="utf-8"
+    )
+    monkeypatch.setattr(settings, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(settings, "CACHE_DIR", tmp_path / "cache")
+    app = build_app("token", tmp_path, tmp_path)
+    save_config = _endpoint(app, "/api/deploy/configs/{kind}")
+    list_configs = _endpoint(app, "/api/deploy/configs/{kind}", method="GET")
+    get_config = _endpoint(app, "/api/deploy/configs/{kind}/{config_id}", method="GET")
+
+    saved = robot.model_copy(update={"name": "Cached robot"})
+    save_config("robot", DeploymentConfigRequest(config=saved.model_dump(mode="json")))
+
+    assert list_configs("robot")["configs"][0]["name"] == "Cached robot"
+    project_configs = list_configs("robot", "project")["configs"]
+    assert [item["configId"] for item in project_configs] == ["robot-a"]
+    assert project_configs[0]["name"] == robot.name
+    assert project_configs[0]["source"] == "project"
+    assert get_config("robot", "robot-a", "project")["config"]["name"] == robot.name
+
+
 def test_api_exposes_orchestration_control_routes(tmp_path: Path) -> None:
     app = build_app("token", tmp_path, tmp_path)
     paths = {getattr(route, "path", "") for route in app.routes}
@@ -1655,6 +1689,8 @@ def test_web_workspace_keeps_deployment_config_read_only() -> None:
     assert "/prompt" in javascript
     assert "/poses" in javascript
     assert "/arm-challenge" in javascript
+    assert "window.prompt" not in javascript
+    assert "confirmation: challenge.phrase" in javascript
     assert "/start-live" in javascript
     assert "给当前模型关节位姿命名" not in javascript
     assert "/stop-evaluation" in javascript
@@ -1662,6 +1698,10 @@ def test_web_workspace_keeps_deployment_config_read_only() -> None:
     assert "/api/deploy/compose" in javascript
     assert "/api/deploy/configs/robot" in javascript
     assert "/api/deploy/configs/model" in javascript
+    assert "/api/deploy/configs/robot?source=project" in javascript
+    assert "/api/deploy/configs/model?source=project" in javascript
+    assert "item.valid && item.source === 'project'" in javascript
+    assert "/api/deploy/examples/component-configs" not in javascript
     assert "/api/deploy/orchestrations" in javascript
     assert "renderDeploymentModelIo(snapshot.modelIo, snapshot.dryRunSafety, snapshot.trajectoryHistory, snapshot.runtimeTiming)" in javascript
     assert 'id="deploymentInferenceMode"' in html

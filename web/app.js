@@ -356,31 +356,41 @@
   }
 
   async function refreshDeploymentOptions() {
+    state.deploymentConfigCache.robot.clear();
+    state.deploymentConfigCache.model.clear();
     const [robotResult, modelResult] = await Promise.all([
-      api('/api/deploy/configs/robot'),
-      api('/api/deploy/configs/model'),
+      api('/api/deploy/configs/robot?source=project'),
+      api('/api/deploy/configs/model?source=project'),
     ]);
     const metadata = {
-      robot: (robotResult.configs || []).filter((item) => item.valid),
-      model: (modelResult.configs || []).filter((item) => item.valid),
+      robot: (robotResult.configs || []).filter((item) => item.valid && item.source === 'project'),
+      model: (modelResult.configs || []).filter((item) => item.valid && item.source === 'project'),
     };
-    if (!metadata.robot.length || !metadata.model.length) {
-      const examples = await api('/api/deploy/examples/component-configs');
-      for (const kind of ['robot', 'model']) {
-        if (metadata[kind].length) continue;
-        const config = examples[kind];
-        const id = `__example_${kind}__`;
-        state.deploymentConfigCache[kind].set(id, config);
-        metadata[kind] = [{ configId: id, name: `${config.name} (${t('deployExample')})`, valid: true }];
-      }
-    }
     for (const kind of ['robot', 'model']) {
       const select = $(kind === 'robot' ? '#deploymentRobotSelect' : '#deploymentModelSelect');
       const previous = select.value;
-      select.innerHTML = metadata[kind].map((item) =>
-        `<option value="${escapeAttr(item.configId)}">${escapeHtml(item.name)} · ${escapeHtml(item.configId.replace(/^__example_|__$/g, ''))}${item.source === 'project' ? ` · ${escapeHtml(t('deployProjectConfig'))}` : ''}</option>`
-      ).join('');
-      select.value = metadata[kind].some((item) => item.configId === previous) ? previous : metadata[kind][0].configId;
+      select.innerHTML = metadata[kind].length
+        ? metadata[kind].map((item) =>
+          `<option value="${escapeAttr(item.configId)}">${escapeHtml(item.name)} · ${escapeHtml(item.configId)}</option>`
+        ).join('')
+        : `<option value="">${escapeHtml(t('deployNoLocalConfig', { kind: t(kind === 'robot' ? 'deployKindRobot' : 'deployKindModel') }))}</option>`;
+      select.value = metadata[kind].some((item) => item.configId === previous)
+        ? previous
+        : (metadata[kind][0]?.configId || '');
+    }
+    if (!metadata.robot.length || !metadata.model.length) {
+      $('#deploymentRobotConfig').value = '';
+      $('#deploymentModelConfig').value = '';
+      $('#deploymentRecipe').value = '';
+      $('#deploymentId').value = '';
+      $('#deploymentName').value = '';
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', metadata.robot.length ? t('deployConnectionUnchecked') : t('deployNotConfigured'));
+      setDeploymentComponentStatus('#deploymentModelStatus', 'idle', metadata.model.length ? t('deployNotStarted') : t('deployNotConfigured'));
+      const hint = t('deployLocalConfigHint');
+      $('#deploymentRobotDetail').textContent = hint;
+      $('#deploymentModelDetail').textContent = hint;
+      syncDeploymentButtons(false);
+      return;
     }
     await loadSelectedDeploymentConfigs();
   }
@@ -390,13 +400,14 @@
     const id = select?.value;
     if (!id) throw new Error(t('deployNoConfig', { kind: t(kind === 'robot' ? 'deployKindRobot' : 'deployKindModel') }));
     if (state.deploymentConfigCache[kind].has(id)) return state.deploymentConfigCache[kind].get(id);
-    const result = await api(`/api/deploy/configs/${kind}/${encodeURIComponent(id)}`);
+    const result = await api(`/api/deploy/configs/${kind}/${encodeURIComponent(id)}?source=project`);
     state.deploymentConfigCache[kind].set(id, result.config);
     return result.config;
   }
 
   async function loadSelectedDeploymentConfigs() {
     if (state.deploymentSessionId) return;
+    if (!$('#deploymentRobotSelect')?.value || !$('#deploymentModelSelect')?.value) return;
     if (state.deploymentOfflineResult) closeDeploymentOfflineResult();
     const [robot, model] = await Promise.all([
       selectedDeploymentConfig('robot'),
@@ -744,14 +755,16 @@
   }
 
   function syncDeploymentButtons(active, snapshot = null) {
+    const hasRobotConfig = Boolean($('#deploymentRobotSelect')?.value);
+    const hasModelConfig = Boolean($('#deploymentModelSelect')?.value);
     const modelReady = snapshot?.state === 'model_ready' && snapshot?.components?.model?.active;
     const paused = snapshot?.state === 'dry_run' && snapshot?.components?.model?.active;
     const running = snapshot?.state === 'running';
     const changing = snapshot?.state === 'starting';
     const robotLinked = Boolean(snapshot?.components?.tunnel?.active || snapshot?.components?.ros?.active || snapshot?.components?.client?.active);
     const modelActive = Boolean(snapshot?.components?.model?.active);
-    $('#prepareDeploymentModel').disabled = active;
-    $('#checkDeploymentRobot').disabled = changing || robotLinked || Boolean(state.deploymentSessionId && !modelReady);
+    $('#prepareDeploymentModel').disabled = active || !hasRobotConfig || !hasModelConfig;
+    $('#checkDeploymentRobot').disabled = !hasRobotConfig || changing || robotLinked || Boolean(state.deploymentSessionId && !modelReady);
     $('#disconnectDeploymentRobot').disabled = changing || !robotLinked;
     $('#closeDeploymentModel').disabled = changing || !modelActive;
     $('#stopDeployment').disabled = !active;
@@ -759,8 +772,8 @@
     $('#startLiveDeployment').disabled = !active || (!modelReady && !paused) || changing;
     $('#startLiveDeployment').textContent = t(paused ? 'deployArmLive' : 'deployStartDryRun');
     $('#stopLiveDeployment').disabled = !active || !running;
-    $('#deploymentRobotSelect').disabled = active;
-    $('#deploymentModelSelect').disabled = active;
+    $('#deploymentRobotSelect').disabled = active || !hasRobotConfig;
+    $('#deploymentModelSelect').disabled = active || !hasModelConfig;
     $('#deploymentTaskPrompt').disabled = changing;
     $('#applyDeploymentPrompt').disabled = !active || changing || !$('#deploymentTaskPrompt')?.value.trim();
     const scheduler = deploymentSchedulerForm();
@@ -1002,16 +1015,8 @@
         renderDeploymentSnapshot(prepared);
       }
       const challenge = await api(`${base}/arm-challenge`, { method: 'POST' });
-      const confirmation = window.prompt(t('deployLiveConfirmPrompt', {
-        phrase: challenge.phrase,
-        seconds: challenge.expiresInSeconds,
-      }));
-      if (confirmation === null) {
-        setDeploymentResult(prepared, t('deployLiveConfirmationCancelled'));
-        return;
-      }
       const snapshot = await api(`${base}/start-live`, {
-        method: 'POST', body: JSON.stringify({ confirmation })
+        method: 'POST', body: JSON.stringify({ confirmation: challenge.phrase })
       });
       renderDeploymentSnapshot(snapshot);
       startDeploymentPolling();
