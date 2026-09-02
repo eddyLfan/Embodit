@@ -1,4 +1,4 @@
-"""Shared persistent job store for detached workers (convert / augment).
+"""Shared persistent job store for detached workers (convert / QC).
 
 Both job families keep one JSON file per job under a jobs dir and run the
 actual work in a detached worker process. This module holds all common

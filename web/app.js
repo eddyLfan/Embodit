@@ -36,11 +36,6 @@
     convertContext: null, // { path, format } for standalone convert
     convertJobs: [],
     mergeContext: null, // { sources, preflight, browserPath, outputTouched }
-    augmentContext: null,
-    augmentJobs: [],
-    augmentOptions: null,
-    augmentPreviewOk: false,
-    lastAugmentPreviewJobId: null,
     breakpoints: [], // sorted seconds; consecutive pairs form draft intervals
     draftIntervalMeta: {}, // `${start}_${end}` -> { tags, note }
     trajVisible: null, // boolean[] aligned to action dims
@@ -51,12 +46,18 @@
     deploymentSessionId: null,
     deploymentRuntimeKind: null,
     deploymentTimer: null,
+    deploymentPreviewTimer: null,
     deploymentPollGeneration: 0,
     deploymentSnapshot: null,
     deploymentRobotConnected: false,
+    deploymentConfigsReady: false,
     deploymentConfigCache: { robot: new Map(), model: new Map() },
     deploymentTrajectoryGroup: 'left',
-    deploymentTrajectorySource: 'state',
+    deploymentLiveStateHistory: [],
+    deploymentLiveStateNames: [],
+    deploymentLiveStateUnits: [],
+    deploymentLiveStateCapturedNs: null,
+    deploymentLiveStateSessionId: null,
     deploymentLogRefreshTick: 0,
     deploymentLogLoading: false,
     deploymentLogRows: [],
@@ -69,9 +70,17 @@
     deploymentOfflineRunGeneration: 0,
     deploymentOfflineRunning: false,
     deploymentOfflineDrawFrame: null,
+    deploymentOfflineReplay: null,
+    deploymentOfflineReplayLoading: false,
+    deploymentOfflineReplayPlaying: false,
+    deploymentOfflineReplayAnimation: null,
+    deploymentOfflineReplayResumeAfterSeek: false,
+    deploymentOfflineReplayGroup: 'left',
+    deploymentOfflineReplaySource: 'action',
     deploymentResizeFrame: null,
     deploymentOfflineResult: null,
     deploymentModelIoRenderKey: null,
+    deploymentPreviewRenderKey: null,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -91,7 +100,9 @@
     if (!response.ok) {
       let message = `${response.status} ${response.statusText}`;
       try { message = (await response.json()).detail || message; } catch {}
-      throw new Error(message);
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
     }
     return response.json();
   }
@@ -161,9 +172,6 @@
     try {
       await refreshConvertJobs();
     } catch {}
-    try {
-      await refreshAugmentJobs();
-    } catch {}
     const preferredLayer = location.hash === '#deploy'
       ? 'deploy'
       : (localStorage.getItem('embodit-primary-layer') || 'data');
@@ -189,12 +197,17 @@
     $('#stopDeployment')?.addEventListener('click', stopDeploymentSession);
     $('#startLiveDeployment')?.addEventListener('click', startLiveDeployment);
     $('#stopLiveDeployment')?.addEventListener('click', stopLiveDeployment);
+    $('#deploymentRecordLive')?.addEventListener('change', () => {
+      setDeploymentRecordingStatus(t($('#deploymentRecordLive').checked ? 'deployRecordingEnabled' : 'deployRecordingIdle'));
+    });
     $('#recordDeploymentPose')?.addEventListener('click', recordDeploymentPose);
     $('#moveDeploymentPose')?.addEventListener('click', moveDeploymentPose);
     $('#deleteDeploymentPose')?.addEventListener('click', deleteDeploymentPose);
     $('#deploymentPoseSelect')?.addEventListener('change', syncDeploymentPoseButtons);
-    $('#deploymentLogSource')?.addEventListener('change', () => refreshDeploymentExecutionLog(true));
-    $('#refreshDeploymentLog')?.addEventListener('click', () => refreshDeploymentExecutionLog(true));
+    $('#deploymentLogSource')?.addEventListener('change', () => {
+      state.deploymentLogRows = [];
+      refreshDeploymentExecutionLog(true);
+    });
     $('#deploymentLogFilter')?.addEventListener('input', () => renderDeploymentLogRows(state.deploymentLogRows));
     $('#clearDeploymentLogView')?.addEventListener('click', () => {
       const source = $('#deploymentLogSource')?.value || 'orchestration';
@@ -209,27 +222,45 @@
       if (output) output.innerHTML = `<div class="deployment-log-empty">${escapeHtml(t('deployLogsCleared'))}</div>`;
     });
     $('#deploymentTrajectoryGroups')?.addEventListener('click', onDeploymentTrajectoryGroup);
-    $('#deploymentTrajectorySource')?.addEventListener('change', renderCurrentDeploymentTrajectory);
-    $('#deploymentTrajectoryWindow')?.addEventListener('change', renderCurrentDeploymentTrajectory);
     $('#deploymentTrajectoryScale')?.addEventListener('change', renderCurrentDeploymentTrajectory);
     $('#useCurrentOfflineDataset')?.addEventListener('click', useCurrentDeploymentOfflineDataset);
     $('#loadDeploymentOfflineDataset')?.addEventListener('click', () => loadDeploymentOfflineDataset());
     $('#deploymentOfflineDataset')?.addEventListener('input', () => {
+      closeDeploymentOfflineReplay();
+      if (state.deploymentOfflineResult) closeDeploymentOfflineResult();
       state.deploymentOfflineLoadGeneration += 1;
       state.deploymentOfflineLoading = false;
       state.deploymentOfflineDatasetMeta = null;
       syncDeploymentOfflineControls();
     });
-    $('#deploymentOfflineEpisode')?.addEventListener('change', syncDeploymentOfflineFrame);
+    $('#deploymentOfflineEpisode')?.addEventListener('change', () => {
+      closeDeploymentOfflineReplay();
+      if (state.deploymentOfflineResult) closeDeploymentOfflineResult();
+      syncDeploymentOfflineFrame();
+    });
     $('#deploymentOfflineFrame')?.addEventListener('input', syncDeploymentOfflineControls);
     $('#runDeploymentOfflineEvaluation')?.addEventListener('click', runDeploymentOfflineEvaluation);
+    $('#replayDeploymentOffline')?.addEventListener('click', startDeploymentOfflineReplay);
     $('#closeDeploymentOfflineResult')?.addEventListener('click', closeDeploymentOfflineResult);
+    $('#closeDeploymentOfflineReplay')?.addEventListener('click', closeDeploymentOfflineReplay);
+    $('#deploymentOfflineReplayPlay')?.addEventListener('click', toggleDeploymentOfflineReplay);
+    $('#deploymentOfflineReplayRobot')?.addEventListener('click', startDeploymentHardwareReplay);
+    $('#deploymentOfflineReplayRobotStop')?.addEventListener('click', stopDeploymentHardwareReplay);
+    $('#deploymentOfflineReplayTimeline')?.addEventListener('pointerdown', beginDeploymentOfflineReplaySeek);
+    $('#deploymentOfflineReplayTimeline')?.addEventListener('input', onDeploymentOfflineReplaySeek);
+    $('#deploymentOfflineReplayTimeline')?.addEventListener('change', endDeploymentOfflineReplaySeek);
+    $('#deploymentOfflineReplaySpeed')?.addEventListener('change', applyDeploymentOfflineReplaySpeed);
+    $('#deploymentOfflineReplaySource')?.addEventListener('change', () => {
+      state.deploymentOfflineReplaySource = $('#deploymentOfflineReplaySource')?.value || 'action';
+      renderDeploymentOfflineReplayTrajectory();
+    });
+    $('#deploymentOfflineReplayGroups')?.addEventListener('click', onDeploymentOfflineReplayGroup);
     window.addEventListener('resize', scheduleDeploymentResize);
   }
 
   function scheduleDeploymentResize() {
     if (state.primaryLayer !== 'deploy') return;
-    if (state.deploymentOfflineResult) cancelDeploymentOfflineChartDraw();
+    if (state.deploymentOfflineResult || state.deploymentOfflineReplay) cancelDeploymentOfflineChartDraw();
     if (state.deploymentResizeFrame !== null) return;
     state.deploymentResizeFrame = window.requestAnimationFrame(() => {
       state.deploymentResizeFrame = null;
@@ -238,14 +269,24 @@
         drawDeploymentOfflineCharts(state.deploymentOfflineResult);
         return;
       }
+      if (state.deploymentOfflineReplay) {
+        drawDeploymentOfflineReplayTrajectory();
+        return;
+      }
       const action = state.deploymentSnapshot?.modelIo?.output?.action || {};
       const chunk = Array.isArray(action.chunk) ? action.chunk.filter(Array.isArray) : [];
-      renderDeploymentActionTrajectory(action, chunk, state.deploymentSnapshot?.trajectoryHistory);
+      renderDeploymentActionTrajectory(
+        action,
+        chunk,
+        state.deploymentSnapshot?.trajectoryHistory,
+        state.deploymentSnapshot?.runtimeTiming,
+      );
     });
   }
 
   function activatePrimaryLayer(layer) {
     const next = layer === 'deploy' ? 'deploy' : 'data';
+    if (next !== 'deploy' && state.deploymentOfflineReplayPlaying) pauseDeploymentOfflineReplay();
     state.primaryLayer = next;
     $('#dataWorkspace')?.classList.toggle('hidden', next !== 'data');
     $('#deploymentWorkspace')?.classList.toggle('hidden', next !== 'deploy');
@@ -289,7 +330,9 @@
         startDeploymentPolling();
         return;
       }
-    } catch {}
+    } catch (error) {
+      console.error('Failed to restore active deployment session', error);
+    }
   }
 
   function deploymentConfig(kind) {
@@ -356,6 +399,8 @@
   }
 
   async function refreshDeploymentOptions() {
+    state.deploymentConfigsReady = false;
+    syncDeploymentButtons(Boolean(state.deploymentSessionId), state.deploymentSnapshot);
     state.deploymentConfigCache.robot.clear();
     state.deploymentConfigCache.model.clear();
     const [robotResult, modelResult] = await Promise.all([
@@ -407,7 +452,10 @@
 
   async function loadSelectedDeploymentConfigs() {
     if (state.deploymentSessionId) return;
+    state.deploymentConfigsReady = false;
+    syncDeploymentButtons(false);
     if (!$('#deploymentRobotSelect')?.value || !$('#deploymentModelSelect')?.value) return;
+    if (state.deploymentOfflineReplay) closeDeploymentOfflineReplay();
     if (state.deploymentOfflineResult) closeDeploymentOfflineResult();
     const [robot, model] = await Promise.all([
       selectedDeploymentConfig('robot'),
@@ -419,6 +467,15 @@
     configureDeploymentScheduler(robot, model);
     syncDeploymentCompositionIdentity();
     await refreshDeploymentComposition(false);
+    state.deploymentConfigsReady = true;
+    // A concurrent workspace/session refresh may have attached a live
+    // orchestration while config I/O was in flight. Never overwrite that
+    // authoritative runtime state with the idle config defaults below.
+    if (state.deploymentSessionId) {
+      if (state.deploymentSnapshot) renderDeploymentSnapshot(state.deploymentSnapshot);
+      else syncDeploymentButtons(true);
+      return;
+    }
     setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployConnectionUnchecked'));
     setDeploymentComponentStatus('#deploymentModelStatus', 'idle', t('deployNotStarted'));
     state.deploymentRobotConnected = false;
@@ -503,19 +560,25 @@
     const episode = deploymentOfflineEpisode(metadata);
     const frame = Number($('#deploymentOfflineFrame')?.value);
     const modelReady = Boolean(state.deploymentSessionId && state.deploymentSnapshot?.components?.model?.active
-      && state.deploymentSnapshot?.state === 'model_ready');
+      && ['model_ready', 'robot_ready'].includes(state.deploymentSnapshot?.state));
     if ($('#loadDeploymentOfflineDataset')) {
-      $('#loadDeploymentOfflineDataset').disabled = state.deploymentOfflineLoading || state.deploymentOfflineRunning;
+      $('#loadDeploymentOfflineDataset').disabled = state.deploymentOfflineLoading || state.deploymentOfflineRunning
+        || state.deploymentOfflineReplayLoading;
     }
     if ($('#useCurrentOfflineDataset')) {
-      $('#useCurrentOfflineDataset').disabled = state.deploymentOfflineLoading || state.deploymentOfflineRunning;
+      $('#useCurrentOfflineDataset').disabled = state.deploymentOfflineLoading || state.deploymentOfflineRunning
+        || state.deploymentOfflineReplayLoading;
     }
     if ($('#deploymentOfflineEpisode')) $('#deploymentOfflineEpisode').disabled = !metadata;
     if ($('#deploymentOfflineFrame')) $('#deploymentOfflineFrame').disabled = !episode;
     const validFrame = Number.isInteger(frame) && frame >= 0 && (!episode?.length || frame < Number(episode.length));
     if ($('#runDeploymentOfflineEvaluation')) {
       $('#runDeploymentOfflineEvaluation').disabled = state.deploymentOfflineLoading || state.deploymentOfflineRunning
-        || !metadata || !episode || !validFrame || !modelReady;
+        || state.deploymentOfflineReplayLoading || !metadata || !episode || !validFrame || !modelReady;
+    }
+    if ($('#replayDeploymentOffline')) {
+      $('#replayDeploymentOffline').disabled = state.deploymentOfflineLoading || state.deploymentOfflineRunning
+        || state.deploymentOfflineReplayLoading || !metadata || !episode || !validFrame;
     }
   }
 
@@ -553,6 +616,8 @@
       return null;
     }
     const generation = ++state.deploymentOfflineLoadGeneration;
+    closeDeploymentOfflineReplay();
+    if (state.deploymentOfflineResult) closeDeploymentOfflineResult();
     state.deploymentOfflineLoading = true;
     state.deploymentOfflineDatasetMeta = null;
     syncDeploymentOfflineControls();
@@ -604,8 +669,9 @@
       const validFrame = Number.isInteger(frameIndex) && frameIndex >= 0
         && (!episode?.length || frameIndex < Number(episode.length));
       const modelReady = state.deploymentSnapshot?.components?.model?.active
-        && state.deploymentSnapshot?.state === 'model_ready';
+        && ['model_ready', 'robot_ready'].includes(state.deploymentSnapshot?.state);
       if (!episode || !validFrame || !modelReady) return;
+      closeDeploymentOfflineReplay();
       busyShown = true;
       setBusy(true, t('deployOfflineBusyTitle'), t('deployOfflineBusyText'));
       const result = await api(`/api/deploy/orchestrations/${encodeURIComponent(sessionId)}/offline-evaluation`, {
@@ -660,6 +726,618 @@
       state.deploymentSnapshot?.trajectoryHistory,
       state.deploymentSnapshot?.runtimeTiming,
     );
+  }
+
+
+  function deploymentControlledDimensionNames(kind) {
+    try {
+      const config = deploymentConfig('robot')?.robot?.client?.config || {};
+      const names = config.telemetry?.[kind]?.names;
+      if (!Array.isArray(names) || !names.length) return [];
+      const normalized = names.map((name) => String(name).trim());
+      return normalized.every(Boolean) && new Set(normalized).size === normalized.length
+        ? normalized
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function deploymentDimensionNameIsSynthetic(name) {
+    return /^(action|actions|state|states|joint|command|merge_pose|dimension)[._-]?\d+$/i
+      .test(String(name || '').trim());
+  }
+
+  function projectDeploymentReplaySeries(matrix, targetNames) {
+    if (!matrix || !targetNames.length) return matrix;
+    const width = matrix.rows[0]?.length || 0;
+    const sourceNames = Array.isArray(matrix.names) ? matrix.names.map(String) : [];
+    const lookup = new Map(sourceNames.map((name, index) => [name, index]));
+    let indices;
+    if (targetNames.every((name) => lookup.has(name))) {
+      indices = targetNames.map((name) => lookup.get(name));
+    } else if (
+      width === targetNames.length
+      && (sourceNames.length !== width || sourceNames.every(deploymentDimensionNameIsSynthetic))
+    ) {
+      indices = Array.from({ length: width }, (_, index) => index);
+    } else {
+      return null;
+    }
+    return {
+      ...matrix,
+      names: targetNames,
+      rows: matrix.rows.map((row) => indices.map((index) => row[index])),
+      sourceNames,
+      sourceIndices: indices,
+      sourceWidth: width,
+      droppedDimensions: width - indices.length,
+    };
+  }
+  function deploymentOfflineReplayMatrices(metadata, timeseries) {
+    const series = timeseries?.series && typeof timeseries.series === 'object' ? timeseries.series : {};
+    const keys = Object.keys(series);
+    const collect = (preferred, token) => {
+      const selected = keys.includes(preferred)
+        ? [preferred]
+        : keys.filter((key) => key.toLowerCase().includes(token));
+      const parts = selected.map((key) => {
+        const raw = Array.isArray(series[key]) ? series[key] : [];
+        const rows = raw.map((row) => (Array.isArray(row) ? row.map(Number) : [Number(row)]));
+        const width = rows[0]?.length || 0;
+        if (!rows.length || !width) return null;
+        const feature = metadata?.features?.[key] || {};
+        const declared = flattenFeatureNames(feature.names);
+        const shortKey = key.replace(/^observation\./, '').replace(/^actions?\.?/, '') || token;
+        const names = Array.from({ length: width }, (_, index) => (
+          declared[index] || (selected.length > 1 ? `${shortKey}.${index + 1}` : `${token}_${index + 1}`)
+        ));
+        return { key, rows, names };
+      }).filter(Boolean);
+      if (!parts.length) return null;
+      const length = Math.min(...parts.map((part) => part.rows.length));
+      return {
+        key: parts.map((part) => part.key).join('+'),
+        rows: Array.from({ length }, (_, index) => parts.flatMap((part) => part.rows[index])),
+        names: parts.flatMap((part) => part.names),
+      };
+    };
+    const action = collect('action', 'action');
+    const robotState = collect('observation.state', 'state');
+    return {
+      action: projectDeploymentReplaySeries(action, deploymentControlledDimensionNames('action')),
+      state: projectDeploymentReplaySeries(robotState, deploymentControlledDimensionNames('state')),
+    };
+  }
+
+  function deploymentOfflineReplayVideoSource(path, episodeIndex, cameraKey, video) {
+    if (video?.kind === 'topic' && video.topic) {
+      return authedAssetUrl(`/api/mcap/video?dataset=${encodeURIComponent(path)}&episode=${episodeIndex}&topic=${encodeURIComponent(video.topic)}`);
+    }
+    if (video?.kind === 'frames') {
+      return authedAssetUrl(`/api/hdf5/video?dataset=${encodeURIComponent(path)}&episode=${episodeIndex}&camera=${encodeURIComponent(cameraKey)}`);
+    }
+    return authedAssetUrl(`/api/video?dataset=${encodeURIComponent(path)}&relative=${encodeURIComponent(video?.path || '')}`);
+  }
+
+  async function startDeploymentOfflineReplay() {
+    if (state.deploymentOfflineReplayLoading) return;
+    const path = deploymentOfflineDatasetPath();
+    let metadata = deploymentOfflineMetadata();
+    if (!metadata) metadata = await loadDeploymentOfflineDataset(path);
+    const episode = deploymentOfflineEpisode(metadata);
+    if (!metadata || !episode) return;
+    const loadGeneration = state.deploymentOfflineLoadGeneration;
+    const episodeIndex = Number(episode.episodeIndex);
+    state.deploymentOfflineReplayLoading = true;
+    syncDeploymentOfflineControls();
+    $('#deploymentOfflineHint').textContent = t('deployOfflineReplayLoading');
+    try {
+      const timeseries = await api(`/api/timeseries?dataset=${encodeURIComponent(path)}&episode=${episodeIndex}&maxPoints=3000`);
+      if (loadGeneration !== state.deploymentOfflineLoadGeneration
+        || path !== deploymentOfflineDatasetPath()
+        || episodeIndex !== Number(deploymentOfflineEpisode()?.episodeIndex)) return;
+      if (state.deploymentOfflineResult) closeDeploymentOfflineResult();
+      closeDeploymentOfflineReplay();
+      const fps = Math.max(0.001, Number(metadata.fps) || 30);
+      const series = deploymentOfflineReplayMatrices(metadata, timeseries);
+      const seriesLength = Math.max(series.action?.rows?.length || 0, series.state?.rows?.length || 0);
+      const totalFrames = Math.max(1, Number(episode.length) || seriesLength || 1);
+      state.deploymentOfflineReplay = {
+        path,
+        metadata,
+        episode,
+        fps,
+        totalFrames,
+        duration: Number(episode.duration) > 0 ? Number(episode.duration) : totalFrames / fps,
+        frame: Math.min(totalFrames - 1, Math.max(0, Number($('#deploymentOfflineFrame')?.value) || 0)),
+        series,
+        chartLayer: null,
+        clockFrame: 0,
+        clockStartedAt: 0,
+      };
+      state.deploymentOfflineReplaySource = series.action ? 'action' : 'state';
+      renderDeploymentOfflineReplay();
+      seekDeploymentOfflineReplay(state.deploymentOfflineReplay.frame);
+      $('#deploymentOfflineHint').textContent = t('deployOfflineReplayReady', {
+        episode: episodeIndex,
+        frames: totalFrames,
+        fps: formatModelIoValue(fps),
+      });
+    } catch (error) {
+      $('#deploymentOfflineHint').textContent = t('deployOfflineReplayFailed', { msg: error.message });
+      setDeploymentResult({ error: error.message }, t('deployOfflineReplayFailedTitle'), true);
+    } finally {
+      state.deploymentOfflineReplayLoading = false;
+      syncDeploymentOfflineControls();
+    }
+  }
+
+  function renderDeploymentOfflineReplay() {
+    const replay = state.deploymentOfflineReplay;
+    if (!replay) return;
+    $('#deploymentModelIoPlaceholder')?.classList.add('hidden');
+    $('#deploymentModelIo')?.classList.add('hidden');
+    $('#deploymentOfflineResult')?.classList.add('hidden');
+    $('#deploymentOfflineReplay')?.classList.remove('hidden');
+    $('#deploymentOfflineReplayMeta').textContent = t('deployOfflineReplayMeta', {
+      dataset: replay.metadata.name,
+      episode: replay.episode.episodeIndex,
+      frames: replay.totalFrames,
+      fps: formatModelIoValue(replay.fps),
+    });
+    const organized = organizeCameras(replay.episode.videos || {});
+    const organizedKeys = new Set(organized.map((entry) => entry.key));
+    const entries = [
+      ...organized,
+      ...Object.entries(replay.episode.videos || {})
+        .filter(([key]) => !organizedKeys.has(key))
+        .map(([key, video]) => ({ key, video, label: key })),
+    ];
+    const cameraGrid = $('#deploymentOfflineReplayCameraGrid');
+    cameraGrid.innerHTML = entries.length ? entries.map(({ key, video, label }) => {
+      const source = deploymentOfflineReplayVideoSource(replay.path, replay.episode.episodeIndex, key, video);
+      return `<figure class="deployment-camera-card deployment-replay-camera">
+        <video muted playsinline preload="metadata" data-replay-camera="${escapeAttr(key)}" data-start="${Number(video.fromTimestamp) || 0}" data-end="${Number(video.toTimestamp) || ''}" src="${escapeAttr(source)}"></video>
+        <figcaption><strong>${escapeHtml(label || key)}</strong><small>${escapeHtml(key)}</small></figcaption>
+      </figure>`;
+    }).join('') : `<div class="deployment-replay-empty">${escapeHtml(t('deployOfflineReplayNoCamera'))}</div>`;
+    deploymentOfflineReplayVideos().forEach((video) => {
+      video.playbackRate = deploymentOfflineReplaySpeed();
+      video.addEventListener('loadedmetadata', () => seekDeploymentOfflineReplay(replay.frame, true));
+      video.addEventListener('waiting', () => {
+        if (state.deploymentOfflineReplayPlaying) pauseDeploymentOfflineReplay();
+      });
+    });
+    const timeline = $('#deploymentOfflineReplayTimeline');
+    timeline.min = '0';
+    timeline.max = String(Math.max(0, replay.totalFrames - 1));
+    timeline.step = '1';
+    timeline.value = String(replay.frame);
+    const source = $('#deploymentOfflineReplaySource');
+    source.innerHTML = [
+      replay.series.action ? `<option value="action">${escapeHtml(t('deployOfflineReplayAction'))}</option>` : '',
+      replay.series.state ? `<option value="state">${escapeHtml(t('deployOfflineReplayState'))}</option>` : '',
+    ].join('');
+    source.value = state.deploymentOfflineReplaySource;
+    source.disabled = !replay.series.action || !replay.series.state;
+    renderDeploymentOfflineReplayTrajectory();
+    updateDeploymentOfflineReplayReadout();
+    syncDeploymentHardwareReplayControls();
+  }
+
+  function syncDeploymentHardwareReplayControls() {
+    const replay = state.deploymentOfflineReplay;
+    const hardware = state.deploymentSnapshot?.hardwareReplay || {};
+    const running = state.deploymentSnapshot?.mode === 'replay'
+      && ['starting', 'replaying', 'stopping'].includes(state.deploymentSnapshot?.state);
+    const robotReady = ['robot_ready', 'dry_run'].includes(state.deploymentSnapshot?.state)
+      && Boolean(state.deploymentSnapshot?.components?.client?.active);
+    const start = $('#deploymentOfflineReplayRobot');
+    const stop = $('#deploymentOfflineReplayRobotStop');
+    const close = $('#closeDeploymentOfflineReplay');
+    if (start) {
+      start.disabled = !replay?.series?.action || !robotReady || running;
+      start.classList.toggle('hidden', running);
+    }
+    if (stop) {
+      stop.disabled = !running || state.deploymentSnapshot?.state === 'stopping';
+      stop.classList.toggle('hidden', !running);
+    }
+    if (close) close.disabled = running;
+    const status = $('#deploymentOfflineReplayRobotStatus');
+    if (!status) return;
+    if (running) {
+      const commandsSent = Number(hardware.commandsSent || 0);
+      const framesSkipped = Number(hardware.framesSkipped || 0);
+      const delivery = commandsSent
+        ? ` · ${t('deployOfflineReplayDelivery', {
+          sent: commandsSent,
+          skipped: framesSkipped,
+        })}`
+        : '';
+      const applied = Number(hardware.framesApplied || 0);
+      const total = Number(hardware.totalFrames || 0);
+      status.textContent = t('deployOfflineReplayRobotRunning', {
+        applied,
+        total,
+        fps: formatModelIoValue(hardware.fps),
+      }) + delivery;
+    } else if (hardware.status === 'fault') {
+      status.textContent = t('deployOfflineReplayRobotFailed', {
+        msg: hardware.error || t('deployFailed'),
+      });
+    } else if (hardware.status === 'finished' || hardware.status === 'stopped') {
+      status.textContent = t(hardware.status === 'finished'
+        ? 'deployOfflineReplayRobotFinished'
+        : 'deployOfflineReplayRobotStopped');
+      if (Number.isFinite(Number(hardware.effectiveCommandHz))
+        && Number(hardware.effectiveCommandHz) > 0) {
+        status.textContent += ` · ${t('deployOfflineReplayEffectiveRate', {
+          hz: formatModelIoValue(hardware.effectiveCommandHz),
+          skipped: Number(hardware.framesSkipped || 0),
+        })}`;
+      }
+    } else {
+      status.textContent = t(robotReady
+        ? 'deployOfflineReplayRobotReady'
+        : 'deployOfflineReplayRobotIdle');
+    }
+  }
+
+  async function startDeploymentHardwareReplay() {
+    const replay = state.deploymentOfflineReplay;
+    if (!replay || !state.deploymentSessionId || !replay.series.action) return;
+    pauseDeploymentOfflineReplay();
+    try {
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/hardware-replay`, {
+        method: 'POST',
+        body: JSON.stringify({
+          dataset: replay.path,
+          episodeIndex: Number(replay.episode.episodeIndex),
+          startFrame: replay.frame,
+          moveToStartDurationS: 3,
+        }),
+      });
+      renderDeploymentSnapshot(snapshot);
+      startDeploymentPolling();
+      syncDeploymentHardwareReplayControls();
+      setDeploymentResult(snapshot, t('deployOfflineReplayRobotStarting'));
+    } catch (error) {
+      setDeploymentResult({ error: error.message }, t('deployOfflineReplayRobotFailed', { msg: error.message }), true);
+    }
+  }
+
+  async function stopDeploymentHardwareReplay() {
+    if (!state.deploymentSessionId || state.deploymentSnapshot?.mode !== 'replay') return;
+    try {
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/hardware-replay/stop`, {
+        method: 'POST',
+      });
+      renderDeploymentSnapshot(snapshot);
+      startDeploymentPolling();
+      syncDeploymentHardwareReplayControls();
+    } catch (error) {
+      setDeploymentResult({ error: error.message }, t('deployOfflineReplayRobotFailed', { msg: error.message }), true);
+    }
+  }
+
+
+  function deploymentOfflineReplayVideos() {
+    return $$('#deploymentOfflineReplayCameraGrid video[data-replay-camera]');
+  }
+
+  function deploymentOfflineReplaySpeed() {
+    const value = Number($('#deploymentOfflineReplaySpeed')?.value);
+    return [0.25, 0.5, 1, 1.5, 2].includes(value) ? value : 1;
+  }
+
+  function applyDeploymentOfflineReplaySpeed() {
+    const speed = deploymentOfflineReplaySpeed();
+    deploymentOfflineReplayVideos().forEach((video) => { video.playbackRate = speed; });
+    if (state.deploymentOfflineReplayPlaying && state.deploymentOfflineReplay) {
+      state.deploymentOfflineReplay.clockFrame = state.deploymentOfflineReplay.frame;
+      state.deploymentOfflineReplay.clockStartedAt = performance.now();
+    }
+  }
+
+  function deploymentOfflineReplayTarget(video, frame) {
+    const replay = state.deploymentOfflineReplay;
+    const start = Number(video.dataset.start) || 0;
+    const end = Number(video.dataset.end);
+    const mediaEnd = Number.isFinite(video.duration) ? video.duration : Infinity;
+    const declaredEnd = Number.isFinite(end) && end > start ? end : Infinity;
+    return Math.max(start, Math.min(start + frame / replay.fps, declaredEnd, mediaEnd));
+  }
+
+  function seekDeploymentOfflineReplay(frame, fast = false) {
+    const replay = state.deploymentOfflineReplay;
+    if (!replay) return;
+    replay.frame = Math.max(0, Math.min(replay.totalFrames - 1, Math.round(Number(frame) || 0)));
+    deploymentOfflineReplayVideos().forEach((video) => {
+      const apply = () => {
+        const target = deploymentOfflineReplayTarget(video, replay.frame);
+        if (Math.abs(video.currentTime - target) <= 0.002) return;
+        if (fast && typeof video.fastSeek === 'function') video.fastSeek(target);
+        else video.currentTime = target;
+      };
+      if (video.readyState === 0) video.addEventListener('loadedmetadata', apply, { once: true });
+      else apply();
+    });
+    replay.clockFrame = replay.frame;
+    replay.clockStartedAt = performance.now();
+    updateDeploymentOfflineReplayReadout();
+    drawDeploymentOfflineReplayChart();
+  }
+
+  function beginDeploymentOfflineReplaySeek() {
+    state.deploymentOfflineReplayResumeAfterSeek = state.deploymentOfflineReplayPlaying;
+    if (state.deploymentOfflineReplayPlaying) pauseDeploymentOfflineReplay();
+  }
+
+  function onDeploymentOfflineReplaySeek(event) {
+    seekDeploymentOfflineReplay(Number(event.target.value), true);
+  }
+
+  function endDeploymentOfflineReplaySeek() {
+    if (!state.deploymentOfflineReplayResumeAfterSeek) return;
+    state.deploymentOfflineReplayResumeAfterSeek = false;
+    playDeploymentOfflineReplay();
+  }
+
+  async function playDeploymentOfflineReplay() {
+    const replay = state.deploymentOfflineReplay;
+    if (!replay || state.deploymentOfflineReplayPlaying) return;
+    if (replay.frame >= replay.totalFrames - 1) seekDeploymentOfflineReplay(0);
+    state.deploymentOfflineReplayPlaying = true;
+    replay.clockFrame = replay.frame;
+    $('#deploymentOfflineReplayPlay').textContent = t('deployOfflineReplayPause');
+    const speed = deploymentOfflineReplaySpeed();
+    const results = await Promise.allSettled(deploymentOfflineReplayVideos().map((video) => {
+      video.playbackRate = speed;
+      return video.play();
+    }));
+    if (!state.deploymentOfflineReplayPlaying) return;
+    if (results.length && results.every((result) => result.status === 'rejected')) {
+      pauseDeploymentOfflineReplay();
+      $('#deploymentOfflineHint').textContent = t('deployOfflineReplayPlayFailed');
+      return;
+    }
+    // Do not count browser/media startup latency as replay time.
+    replay.clockStartedAt = performance.now();
+    syncDeploymentOfflineReplay();
+  }
+
+  function pauseDeploymentOfflineReplay() {
+    state.deploymentOfflineReplayPlaying = false;
+    if (state.deploymentOfflineReplayAnimation !== null) {
+      window.cancelAnimationFrame(state.deploymentOfflineReplayAnimation);
+      state.deploymentOfflineReplayAnimation = null;
+    }
+    deploymentOfflineReplayVideos().forEach((video) => video.pause());
+    const button = $('#deploymentOfflineReplayPlay');
+    if (button) button.textContent = t('deployOfflineReplayPlay');
+  }
+
+  function toggleDeploymentOfflineReplay() {
+    if (state.deploymentOfflineReplayPlaying) pauseDeploymentOfflineReplay();
+    else playDeploymentOfflineReplay();
+  }
+
+  function syncDeploymentOfflineReplay() {
+    if (!state.deploymentOfflineReplayPlaying || !state.deploymentOfflineReplay) return;
+    const replay = state.deploymentOfflineReplay;
+    const videos = deploymentOfflineReplayVideos();
+    // The episode clock is authoritative. A camera may still be completing a
+    // seek when playback resumes; using that camera as the clock would make
+    // the whole replay jump to its stale media timestamp.
+    const frame = Math.round(replay.clockFrame + (performance.now() - replay.clockStartedAt) / 1000
+      * replay.fps * deploymentOfflineReplaySpeed());
+    const nextFrame = Math.max(0, Math.min(replay.totalFrames - 1, frame));
+    const frameChanged = nextFrame !== replay.frame;
+    const speed = deploymentOfflineReplaySpeed();
+    videos.forEach((video) => {
+      if (video.readyState < 2 || video.seeking) return;
+      const target = deploymentOfflineReplayTarget(video, nextFrame);
+      if (Math.abs(target - video.currentTime) > 0.12) video.currentTime = target;
+      video.playbackRate = speed;
+    });
+    if (frameChanged) {
+      replay.frame = nextFrame;
+      updateDeploymentOfflineReplayReadout();
+      drawDeploymentOfflineReplayChart();
+    }
+    if (replay.frame >= replay.totalFrames - 1) {
+      pauseDeploymentOfflineReplay();
+      seekDeploymentOfflineReplay(replay.totalFrames - 1);
+      return;
+    }
+    state.deploymentOfflineReplayAnimation = window.requestAnimationFrame(syncDeploymentOfflineReplay);
+  }
+
+  function closeDeploymentOfflineReplay() {
+    if (state.deploymentSnapshot?.mode === 'replay') return;
+    pauseDeploymentOfflineReplay();
+    deploymentOfflineReplayVideos().forEach((video) => {
+      video.removeAttribute('src');
+      video.load();
+    });
+    state.deploymentOfflineReplay = null;
+    state.deploymentOfflineReplayResumeAfterSeek = false;
+    $('#deploymentOfflineReplay')?.classList.add('hidden');
+    ['#deploymentOfflineReplayCameraGrid', '#deploymentOfflineReplayGroups', '#deploymentOfflineReplayLegend'].forEach((selector) => {
+      $(selector)?.replaceChildren();
+    });
+    renderDeploymentModelIo(
+      state.deploymentSnapshot?.modelIo,
+      state.deploymentSnapshot?.dryRunSafety,
+      state.deploymentSnapshot?.trajectoryHistory,
+      state.deploymentSnapshot?.runtimeTiming,
+    );
+  }
+
+  function updateDeploymentOfflineReplayReadout() {
+    const replay = state.deploymentOfflineReplay;
+    if (!replay) return;
+    const frame = replay.frame;
+    const seconds = frame / replay.fps;
+    const timeline = $('#deploymentOfflineReplayTimeline');
+    if (timeline) timeline.value = String(frame);
+    const label = $('#deploymentOfflineReplayTime');
+    if (label) label.textContent = t('deployOfflineReplayTime', {
+      frame,
+      total: Math.max(0, replay.totalFrames - 1),
+      time: seconds.toFixed(2),
+      duration: replay.duration.toFixed(2),
+    });
+  }
+
+  function renderDeploymentOfflineReplayTrajectory() {
+    const replay = state.deploymentOfflineReplay;
+    if (!replay) return;
+    const source = replay.series[state.deploymentOfflineReplaySource]
+      || replay.series.action || replay.series.state;
+    if (!source?.rows?.length) {
+      $('#deploymentOfflineReplayGroups').innerHTML = '';
+      $('#deploymentOfflineReplayLegend').innerHTML = `<span>${escapeHtml(t('deployOfflineReplayNoTrajectory'))}</span>`;
+      drawDeploymentOfflineReplayChart();
+      return;
+    }
+    const width = source.rows[0]?.length || 0;
+    const { names, groups } = deploymentOfflineReplayGroups(source, width);
+    if (!groups.some((group) => group.id === state.deploymentOfflineReplayGroup)) {
+      state.deploymentOfflineReplayGroup = groups[0]?.id || 'all';
+    }
+    const selected = groups.find((group) => group.id === state.deploymentOfflineReplayGroup) || groups[0];
+    $('#deploymentOfflineReplayGroups').innerHTML = groups.map((group) =>
+      `<button type="button" data-offline-replay-group="${escapeAttr(group.id)}" class="${group.id === selected?.id ? 'active' : ''}">${escapeHtml(group.label)}</button>`
+    ).join('');
+    $('#deploymentOfflineReplayLegend').innerHTML = (selected?.indexes || []).map((index, colorIndex) =>
+      `<span><i style="background:${deploymentTrajectoryColors[colorIndex % deploymentTrajectoryColors.length]}"></i>${escapeHtml(names[index])}</span>`
+    ).join('');
+    replay.chartLayer = null;
+    drawDeploymentOfflineReplayChart();
+  }
+
+  function onDeploymentOfflineReplayGroup(event) {
+    const button = event.target.closest('[data-offline-replay-group]');
+    if (!button || !state.deploymentOfflineReplay) return;
+    state.deploymentOfflineReplayGroup = button.dataset.offlineReplayGroup;
+    renderDeploymentOfflineReplayTrajectory();
+  }
+
+  function deploymentOfflineReplayGroups(source, width) {
+    const base = deploymentTrajectoryGroups({ names: source?.names || [] }, width);
+    const semantic = base.groups.filter((group) => group.id !== 'all');
+    if (width <= 8 || semantic.length) return base;
+    const groups = [];
+    for (let start = 0; start < width; start += 8) {
+      const end = Math.min(width, start + 8);
+      groups.push({
+        id: `dims-${start}-${end}`,
+        label: t('deployOfflineReplayDims', { start: start + 1, end }),
+        indexes: Array.from({ length: end - start }, (_, index) => start + index),
+      });
+    }
+    groups.push({ id: 'all', label: t('deployOfflineReplayAllDims'), indexes: Array.from({ length: width }, (_, index) => index) });
+    return { names: base.names, groups };
+  }
+
+  function drawDeploymentOfflineReplayChart() {
+    const replay = state.deploymentOfflineReplay;
+    const canvas = $('#deploymentOfflineReplayChart');
+    if (!replay || !canvas) return;
+    const source = replay.series[state.deploymentOfflineReplaySource]
+      || replay.series.action || replay.series.state;
+    const rows = source?.rows || [];
+    const width = rows[0]?.length || 0;
+    const { names, groups } = deploymentOfflineReplayGroups(source, width);
+    const selected = groups.find((group) => group.id === state.deploymentOfflineReplayGroup) || groups[0];
+    const indexes = selected?.indexes || [];
+    const rect = canvas.getBoundingClientRect();
+    const cssWidth = Math.max(320, Math.floor(rect.width || 800));
+    const cssHeight = Math.max(190, Math.floor(rect.height || 230));
+    const ratio = Math.min(2, window.devicePixelRatio || 1);
+    if (canvas.width !== Math.floor(cssWidth * ratio) || canvas.height !== Math.floor(cssHeight * ratio)) {
+      canvas.width = Math.floor(cssWidth * ratio);
+      canvas.height = Math.floor(cssHeight * ratio);
+    }
+    const context = canvas.getContext('2d');
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, cssWidth, cssHeight);
+    if (!rows.length || !indexes.length) {
+      context.fillStyle = '#f8fafc'; context.fillRect(0, 0, cssWidth, cssHeight);
+      context.fillStyle = '#94a3b8'; context.font = '12px sans-serif';
+      context.fillText(t('deployOfflineReplayNoTrajectory'), 14, cssHeight / 2);
+      return;
+    }
+    const sampled = downsampleSeries(rows, 700);
+    const cacheKey = [state.deploymentOfflineReplaySource, state.deploymentOfflineReplayGroup,
+      cssWidth, cssHeight, sampled.length, indexes.join(',')].join('|');
+    if (replay.chartLayer?.key !== cacheKey) {
+      const layer = document.createElement('canvas');
+      layer.width = cssWidth;
+      layer.height = cssHeight;
+      const ctx = layer.getContext('2d');
+      ctx.fillStyle = '#f8fafc'; ctx.fillRect(0, 0, cssWidth, cssHeight);
+      const margin = { left: 48, right: 16, top: 14, bottom: 28 };
+      const plotWidth = cssWidth - margin.left - margin.right;
+      const plotHeight = cssHeight - margin.top - margin.bottom;
+      const values = indexes.flatMap((index) => sampled.map((row) => Number(row[index])).filter(Number.isFinite));
+      let minimum = Math.min(...values);
+      let maximum = Math.max(...values);
+      if (minimum === maximum) {
+        const delta = Math.max(0.01, Math.abs(minimum) * 0.1);
+        minimum -= delta; maximum += delta;
+      } else {
+        const padding = (maximum - minimum) * 0.1;
+        minimum -= padding; maximum += padding;
+      }
+      const x = (index) => margin.left + (sampled.length <= 1 ? 0 : index / (sampled.length - 1)) * plotWidth;
+      const y = (value) => margin.top + (maximum - value) / (maximum - minimum) * plotHeight;
+      ctx.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+      for (let tick = 0; tick <= 4; tick += 1) {
+        const yy = margin.top + tick / 4 * plotHeight;
+        ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(margin.left, yy); ctx.lineTo(cssWidth - margin.right, yy); ctx.stroke();
+        ctx.fillStyle = '#64748b'; ctx.textAlign = 'right';
+        ctx.fillText(formatModelIoValue(maximum - tick / 4 * (maximum - minimum)), margin.left - 6, yy + 3);
+      }
+      indexes.forEach((dimension, colorIndex) => {
+        ctx.strokeStyle = deploymentTrajectoryColors[colorIndex % deploymentTrajectoryColors.length];
+        ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.beginPath();
+        const points = sampled
+          .map((row, index) => ({
+            x: x(index),
+            y: y(Number(row[dimension])),
+          }))
+          .filter((point) => Number.isFinite(point.y));
+        traceSmoothDeploymentPath(ctx, points);
+        ctx.stroke();
+      });
+      ctx.fillStyle = '#64748b'; ctx.textAlign = 'left'; ctx.fillText('0.0s', margin.left, cssHeight - 8);
+      ctx.textAlign = 'right'; ctx.fillText(`${replay.duration.toFixed(1)}s`, cssWidth - margin.right, cssHeight - 8);
+      replay.chartLayer = { key: cacheKey, canvas: layer, margin, plotWidth, plotHeight, minimum, maximum, indexes, names };
+    }
+    const layer = replay.chartLayer;
+    context.drawImage(layer.canvas, 0, 0);
+    const fraction = replay.totalFrames <= 1 ? 0 : replay.frame / (replay.totalFrames - 1);
+    const playX = layer.margin.left + fraction * layer.plotWidth;
+    context.strokeStyle = '#0f172a'; context.lineWidth = 1; context.setLineDash([4, 3]);
+    context.beginPath(); context.moveTo(playX, layer.margin.top); context.lineTo(playX, cssHeight - layer.margin.bottom); context.stroke();
+    context.setLineDash([]);
+    const sampleIndex = rows.length <= 1 ? 0 : Math.round(fraction * (rows.length - 1));
+    const readout = [];
+    layer.indexes.forEach((dimension, colorIndex) => {
+      const value = Number(rows[sampleIndex]?.[dimension]);
+      if (!Number.isFinite(value)) return;
+      const y = layer.margin.top + (layer.maximum - value) / (layer.maximum - layer.minimum) * layer.plotHeight;
+      const color = deploymentTrajectoryColors[colorIndex % deploymentTrajectoryColors.length];
+      context.fillStyle = '#fff'; context.strokeStyle = color; context.lineWidth = 2;
+      context.beginPath(); context.arc(playX, y, 3.2, 0, Math.PI * 2); context.fill(); context.stroke();
+      readout.push(`<span style="color:${color}"><b>${escapeHtml(layer.names[dimension])}</b>=${escapeHtml(formatModelIoValue(value))}</span>`);
+    });
+    $('#deploymentOfflineReplayReadout').innerHTML = readout.join(' · ');
   }
 
   function syncDeploymentSchedulerControls() {
@@ -754,26 +1432,53 @@
     element.innerHTML = `<i></i>${escapeHtml(text)}`;
   }
 
+  function resetDeploymentRuntimeViews() {
+    state.deploymentModelIoRenderKey = null;
+    state.deploymentPreviewRenderKey = null;
+    state.deploymentLiveStateHistory = [];
+    state.deploymentLiveStateNames = [];
+    state.deploymentLiveStateUnits = [];
+    state.deploymentLiveStateCapturedNs = null;
+    state.deploymentLiveStateSessionId = null;
+    renderDeploymentLivePreview(null, null);
+    renderDeploymentModelIo(null);
+    if ($('#deploymentRobotDetail')) $('#deploymentRobotDetail').textContent = t('deployObservationLinkMissing');
+    if ($('#deploymentModelDetail')) $('#deploymentModelDetail').textContent = t('deployModelServiceStopped');
+  }
+
   function syncDeploymentButtons(active, snapshot = null) {
     const hasRobotConfig = Boolean($('#deploymentRobotSelect')?.value);
     const hasModelConfig = Boolean($('#deploymentModelSelect')?.value);
-    const modelReady = snapshot?.state === 'model_ready' && snapshot?.components?.model?.active;
+    const configsReady = state.deploymentConfigsReady || Boolean(state.deploymentSessionId);
+    const modelReady = ['model_ready', 'robot_ready'].includes(snapshot?.state) && snapshot?.components?.model?.active;
     const paused = snapshot?.state === 'dry_run' && snapshot?.components?.model?.active;
     const running = snapshot?.state === 'running';
-    const changing = snapshot?.state === 'starting';
+    const changing = ['starting', 'replaying', 'stopping'].includes(snapshot?.state);
     const robotLinked = Boolean(snapshot?.components?.tunnel?.active || snapshot?.components?.ros?.active || snapshot?.components?.client?.active);
     const modelActive = Boolean(snapshot?.components?.model?.active);
-    $('#prepareDeploymentModel').disabled = active || !hasRobotConfig || !hasModelConfig;
-    $('#checkDeploymentRobot').disabled = !hasRobotConfig || changing || robotLinked || Boolean(state.deploymentSessionId && !modelReady);
+    $('#prepareDeploymentModel').disabled = changing || modelActive || !configsReady || !hasRobotConfig || !hasModelConfig;
+    if ($('#prepareDeploymentModel')) {
+      const modelHealthPassed = latestDeploymentStep(snapshot, 'model_health')?.status === 'passed';
+      const progressKey = modelHealthPassed || modelReady || paused || running
+        ? 'deployModelReadyShort'
+        : ({
+        precheck: 'deployCheckingEnvironment',
+        model: 'deployStartingService',
+        model_health: 'deployWaitingModelHealth',
+      }[snapshot?.currentStep] || null);
+      $('#prepareDeploymentModel').textContent = t(progressKey || 'deployStartModel');
+    }
+    $('#checkDeploymentRobot').disabled = !configsReady || !hasRobotConfig || changing || robotLinked
+      || Boolean(state.deploymentSessionId && snapshot?.state !== 'model_ready');
     $('#disconnectDeploymentRobot').disabled = changing || !robotLinked;
     $('#closeDeploymentModel').disabled = changing || !modelActive;
     $('#stopDeployment').disabled = !active;
     $('#stopDeployment').hidden = !active;
-    $('#startLiveDeployment').disabled = !active || (!modelReady && !paused) || changing;
+    $('#startLiveDeployment').disabled = (!modelReady && !paused) || changing;
     $('#startLiveDeployment').textContent = t(paused ? 'deployArmLive' : 'deployStartDryRun');
     $('#stopLiveDeployment').disabled = !active || !running;
-    $('#deploymentRobotSelect').disabled = active || !hasRobotConfig;
-    $('#deploymentModelSelect').disabled = active || !hasModelConfig;
+    $('#deploymentRobotSelect').disabled = active || !configsReady || !hasRobotConfig;
+    $('#deploymentModelSelect').disabled = active || !configsReady || !hasModelConfig;
     $('#deploymentTaskPrompt').disabled = changing;
     $('#applyDeploymentPrompt').disabled = !active || changing || !$('#deploymentTaskPrompt')?.value.trim();
     const scheduler = deploymentSchedulerForm();
@@ -781,11 +1486,9 @@
     $('#applyDeploymentScheduler').disabled = changing || state.deploymentSchedulerApplying
       || !schedulerContextReady || !state.deploymentSchedulerDirty || Boolean(scheduler.error);
     $('#applyDeploymentScheduler').textContent = t(state.deploymentSchedulerApplying ? 'deployApplying' : 'deployApply');
-    const canRecord = active && ['dry_run', 'running'].includes(snapshot?.state)
-      && Array.isArray(snapshot?.modelIo?.input?.state?.values);
-    $('#recordDeploymentPose').disabled = !canRecord;
     syncDeploymentOfflineControls();
     syncDeploymentPoseButtons();
+    syncDeploymentHardwareReplayControls();
   }
 
   async function validateDeploymentRecipe() {
@@ -821,33 +1524,75 @@
     }
   }
 
-  async function checkDeploymentRobotConnection() {
+  async function checkDeploymentRobotConnection({ silent = false } = {}) {
     const button = $('#checkDeploymentRobot');
-    button.disabled = true;
+    if (button) button.disabled = true;
     setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', t('deployConnecting'));
     try {
-      const snapshot = state.deploymentSnapshot;
-      if (state.deploymentSessionId && snapshot?.state === 'model_ready' && snapshot?.components?.model?.active) {
-        const prompt = $('#deploymentTaskPrompt')?.value.trim();
-        if (!prompt) throw new Error(t('deployPromptRequired'));
-        const connected = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/start-dry-run`, {
-          method: 'POST', body: JSON.stringify({ taskPrompt: prompt })
+      const createConnection = async () => api('/api/deploy/orchestrations/connect-robot', {
+          method: 'POST', body: JSON.stringify({
+            recipe: await composeDeploymentRecipe(),
+            mode: 'dry_run',
+            robotConfigId: $('#deploymentRobotSelect')?.value || null,
+          })
         });
-        renderDeploymentSnapshot(connected);
-        setDeploymentResult(connected, t('deployOpeningReadOnlyLink'));
-        startDeploymentPolling();
-        return true;
+      const existing = state.deploymentSessionId;
+      let result;
+      if (existing) {
+        try {
+          result = await api(`/api/deploy/orchestrations/${encodeURIComponent(existing)}/connect-robot`, { method: 'POST' });
+        } catch (error) {
+          if (error.status !== 404) throw error;
+          stopDeploymentPolling();
+          state.deploymentSessionId = null;
+          state.deploymentRuntimeKind = null;
+          state.deploymentSnapshot = null;
+          state.deploymentRobotConnected = false;
+          result = await createConnection();
+        }
+      } else {
+        result = await createConnection();
       }
-      const result = await api('/api/deploy/robot-connection', {
-        method: 'POST', body: JSON.stringify({ config: deploymentConfig('robot') })
-      });
-      state.deploymentRobotConnected = Boolean(result.connected);
-      setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', result.hostname ? `${t('deployConnected')} · ${result.hostname}` : t('deployConnected'));
+      state.deploymentSessionId = result.orchestrationId;
+      state.deploymentRuntimeKind = 'recipe';
+      state.deploymentRobotConnected = Boolean(result.components?.client?.active);
+      renderDeploymentSnapshot(result);
+      startDeploymentPolling();
+      if (!silent) setDeploymentResult(result, t('deployConnectingObservation'));
       return true;
     } catch (error) {
+      // The connect request can finish on the server even when its HTTP
+      // response is lost during an Embodit restart/tunnel transition. Reconcile
+      // with the server before presenting a real robot connection failure.
+      try {
+        const listed = await api('/api/deploy/orchestrations');
+        const deploymentId = $('#deploymentId')?.value || '';
+        const recovered = [...(listed.orchestrations || [])].reverse().find((item) => {
+          const robotLinked = Boolean(
+            item.components?.tunnel?.active
+            || item.components?.ros?.active
+            || item.components?.client?.active
+          );
+          return robotLinked
+            && !['stopped', 'fault'].includes(item.state)
+            && (!deploymentId || item.deploymentId === deploymentId);
+        });
+        if (recovered) {
+          console.warn('Recovered robot connection after a lost connect response', error);
+          state.deploymentSessionId = recovered.orchestrationId;
+          state.deploymentRuntimeKind = 'recipe';
+          state.deploymentRobotConnected = true;
+          renderDeploymentSnapshot(recovered);
+          startDeploymentPolling();
+          if (!silent) setDeploymentResult(recovered, t('deployConnectingObservation'));
+          return true;
+        }
+      } catch (recoveryError) {
+        console.warn('Robot connection reconciliation failed', recoveryError);
+      }
       state.deploymentRobotConnected = false;
       setDeploymentComponentStatus('#deploymentRobotStatus', 'error', t('deployConnectionFailed'));
-      setDeploymentResult({ error: error.message }, t('deployRobotConnectionFailed'), true);
+      if (!silent) setDeploymentResult({ error: error.message }, t('deployRobotConnectionFailed'), true);
       return false;
     } finally {
       syncDeploymentButtons(Boolean(state.deploymentSessionId), state.deploymentSnapshot);
@@ -857,20 +1602,41 @@
   async function prepareDeploymentModel() {
     setBusy(true, t('deployPreparingModel'), t('deployPreparingModelHint'));
     try {
-      const recipe = await composeDeploymentRecipe();
-      const snapshot = await api('/api/deploy/orchestrations/prepare-model', {
-        method: 'POST', body: JSON.stringify({ recipe, mode: 'dry_run' })
+      const createPreparation = async () => api('/api/deploy/orchestrations/prepare-model', {
+        method: 'POST', body: JSON.stringify({
+          recipe: await composeDeploymentRecipe(),
+          mode: 'dry_run',
+          robotConfigId: $('#deploymentRobotSelect')?.value || null,
+        })
       });
+      const existing = state.deploymentSessionId;
+      let snapshot;
+      if (existing) {
+        try {
+          snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(existing)}/prepare-model`, { method: 'POST' });
+        } catch (error) {
+          if (error.status !== 404) throw error;
+          stopDeploymentPolling();
+          state.deploymentSessionId = null;
+          state.deploymentRuntimeKind = null;
+          state.deploymentSnapshot = null;
+          state.deploymentRobotConnected = false;
+          snapshot = await createPreparation();
+        }
+      } else {
+        snapshot = await createPreparation();
+      }
       state.deploymentSessionId = snapshot.orchestrationId;
       state.deploymentRuntimeKind = 'recipe';
       renderDeploymentSnapshot(snapshot);
       setDeploymentResult(snapshot, t('deployCheckingRobotStartingModel'));
       startDeploymentPolling();
     } catch (error) {
-      state.deploymentSessionId = null;
-      state.deploymentRuntimeKind = null;
-      state.deploymentSnapshot = null;
-      syncDeploymentButtons(false);
+      if (!state.deploymentSessionId) {
+        state.deploymentRuntimeKind = null;
+        state.deploymentSnapshot = null;
+      }
+      syncDeploymentButtons(Boolean(state.deploymentSessionId), state.deploymentSnapshot);
       setDeploymentComponentStatus('#deploymentModelStatus', 'error', t('deployStartFailed'));
       setDeploymentResult({ error: error.message }, t('deployFailed'), true);
     } finally {
@@ -880,33 +1646,40 @@
 
   async function disconnectDeploymentRobot() {
     if (!state.deploymentSessionId) return;
-    setBusy(true, t('deployDisconnectingRobot'), t('deployDisconnectingRobotHint'));
+    stopDeploymentPolling();
+    $('#disconnectDeploymentRobot').disabled = true;
+    $('#closeDeploymentModel').disabled = true;
+    setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', t('deployDisconnectingRobot'));
     try {
       const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/disconnect-robot`, { method: 'POST' });
-      state.deploymentRobotConnected = false;
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, t('deployRobotDisconnected'));
+      startDeploymentPolling();
+      setDeploymentResult(snapshot, t('deployDisconnectingRobot'));
     } catch (error) {
       setDeploymentResult({ error: error.message }, t('deployDisconnectFailed'), true);
-    } finally { setBusy(false); }
+      syncDeploymentButtons(true, state.deploymentSnapshot);
+      startDeploymentPolling();
+    }
   }
 
   async function closeDeploymentModel() {
     if (!state.deploymentSessionId) return;
+    if (state.deploymentOfflineReplay) closeDeploymentOfflineReplay();
     if (state.deploymentOfflineResult) closeDeploymentOfflineResult();
-    setBusy(true, t('deployClosingModel'), t('deployClosingModelHint'));
+    stopDeploymentPolling();
+    $('#disconnectDeploymentRobot').disabled = true;
+    $('#closeDeploymentModel').disabled = true;
+    setDeploymentComponentStatus('#deploymentModelStatus', 'pending', t('deployClosingModel'));
     try {
       const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/close-model`, { method: 'POST' });
       renderDeploymentSnapshot(snapshot);
-      setDeploymentResult(snapshot, t('deployModelClosed'));
-      stopDeploymentPolling();
-      state.deploymentSessionId = null;
-      state.deploymentRuntimeKind = null;
-      state.deploymentRobotConnected = false;
-      syncDeploymentButtons(false);
+      startDeploymentPolling();
+      setDeploymentResult(snapshot, t('deployClosingModel'));
     } catch (error) {
       setDeploymentResult({ error: error.message }, t('deployCloseModelFailed'), true);
-    } finally { setBusy(false); }
+      syncDeploymentButtons(true, state.deploymentSnapshot);
+      startDeploymentPolling();
+    }
   }
 
   function startDeploymentPolling() {
@@ -922,13 +1695,37 @@
         state.deploymentTimer = window.setTimeout(poll, 500);
       }
     };
+    let nextPreviewAt = performance.now();
+    const previewPoll = async () => {
+      if (generation !== state.deploymentPollGeneration || state.deploymentSessionId !== sessionId) return;
+      state.deploymentPreviewTimer = null;
+      try {
+        const response = await fetch(`/api/deploy/orchestrations/${encodeURIComponent(sessionId)}/live-preview`, {
+          headers: { 'X-LeRobot-Token': token },
+        });
+        if (response.ok) {
+          const payload = await response.json();
+          if (generation === state.deploymentPollGeneration && state.deploymentSessionId === sessionId) {
+            renderDeploymentLivePreview(payload.livePreview, state.deploymentSnapshot?.modelIo?.input);
+          }
+        }
+      } catch {}
+      if (generation === state.deploymentPollGeneration && state.deploymentSessionId === sessionId) {
+        nextPreviewAt += 125;
+        if (nextPreviewAt < performance.now()) nextPreviewAt = performance.now();
+        state.deploymentPreviewTimer = window.setTimeout(previewPoll, Math.max(0, nextPreviewAt - performance.now()));
+      }
+    };
     state.deploymentTimer = window.setTimeout(poll, 500);
+    state.deploymentPreviewTimer = window.setTimeout(previewPoll, 0);
   }
 
   function stopDeploymentPolling() {
     state.deploymentPollGeneration += 1;
     if (state.deploymentTimer !== null) window.clearTimeout(state.deploymentTimer);
+    if (state.deploymentPreviewTimer !== null) window.clearTimeout(state.deploymentPreviewTimer);
     state.deploymentTimer = null;
+    state.deploymentPreviewTimer = null;
   }
 
   async function refreshDeploymentSession(sessionId = state.deploymentSessionId, generation = state.deploymentPollGeneration) {
@@ -936,23 +1733,56 @@
     const requestIsCurrent = () => generation === state.deploymentPollGeneration
       && state.deploymentSessionId === sessionId;
     try {
-      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(sessionId)}`);
+      const wasDisconnecting = state.deploymentSnapshot?.currentStep === 'robot_disconnect';
+      const wasClosingModel = state.deploymentSnapshot?.currentStep === 'model_close';
+      const wasPausingEvaluation = state.deploymentSnapshot?.state === 'stopping'
+        && state.deploymentSnapshot?.currentStep?.startsWith('evaluation_');
+      const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(sessionId)}?includePreview=false&includeModelImages=false&trajectoryPoints=360`);
       if (!requestIsCurrent()) return;
       renderDeploymentSnapshot(snapshot);
+      if (wasDisconnecting && snapshot.state === 'model_ready') {
+        state.deploymentRobotConnected = false;
+        setDeploymentResult(snapshot, t('deployRobotDisconnected'));
+      }
+      if (wasClosingModel && !snapshot.components?.model?.active && snapshot.state === 'robot_ready') {
+        setDeploymentResult(snapshot, t('deployModelClosed'));
+      }
+      if (wasPausingEvaluation && snapshot.state === 'dry_run') {
+        setDeploymentResult(snapshot, t('deployEvaluationPaused'));
+      }
       const anyManagedActive = Object.values(snapshot.components || {}).some((component) => component?.active);
       if (['stopped', 'disconnected'].includes(snapshot.state) || (snapshot.state === 'fault' && !anyManagedActive)) {
         stopDeploymentPolling();
-        setDeploymentResult(snapshot, snapshot.lastError || t('deployStateMessage', { state: snapshot.state }), snapshot.state === 'fault');
+        const faulted = snapshot.state === 'fault';
+        setDeploymentResult(
+          snapshot,
+          wasClosingModel && snapshot.state === 'stopped'
+            ? t('deployModelClosed')
+            : (faulted ? t('deployFaultHint') : t('deployStateMessage', { state: snapshot.state })),
+          faulted,
+        );
         state.deploymentSessionId = null;
         state.deploymentRuntimeKind = null;
+        state.deploymentSnapshot = null;
+        state.deploymentRobotConnected = false;
+        resetDeploymentRuntimeViews();
         syncDeploymentButtons(false);
       } else if (snapshot.state === 'fault') {
         stopDeploymentPolling();
-        setDeploymentResult(snapshot, snapshot.lastError || t('deployFaultHint'), true);
+        setDeploymentResult(snapshot, t('deployFaultHint'), true);
       }
     } catch (error) {
       if (!requestIsCurrent()) return;
       stopDeploymentPolling();
+      if (error.status === 404) {
+        state.deploymentSessionId = null;
+        state.deploymentRuntimeKind = null;
+        state.deploymentSnapshot = null;
+        state.deploymentRobotConnected = false;
+        resetDeploymentRuntimeViews();
+        syncDeploymentButtons(false);
+        return;
+      }
       setDeploymentResult({ error: error.message }, t('deployFailed'), true);
     }
   }
@@ -960,6 +1790,7 @@
   async function stopDeploymentSession() {
     stopDeploymentPolling();
     if (!state.deploymentSessionId) return;
+    if (state.deploymentOfflineReplay) closeDeploymentOfflineReplay();
     if (state.deploymentOfflineResult) closeDeploymentOfflineResult();
     try {
       const result = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/stop`, { method: 'POST' });
@@ -972,6 +1803,7 @@
       state.deploymentRuntimeKind = null;
       state.deploymentSnapshot = null;
       state.deploymentRobotConnected = false;
+      resetDeploymentRuntimeViews();
       syncDeploymentButtons(false);
       setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployConnectionUnchecked'));
       setDeploymentComponentStatus('#deploymentModelStatus', 'idle', t('deployNotStarted'));
@@ -980,6 +1812,7 @@
 
   async function startLiveDeployment() {
     if (!state.deploymentSessionId) return;
+    if (state.deploymentOfflineReplay) closeDeploymentOfflineReplay();
     if (state.deploymentOfflineResult) closeDeploymentOfflineResult();
     const taskPrompt = $('#deploymentTaskPrompt')?.value.trim() || '';
     if (!taskPrompt) {
@@ -991,7 +1824,8 @@
     if (button) button.disabled = true;
     try {
       const base = `/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}`;
-      if (state.deploymentSnapshot?.state === 'model_ready') {
+      if (['model_ready', 'robot_ready'].includes(state.deploymentSnapshot?.state)
+        && state.deploymentSnapshot?.components?.model?.active) {
         const snapshot = await api(`${base}/start-dry-run`, {
           method: 'POST', body: JSON.stringify({ taskPrompt })
         });
@@ -1016,7 +1850,11 @@
       }
       const challenge = await api(`${base}/arm-challenge`, { method: 'POST' });
       const snapshot = await api(`${base}/start-live`, {
-        method: 'POST', body: JSON.stringify({ confirmation: challenge.phrase })
+        method: 'POST',
+        body: JSON.stringify({
+          confirmation: challenge.phrase,
+          recordVideo: Boolean($('#deploymentRecordLive')?.checked),
+        })
       });
       renderDeploymentSnapshot(snapshot);
       startDeploymentPolling();
@@ -1030,14 +1868,16 @@
 
   async function stopLiveDeployment() {
     if (!state.deploymentSessionId || state.deploymentSnapshot?.state !== 'running') return;
+    setBusy(true, t('deployPausingEvaluation'), t('deployPausingEvaluationHint'));
     try {
       const snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(state.deploymentSessionId)}/stop-evaluation`, {
         method: 'POST'
       });
       renderDeploymentSnapshot(snapshot);
       startDeploymentPolling();
-      setDeploymentResult(snapshot, t('deployEvaluationPaused'));
+      setDeploymentResult(snapshot, t('deployPausingEvaluation'));
     } catch (error) { setDeploymentResult({ error: error.message }, t('deployFailed'), true); }
+    finally { setBusy(false); }
   }
 
   async function applyDeploymentPrompt() {
@@ -1144,6 +1984,46 @@
     window.open(path, '_blank', 'noopener');
   }
 
+  function latestDeploymentStep(snapshot, name) {
+    const steps = Array.isArray(snapshot?.steps) ? snapshot.steps : [];
+    for (let index = steps.length - 1; index >= 0; index -= 1) {
+      if (steps[index]?.name === name) return steps[index];
+    }
+    return null;
+  }
+
+  function deploymentStepProgress(snapshot) {
+    const step = latestDeploymentStep(snapshot, snapshot?.currentStep);
+    const elapsed = step?.startedNs ? Math.max(0, (Date.now() * 1e6 - Number(step.startedNs)) / 1e9) : null;
+    const labels = {
+      precheck: t('deployCheckingEnvironment'),
+      model: t('deployStartingService'),
+      model_health: t('deployWaitingModelHealth'),
+      robot_precheck: t('deployCheckingRobot'),
+      tunnel_credentials: t('deployPreparingTunnelCredentials'),
+      tunnel: t('deployStartingTunnel'),
+      tunnel_health: t('deployWaitingTunnel'),
+      ros: t('deployStartingRos'),
+      ros_readiness: t('deployWaitingRos'),
+      client: t('deployStartingClient'),
+      client_health: t('deployWaitingClient'),
+      evaluation_hold: t('deployPausingEvaluation'),
+      evaluation_client_stop: t('deployPausingEvaluation'),
+      evaluation_recording_finalize: t('deployFinalizingRecording'),
+      evaluation_dry_run_start: t('deployStartingClient'),
+      evaluation_dry_run_health: t('deployWaitingClient'),
+      hardware_replay_prepare: t('deployOfflineReplayRobotStarting'),
+      hardware_replay_client_stop: t('deployOfflineReplayRobotStarting'),
+      hardware_replay_client_start: t('deployOfflineReplayRobotStarting'),
+      hardware_replay_stop: t('deployOfflineReplayRobotStop'),
+      hardware_replay_restore: t('deployConnecting'),
+      robot_disconnect: t('deployDisconnectingRobot'),
+      model_close: t('deployClosingModel'),
+    };
+    const label = labels[snapshot?.currentStep] || snapshot?.currentStep || '';
+    return { label, elapsed, text: label && elapsed !== null ? `${label} · ${elapsed.toFixed(1)} s` : label };
+  }
+
   function renderDeploymentSnapshot(snapshot) {
     if (!snapshot) return;
     state.deploymentSnapshot = snapshot;
@@ -1153,35 +2033,52 @@
     const promptInput = $('#deploymentTaskPrompt');
     if (observedPrompt && promptInput && document.activeElement !== promptInput) promptInput.value = observedPrompt;
     syncDeploymentButtons(!['disconnected', 'stopped', 'fault'].includes(snapshot.state), snapshot);
-    const robotPrecheck = (snapshot.steps || []).find((item) => item.name === 'robot_precheck');
+    const robotPrecheck = latestDeploymentStep(snapshot, 'robot_precheck');
     const robotLinked = Boolean(snapshot.components?.tunnel?.active || snapshot.components?.ros?.active || snapshot.components?.client?.active);
-    if (robotLinked) {
+    const progress = deploymentStepProgress(snapshot);
+    const robotStartingSteps = new Set(['robot_precheck', 'observation_client_stop', 'tunnel_credentials', 'tunnel', 'tunnel_health', 'ros', 'ros_readiness', 'client', 'client_health', 'evaluation_hold', 'evaluation_client_stop', 'evaluation_recording_finalize', 'evaluation_dry_run_start', 'evaluation_dry_run_health']);
+    ['hardware_replay_prepare', 'hardware_replay_client_stop', 'hardware_replay_client_start',
+      'hardware_replay_stop', 'hardware_replay_restore'].forEach((step) => robotStartingSteps.add(step));
+    const robotDisconnecting = snapshot.currentStep === 'robot_disconnect';
+    if (robotDisconnecting) {
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', progress.text || t('deployDisconnectingRobot'));
+    } else if (robotStartingSteps.has(snapshot.currentStep)) {
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', progress.text || t('deployConnecting'));
+    } else if (robotLinked) {
       state.deploymentRobotConnected = true;
-      const mode = t(snapshot.clientRuntime?.mode === 'live' ? 'deployActionExecution' : 'deployReadOnlyObservation');
+      const actionMode = ['live', 'replay'].includes(snapshot.clientRuntime?.mode)
+        || snapshot.mode === 'replay';
+      const mode = t(actionMode ? 'deployActionExecution' : 'deployReadOnlyObservation');
       setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', `${t('deployConnected')} · ${mode}`);
-    } else if (snapshot.state === 'model_ready') {
-      state.deploymentRobotConnected = false;
-      setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployDisconnected'));
     } else if (robotPrecheck?.status === 'failed') {
       state.deploymentRobotConnected = false;
       setDeploymentComponentStatus('#deploymentRobotStatus', 'error', t('deployConnectionFailed'));
-    }
-    else if (snapshot.currentStep === 'robot_precheck') setDeploymentComponentStatus('#deploymentRobotStatus', 'pending', t('deployConnecting'));
-    else setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployConnectionUnchecked'));
+    } else if (state.deploymentRobotConnected) {
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'ready', t('deployConnectionVerified'));
+    } else if (['dry_run', 'running'].includes(snapshot.state)) {
+      setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployDisconnected'));
+    } else setDeploymentComponentStatus('#deploymentRobotStatus', 'idle', t('deployConnectionUnchecked'));
     const clientStatus = snapshot.components?.client?.status;
+    const clientActive = Boolean(snapshot.components?.client?.active);
     const robotDetail = $('#deploymentRobotDetail');
     if (robotDetail) robotDetail.textContent = robotLinked
-      ? `Client ${clientStatus?.activeState || 'active'}/${clientStatus?.subState || 'running'} · ROS ${snapshot.components?.ros?.active ? 'active' : 'off'} · Tunnel ${snapshot.components?.tunnel?.active ? 'active' : 'off'}${snapshot.clientRuntime?.actionShape ? ` · ${t('deployAction')} ${snapshot.clientRuntime.actionShape.join('×')}` : ''}`
-      : t('deployObservationLinkMissing');
-    if (snapshot.components?.model?.active) setDeploymentComponentStatus('#deploymentModelStatus', 'ready', t('deployModelStarted'));
-    else if (snapshot.currentStep === 'model' || snapshot.currentStep === 'model_health') setDeploymentComponentStatus('#deploymentModelStatus', 'pending', t('deployStartingShort'));
+      ? `Client ${clientActive ? `${clientStatus?.activeState || 'active'}/${clientStatus?.subState || 'running'}` : 'off'} · ROS ${snapshot.components?.ros?.active ? 'active' : 'off'} · Tunnel ${snapshot.components?.tunnel?.active ? 'active' : 'off'}${(robotStartingSteps.has(snapshot.currentStep) || robotDisconnecting) && progress.text ? ` · ${progress.text}` : ''}${snapshot.clientRuntime?.actionShape ? ` · ${t('deployAction')} ${snapshot.clientRuntime.actionShape.join('×')}` : ''}`
+      : ((robotStartingSteps.has(snapshot.currentStep) || robotDisconnecting) ? progress.text : t('deployObservationLinkMissing'));
+    const modelHealth = latestDeploymentStep(snapshot, 'model_health');
+    const modelClosing = snapshot.currentStep === 'model_close';
+    const modelStarting = ['precheck', 'model', 'model_health'].includes(snapshot.currentStep);
+    const modelReady = Boolean(snapshot.components?.model?.active)
+      && (modelHealth?.status === 'passed' || ['model_ready', 'robot_ready', 'dry_run', 'running'].includes(snapshot.state));
+    if (modelClosing) setDeploymentComponentStatus('#deploymentModelStatus', 'pending', progress.text || t('deployClosingModel'));
+    else if (modelStarting) setDeploymentComponentStatus('#deploymentModelStatus', 'pending', progress.text || t('deployStartingShort'));
+    else if (modelReady) setDeploymentComponentStatus('#deploymentModelStatus', 'ready', t('deployModelStarted'));
     else if (snapshot.state === 'fault' && snapshot.modelIo) setDeploymentComponentStatus('#deploymentModelStatus', 'idle', t('deployModelStopped'));
     else if (snapshot.state === 'fault') setDeploymentComponentStatus('#deploymentModelStatus', 'error', t('deployStartFailed'));
     else setDeploymentComponentStatus('#deploymentModelStatus', 'idle', t('deployNotStarted'));
     const modelManaged = snapshot.components?.model?.status;
     const modelDetail = $('#deploymentModelDetail');
     if (modelDetail) modelDetail.textContent = snapshot.components?.model?.active
-      ? `${modelManaged?.activeState || 'active'}/${modelManaged?.subState || 'running'}${modelManaged?.pid ? ` · PID ${modelManaged.pid}` : ''}${Number.isFinite(Number(snapshot.clientRuntime?.inferenceLatencyMs)) ? ` · ${t('deployInference')} ${Number(snapshot.clientRuntime.inferenceLatencyMs).toFixed(0)} ms` : ''}`
+      ? `${modelManaged?.activeState || 'active'}/${modelManaged?.subState || 'running'}${modelManaged?.pid ? ` · PID ${modelManaged.pid}` : ''}${modelStarting && progress.text ? ` · ${progress.text}` : ''}${Number.isFinite(Number(snapshot.clientRuntime?.inferenceLatencyMs)) ? ` · ${t('deployInference')} ${Number(snapshot.clientRuntime.inferenceLatencyMs).toFixed(0)} ms` : ''}`
       : `${t('deployModelServiceStopped')}${modelManaged?.result ? ` · ${modelManaged.result}` : ''}`;
     if (snapshot.scheduler) {
       const scheduler = snapshot.scheduler;
@@ -1206,6 +2103,10 @@
       syncDeploymentButtons(!['disconnected', 'stopped', 'fault'].includes(snapshot.state), snapshot);
     }
     renderDeploymentPoses(snapshot.recordedPoses || []);
+    renderDeploymentRecording(snapshot.recording, snapshot.state);
+    if (snapshot.livePreview || state.deploymentPreviewRenderKey === null) {
+      renderDeploymentLivePreview(snapshot.livePreview, snapshot.modelIo?.input);
+    }
     renderDeploymentModelIo(snapshot.modelIo, snapshot.dryRunSafety, snapshot.trajectoryHistory, snapshot.runtimeTiming);
     refreshDeploymentExecutionLog(false);
     const output = $('#deploymentResult');
@@ -1220,7 +2121,10 @@
       recentEvents: (snapshot.events || []).slice(-30),
     }, null, 2);
     const hint = $('#deploymentResultHint');
-    if (hint) hint.textContent = snapshot.lastError || `${snapshot.name || snapshot.deploymentId} · ${snapshot.state}`;
+    if (hint) {
+      hint.textContent = `${snapshot.name || snapshot.deploymentId} · ${snapshot.state}`;
+      hint.classList.toggle('error', snapshot.state === 'fault');
+    }
   }
 
   function renderDeploymentPoses(poses) {
@@ -1236,31 +2140,99 @@
 
   function syncDeploymentPoseButtons() {
     const hasPose = Boolean($('#deploymentPoseSelect')?.value);
-    const stateName = state.deploymentSnapshot?.state;
-    const canMove = hasPose && ['dry_run', 'running'].includes(stateName);
+    const snapshot = state.deploymentSnapshot;
+    const stateName = snapshot?.state;
+    const clientActive = Boolean(state.deploymentSessionId && snapshot?.components?.client?.active);
+    const robotState = snapshot?.robotState;
+    const hasState = clientActive && Array.isArray(robotState?.values);
+    const canMove = hasPose && clientActive && ['robot_ready', 'dry_run', 'running'].includes(stateName);
+    if ($('#recordDeploymentPose')) $('#recordDeploymentPose').disabled = !hasState;
     if ($('#moveDeploymentPose')) $('#moveDeploymentPose').disabled = !canMove;
     if ($('#deleteDeploymentPose')) $('#deleteDeploymentPose').disabled = !hasPose;
     const hint = $('#deploymentPoseHint');
-    const hasState = ['dry_run', 'running'].includes(stateName)
-      && Array.isArray(state.deploymentSnapshot?.modelIo?.input?.state?.values);
     if (hint) hint.textContent = hasState
-      ? t('deployPoseReady', { n: state.deploymentSnapshot.modelIo.input.state.values.length })
+      ? t('deployPoseReady', { n: robotState.values.length })
       : t('deployPoseNotReady');
   }
 
   function orchestrationLogRows(snapshot) {
     const marker = Number(state.deploymentLogClearMarkers.orchestration || 0);
-    const rows = (snapshot?.events || []).filter((event) => Number(event.timeNs || 0) > marker).slice(-160).map((event) => {
+    const zh = (window.EmbodyI18n?.getLang?.() || 'zh').startsWith('zh');
+    const eventLabels = zh ? {
+      created: '会话创建', dry_run_requested: '准备测试', robot_connect_requested: '连接本体',
+      robot_observation_ready: '本体就绪', robot_connect_cancelled: '连接取消', robot_connect_failed: '连接失败',
+      model_prepare_requested: '启动模型', model_ready: '模型就绪', model_prepare_cancelled: '启动取消',
+      model_prepare_failed: '模型失败', deployment_ready: '部署就绪', start_cancelled: '启动取消', fault: '运行故障',
+      live_challenge_created: '评测准备', live_start_requested: '开始评测', live_started: '评测运行',
+      live_stop_requested: '停止评测', live_stopped: '评测停止', prompt_switch_requested: '切换 Prompt',
+      prompt_updated: 'Prompt 已更新', scheduler_update_requested: '更新调度', scheduler_updated: '调度已更新',
+      pose_recorded: '位姿已记录', pose_deleted: '位姿已删除', pose_move_requested: '开始回位',
+      pose_move_failed: '回位失败',
+      pose_move_finished: '回位完成', robot_disconnect_requested: '断开本体', robot_disconnected: '本体已断开',
+      model_close_requested: '关闭模型', model_closed: '模型已关闭', component_restart_requested: '重启组件',
+      component_restarted: '组件已重启', component_unhealthy_observed: '组件异常', component_recovered: '组件恢复',
+      stop_requested: '停止会话', emergency_stop_requested: '停止会话', rollback_finished: '清理完成',
+      video_recording_started: '开始录像', video_recording_saved: '录像已保存', video_recording_failed: '录像失败',
+      offline_inference: '离线推理', legacy_evaluation_downgraded: '评测模式兼容',
+    } : {
+      created: 'Session created', dry_run_requested: 'Prepare test', robot_connect_requested: 'Connect robot',
+      robot_observation_ready: 'Robot ready', robot_connect_cancelled: 'Connection cancelled', robot_connect_failed: 'Connection failed',
+      model_prepare_requested: 'Start model', model_ready: 'Model ready', model_prepare_cancelled: 'Start cancelled',
+      model_prepare_failed: 'Model failed', deployment_ready: 'Deployment ready', start_cancelled: 'Start cancelled', fault: 'Runtime fault',
+      live_challenge_created: 'Evaluation ready', live_start_requested: 'Start evaluation', live_started: 'Evaluation running',
+      live_stop_requested: 'Stop evaluation', live_stopped: 'Evaluation stopped', prompt_switch_requested: 'Switch prompt',
+      prompt_updated: 'Prompt updated', scheduler_update_requested: 'Update scheduler', scheduler_updated: 'Scheduler updated',
+      pose_recorded: 'Pose recorded', pose_deleted: 'Pose deleted', pose_move_requested: 'Move to pose',
+      pose_move_failed: 'Move to pose failed',
+      pose_move_finished: 'Pose reached', robot_disconnect_requested: 'Disconnect robot', robot_disconnected: 'Robot disconnected',
+      model_close_requested: 'Close model', model_closed: 'Model closed', component_restart_requested: 'Restart component',
+      component_restarted: 'Component restarted', component_unhealthy_observed: 'Component unhealthy', component_recovered: 'Component recovered',
+      stop_requested: 'Stop session', emergency_stop_requested: 'Stop session', rollback_finished: 'Cleanup complete',
+      video_recording_started: 'Recording started', video_recording_saved: 'Recording saved', video_recording_failed: 'Recording failed',
+      offline_inference: 'Offline inference', legacy_evaluation_downgraded: 'Evaluation compatibility',
+    };
+    const stepLabels = zh ? {
+      precheck: '环境检查', robot_precheck: '本体检查', model: '模型服务', model_health: '模型健康检查',
+      ros: 'ROS 服务', ros_readiness: 'ROS 就绪检查', power_on: '本体上电', initial_pose: '初始位姿',
+      tunnel_credentials: '通信凭据', tunnel: '通信隧道', tunnel_health: '隧道检查',
+      observation_client_stop: '切换本体客户端', client: '本体客户端', client_health: '本体链路检查',
+    } : {
+      precheck: 'Environment check', robot_precheck: 'Robot check', model: 'Model service', model_health: 'Model health',
+      ros: 'ROS service', ros_readiness: 'ROS readiness', power_on: 'Robot power', initial_pose: 'Initial pose',
+      tunnel_credentials: 'Credentials', tunnel: 'Tunnel', tunnel_health: 'Tunnel health',
+      observation_client_stop: 'Switch robot client', client: 'Robot client', client_health: 'Robot link',
+    };
+    const visibleEvents = (snapshot?.events || [])
+      .filter((event) => Number(event.timeNs || 0) > marker && event.event !== 'step_started')
+      .slice(-120);
+    const rows = visibleEvents.map((event) => {
       const time = event.timeNs ? new Date(event.timeNs / 1e6).toLocaleTimeString('zh-CN', { hour12: false }) : '--:--:--';
-      const detail = Object.entries(event)
-        .filter(([key]) => !['timeNs', 'event', 'state'].includes(key))
-        .map(([key, value]) => `${key}=${typeof value === 'object' ? JSON.stringify(value) : value}`)
-        .join(' ');
       const name = String(event.event || 'event');
       const level = /fault|failed|error|unhealthy/.test(name) ? 'error' : (/requested|starting/.test(name) ? 'pending' : 'info');
-      return { time, level, tag: name, message: detail || event.state || '' };
+      if (name === 'step_passed' || name === 'step_failed') {
+        const step = stepLabels[event.step] || String(event.step || 'step').replaceAll('_', ' ');
+        return {
+          time,
+          level,
+          tag: name === 'step_passed' ? (zh ? '完成' : 'Done') : (zh ? '失败' : 'Failed'),
+          message: name === 'step_failed' && event.reason ? `${step} · ${event.reason}` : step,
+        };
+      }
+      const detailKeys = ['reason', 'component', 'name', 'mode', 'prompt', 'path'];
+      const detail = detailKeys
+        .filter((key) => event[key] !== undefined && event[key] !== null && event[key] !== '')
+        .map((key) => String(event[key]))
+        .join(' · ');
+      return {
+        time,
+        level,
+        tag: eventLabels[name] || name.replaceAll('_', ' '),
+        message: detail,
+      };
     });
-    if (snapshot?.lastError) rows.push({ time: '--:--:--', level: 'error', tag: 'ERROR', message: snapshot.lastError });
+    if (snapshot?.lastError && !rows.some((row) => row.level === 'error' && row.message.includes(snapshot.lastError))) {
+      rows.push({ time: '--:--:--', level: 'error', tag: 'ERROR', message: snapshot.lastError });
+    }
     return rows;
   }
 
@@ -1285,6 +2257,8 @@
   function renderDeploymentLogRows(rows) {
     const output = $('#deploymentExecutionLog');
     if (!output) return;
+    const wasEmpty = state.deploymentLogRows.length === 0;
+    const nearBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 28;
     state.deploymentLogRows = rows;
     const filter = ($('#deploymentLogFilter')?.value || '').trim().toLowerCase();
     const visible = filter ? rows.filter((row) => `${row.tag} ${row.message}`.toLowerCase().includes(filter)) : rows;
@@ -1294,7 +2268,7 @@
         <span>${escapeHtml(row.tag)}</span>
         <p>${escapeHtml(row.message)}</p>
       </div>`).join('') : `<div class="deployment-log-empty">${escapeHtml(t('deployNoMatchingLogs'))}</div>`;
-    if ($('#deploymentLogAutoscroll')?.checked) output.scrollTop = output.scrollHeight;
+    if (wasEmpty || nearBottom) output.scrollTop = output.scrollHeight;
   }
 
   async function refreshDeploymentExecutionLog(force = false) {
@@ -1455,23 +2429,85 @@
     });
   }
 
+  function renderDeploymentStateVector(inputState) {
+    if (!$('#deploymentStateGrid') || !$('#deploymentStateLabel') || !$('#deploymentStateKey')) return;
+    $('#deploymentStateLabel').textContent = inputState?.label || t('deployStateInput');
+    $('#deploymentStateKey').textContent = inputState?.key || '—';
+    const stateValues = Array.isArray(inputState?.values) ? inputState.values : [];
+    $('#deploymentStateGrid').innerHTML = stateValues.length
+      ? stateValues.map((value, index) => {
+        const name = inputState.names?.[index] || `state_${index + 1}`;
+        return `<div class="deployment-vector-item"><strong title="${escapeAttr(name)}">${escapeHtml(name)}</strong><span>${escapeHtml(formatModelIoValue(value))}</span><small>${escapeHtml(inputState.units?.[index] || '')}</small></div>`;
+      }).join('')
+      : `<div class="deployment-io-empty">${escapeHtml(t('deployNoStateVector'))}</div>`;
+  }
+
+  function rememberDeploymentLiveState(inputState, capturedMonotonicNs) {
+    const values = Array.isArray(inputState?.values) ? inputState.values.map(Number) : [];
+    const captured = Number(capturedMonotonicNs);
+    if (!values.length || !values.every(Number.isFinite) || !Number.isFinite(captured)) return false;
+
+    const sessionId = state.deploymentSessionId || '';
+    const names = Array.from(
+      { length: values.length },
+      (_, index) => inputState.names?.[index] || `state_${index + 1}`,
+    );
+    const units = Array.from(
+      { length: values.length },
+      (_, index) => inputState.units?.[index] || '',
+    );
+    const layoutChanged = state.deploymentLiveStateNames.length
+      && JSON.stringify(names) !== JSON.stringify(state.deploymentLiveStateNames);
+    const clockRestarted = Number.isFinite(state.deploymentLiveStateCapturedNs)
+      && captured < state.deploymentLiveStateCapturedNs;
+    if (state.deploymentLiveStateSessionId !== sessionId || layoutChanged || clockRestarted) {
+      state.deploymentLiveStateHistory = [];
+      state.deploymentLiveStateCapturedNs = null;
+    }
+    state.deploymentLiveStateSessionId = sessionId;
+    state.deploymentLiveStateNames = names;
+    state.deploymentLiveStateUnits = units;
+    if (captured === state.deploymentLiveStateCapturedNs) return false;
+
+    state.deploymentLiveStateCapturedNs = captured;
+    state.deploymentLiveStateHistory.push({ tNs: captured, values });
+    const cutoff = captured - 10 * 1e9;
+    state.deploymentLiveStateHistory = state.deploymentLiveStateHistory
+      .filter((point) => Number(point.tNs) >= cutoff)
+      .slice(-512);
+    return true;
+  }
   function renderDeploymentModelIo(modelIo, dryRunSafety = null, trajectoryHistory = null, runtimeTiming = null) {
     const placeholder = $('#deploymentModelIoPlaceholder');
     const container = $('#deploymentModelIo');
+    const outputSection = $('#deploymentModelOutputSection');
+    const inputHeading = $('#deploymentInputHeadingTitle');
     if (!placeholder || !container) return;
-    if (state.deploymentOfflineResult) {
+    if (state.deploymentOfflineResult || state.deploymentOfflineReplay) {
       placeholder.classList.add('hidden');
       container.classList.add('hidden');
       return;
     }
     if (!modelIo?.input || !modelIo?.output) {
       state.deploymentModelIoRenderKey = null;
-      placeholder.classList.remove('hidden');
-      container.classList.add('hidden');
+      const robotState = state.deploymentSnapshot?.robotState;
+      if (Array.isArray(robotState?.values)) {
+        placeholder.classList.add('hidden');
+        container.classList.remove('hidden');
+        outputSection?.classList.remove('hidden');
+        $('#deploymentOutputMeta').textContent = t('deployObservationWithoutModel');
+        $('#deploymentActionShape').textContent = '—';
+        renderDeploymentActionTrajectory({}, [], trajectoryHistory, runtimeTiming);
+      } else {
+        placeholder.classList.remove('hidden');
+        container.classList.add('hidden');
+      }
       return;
     }
     placeholder.classList.add('hidden');
     container.classList.remove('hidden');
+    outputSection?.classList.remove('hidden');
+    if (inputHeading) inputHeading.textContent = t('deployModelInput');
 
     const input = modelIo.input;
     const output = modelIo.output;
@@ -1482,29 +2518,9 @@
     const renderKey = captured === null || captured === undefined
       ? null
       : JSON.stringify([state.deploymentSessionId || '', captured]);
+    if (!state.deploymentLiveStateHistory.length) rememberDeploymentLiveState(input.state, captured);
     const rebuildModelIoDom = renderKey === null || renderKey !== state.deploymentModelIoRenderKey;
     if (rebuildModelIoDom) {
-      const cameras = Array.isArray(input.cameras) ? input.cameras : [];
-      $('#deploymentCameraGrid').innerHTML = cameras.length
-        ? cameras.map((camera) => {
-          const url = safeModelImageUrl(camera.dataUrl);
-          if (!url) return '';
-          const size = camera.width && camera.height ? `${camera.width} × ${camera.height}` : 'JPEG';
-          return `<figure class="deployment-camera-card"><img src="${escapeAttr(url)}" alt="${escapeAttr(camera.label || camera.key || t('deployModelImageInput'))}"><figcaption><strong>${escapeHtml(camera.label || camera.key || t('deployImageInput'))}</strong><small>${escapeHtml(size)}</small></figcaption></figure>`;
-        }).join('')
-        : `<div class="deployment-io-empty">${escapeHtml(t('deployNoInputImages'))}</div>`;
-      $('#deploymentInputMeta').textContent = input.prompt ? `Prompt · ${input.prompt}` : t('deployActualModelInput');
-
-      const inputState = input.state;
-      $('#deploymentStateLabel').textContent = inputState?.label || t('deployStateInput');
-      $('#deploymentStateKey').textContent = inputState?.key || '—';
-      const stateValues = Array.isArray(inputState?.values) ? inputState.values : [];
-      $('#deploymentStateGrid').innerHTML = stateValues.length
-        ? stateValues.map((value, index) => {
-          const name = inputState.names?.[index] || `state_${index + 1}`;
-          return `<div class="deployment-vector-item"><strong title="${escapeAttr(name)}">${escapeHtml(name)}</strong><span>${escapeHtml(formatModelIoValue(value))}</span><small>${escapeHtml(inputState.units?.[index] || '')}</small></div>`;
-        }).join('')
-        : `<div class="deployment-io-empty">${escapeHtml(t('deployNoStateVector'))}</div>`;
       $('#deploymentActionShape').textContent = chunk.length && width ? `${chunk.length} × ${width}` : '—';
     }
 
@@ -1521,8 +2537,8 @@
     $('#deploymentOutputMeta').textContent = dryRunSafety?.passed === false
       ? `${detailedLatency} · ${t('deployActionValidationFailed')}`
       : detailedLatency;
-    renderDeploymentActionTrajectory(action, chunk, trajectoryHistory);
-    if (rebuildModelIoDom) {
+    renderDeploymentActionTrajectory(action, chunk, trajectoryHistory, runtimeTiming);
+    if (rebuildModelIoDom && $('#deploymentActionGrid')) {
       $('#deploymentActionGrid').innerHTML = width
         ? Array.from({ length: width }, (_, index) => {
           const series = chunk.map((row) => Number(row[index])).filter(Number.isFinite);
@@ -1536,11 +2552,139 @@
         : `<div class="deployment-io-empty">${escapeHtml(t('deployNoActionOutput'))}</div>`;
       state.deploymentModelIoRenderKey = renderKey;
     }
+    if (rebuildModelIoDom) state.deploymentModelIoRenderKey = renderKey;
+  }
+
+  function renderDeploymentLivePreview(livePreview, modelInput = null) {
+    const grid = $('#deploymentCameraGrid');
+    const meta = $('#deploymentLivePreviewMeta');
+    if (!grid || !meta) return;
+    const liveState = livePreview?.state;
+    const liveStateUpdated = rememberDeploymentLiveState(
+      liveState,
+      livePreview?.capturedMonotonicNs,
+    );
+    if (liveStateUpdated) renderCurrentDeploymentTrajectory();
+    if (Array.isArray(liveState?.values)) {
+      $('#deploymentModelIoPlaceholder')?.classList.add('hidden');
+      $('#deploymentModelIo')?.classList.remove('hidden');
+      $('#deploymentModelOutputSection')?.classList.remove('hidden');
+      if (!state.deploymentSnapshot?.modelIo?.output) {
+        $('#deploymentOutputMeta').textContent = t('deployObservationWithoutModel');
+        $('#deploymentActionShape').textContent = '—';
+      }
+    }
+    const liveCameras = Array.isArray(livePreview?.cameras) ? livePreview.cameras : [];
+    const allowInferenceFallback = ['starting', 'dry_run', 'running'].includes(state.deploymentSnapshot?.state);
+    const fallbackCameras = allowInferenceFallback && Array.isArray(modelInput?.cameras) ? modelInput.cameras : [];
+    const cameras = liveCameras.length ? liveCameras : fallbackCameras;
+    const captured = liveCameras.length ? livePreview?.capturedMonotonicNs : state.deploymentSnapshot?.modelIo?.capturedMonotonicNs;
+    const renderKey = JSON.stringify([state.deploymentSessionId || '', captured || null, cameras.map((camera) => camera.key || camera.label || '')]);
+    if (renderKey === state.deploymentPreviewRenderKey) return;
+    state.deploymentPreviewRenderKey = renderKey;
+
+    if (!cameras.length) {
+      grid.innerHTML = `<div class="deployment-io-empty">${escapeHtml(t('deployWaitingLivePreview'))}</div>`;
+      meta.textContent = livePreview?.error ? t('deployPreviewError', { error: livePreview.error }) : t('deployWaitingRobotObservation');
+      return;
+    }
+
+    if (!state.deploymentSnapshot?.modelIo?.output) {
+      $('#deploymentModelIoPlaceholder')?.classList.add('hidden');
+      $('#deploymentModelIo')?.classList.remove('hidden');
+      $('#deploymentModelOutputSection')?.classList.remove('hidden');
+    }
+
+    const signature = cameras.map((camera, index) => String(camera.key || camera.label || index));
+    const cards = Array.from(grid.querySelectorAll('.deployment-camera-card'));
+    const currentSignature = cards.map((card) => card.dataset.cameraKey || '');
+    if (JSON.stringify(signature) !== JSON.stringify(currentSignature)) {
+      grid.innerHTML = cameras.map((camera, index) => {
+        const key = String(camera.key || camera.label || index);
+        const label = camera.label || camera.key || t('deployImageInput');
+        return `<figure class="deployment-camera-card" data-camera-key="${escapeAttr(key)}"><img alt="${escapeAttr(label)}"><figcaption><strong>${escapeHtml(label)}</strong><small></small></figcaption></figure>`;
+      }).join('');
+    }
+
+    cameras.forEach((camera, index) => {
+      const key = String(camera.key || camera.label || index);
+      const url = safeModelImageUrl(camera.dataUrl);
+      if (!url) return;
+      const card = Array.from(grid.querySelectorAll('.deployment-camera-card')).find((item) => item.dataset.cameraKey === key);
+      const imageElement = card?.querySelector('img');
+      if (imageElement && imageElement.src !== url) imageElement.src = url;
+      const size = camera.width && camera.height ? `${camera.width} × ${camera.height}` : 'JPEG';
+      const sizeElement = card?.querySelector('small');
+      if (sizeElement) sizeElement.textContent = size;
+    });
+    meta.textContent = liveCameras.length
+      ? t('deployLivePreviewRate', { rate: Number(livePreview?.rateHz || 0).toFixed(1) })
+      : t('deployInferenceFrameFallback');
+  }
+
+  function setDeploymentRecordingStatus(text, status = '') {
+    const element = $('#deploymentRecordingStatus');
+    if (!element) return;
+    element.textContent = text;
+    element.className = `deployment-record-status ${status}`.trim();
+  }
+
+  function renderDeploymentRecording(recording, snapshotState) {
+    const checkbox = $('#deploymentRecordLive');
+    if (checkbox) checkbox.disabled = snapshotState === 'running';
+    if (!recording || ['idle', 'disabled'].includes(recording.status)) {
+      setDeploymentRecordingStatus(t(checkbox?.checked ? 'deployRecordingEnabled' : 'deployRecordingIdle'));
+      return;
+    }
+    if (recording.status === 'recording') {
+      setDeploymentRecordingStatus(t('deployRecordingActive', { directory: recording.directory || '' }), 'active');
+      return;
+    }
+    if (recording.status === 'finalizing') {
+      setDeploymentRecordingStatus(t('deployRecordingFinalizing'), 'active');
+      return;
+    }
+    if (recording.status === 'saved') {
+      setDeploymentRecordingStatus(t('deployRecordingSaved', { path: recording.path || recording.directory || '' }));
+      return;
+    }
+    setDeploymentRecordingStatus(t('deployRecordingFailed', { error: recording.error || 'unknown' }), 'error');
   }
 
   const deploymentTrajectoryColors = [
     '#2563eb', '#e11d48', '#059669', '#d97706', '#7c3aed', '#0891b2', '#db2777', '#4f46e5',
   ];
+
+  function traceSmoothDeploymentPath(context, points) {
+    if (!points.length) return;
+    context.moveTo(points[0].x, points[0].y);
+    if (points.length === 1) return;
+    if (points.length === 2) {
+      context.lineTo(points[1].x, points[1].y);
+      return;
+    }
+    points.slice(0, -1).forEach((point, index) => {
+      const previous = points[Math.max(0, index - 1)];
+      const next = points[index + 1];
+      const after = points[Math.min(points.length - 1, index + 2)];
+      const minimumY = Math.min(point.y, next.y);
+      const maximumY = Math.max(point.y, next.y);
+      const clamp = (value, lower, upper) => Math.max(lower, Math.min(upper, value));
+      const control1X = clamp(
+        point.x + (next.x - previous.x) / 6,
+        point.x,
+        next.x,
+      );
+      const control2X = clamp(
+        next.x - (after.x - point.x) / 6,
+        point.x,
+        next.x,
+      );
+      const control1Y = clamp(point.y + (next.y - previous.y) / 6, minimumY, maximumY);
+      const control2Y = clamp(next.y - (after.y - point.y) / 6, minimumY, maximumY);
+      context.bezierCurveTo(control1X, control1Y, control2X, control2Y, next.x, next.y);
+    });
+  }
 
   function deploymentTrajectoryGroups(action, width) {
     const names = Array.from({ length: width }, (_, index) => action.names?.[index] || `action_${index + 1}`);
@@ -1554,7 +2698,7 @@
     return { names, groups };
   }
 
-  function deploymentTrajectoryData(action, chunk, history) {
+  function legacyDeploymentTrajectoryData(action, chunk, history) {
     const requested = $('#deploymentTrajectorySource')?.value || state.deploymentTrajectorySource || 'state';
     const windowSeconds = Number($('#deploymentTrajectoryWindow')?.value) || 20;
     const historyKey = ['state', 'planned', 'executed'].includes(requested) ? requested : null;
@@ -1587,19 +2731,19 @@
     };
   }
 
-  function renderCurrentDeploymentTrajectory() {
+  function renderLegacyCurrentDeploymentTrajectory() {
     state.deploymentTrajectorySource = $('#deploymentTrajectorySource')?.value || 'executed';
     const action = state.deploymentSnapshot?.modelIo?.output?.action || {};
     const chunk = Array.isArray(action.chunk) ? action.chunk.filter(Array.isArray) : [];
     renderDeploymentActionTrajectory(action, chunk, state.deploymentSnapshot?.trajectoryHistory);
   }
 
-  function renderDeploymentActionTrajectory(action, chunk, history = null) {
+  function renderLegacyDeploymentActionTrajectory(action, chunk, history = null) {
     const canvas = $('#deploymentActionTrajectory');
     const legend = $('#deploymentTrajectoryLegend');
     const groupContainer = $('#deploymentTrajectoryGroups');
     if (!canvas || !legend || !groupContainer) return;
-    const data = deploymentTrajectoryData(action, chunk, history);
+    const data = legacyDeploymentTrajectoryData(action, chunk, history);
     const rows = data.rows || [];
     const width = rows[0]?.length || 0;
     if (!width || !rows.length) {
@@ -1634,7 +2778,7 @@
     const margin = { left: 48, right: 18, top: 16, bottom: 30 };
     const plotWidth = cssWidth - margin.left - margin.right;
     const plotHeight = cssHeight - margin.top - margin.bottom;
-    const perDimension = ($('#deploymentTrajectoryScale')?.value || 'per') === 'per';
+    const perDimension = ($('#deploymentTrajectoryScale')?.value || 'shared') === 'per';
     const seriesStats = new Map(indexes.map((index) => {
       const values = rows.map((row) => Number(row[index])).filter(Number.isFinite);
       return [index, { minimum: Math.min(...values), maximum: Math.max(...values) }];
@@ -1711,6 +2855,342 @@
     context.fillText(`${data.xLabel}${perDimension ? ` · ${t('deployPerDimensionScale')}` : ''}`, margin.left + plotWidth / 2, cssHeight - 2);
   }
 
+  function deploymentTrajectoryRate(history, runtimeTiming) {
+    const configured = Number(
+      runtimeTiming?.targetRateHz
+      || state.deploymentSnapshot?.runtimeTiming?.targetRateHz,
+    );
+    if (Number.isFinite(configured) && configured > 0) return configured;
+    const planned = Array.isArray(history?.planned) ? history.planned : [];
+    const latestChunk = planned.reduce(
+      (maximum, point) => Math.max(maximum, Number(point?.chunk) || 0),
+      0,
+    );
+    const timestamps = planned
+      .filter((point) => !latestChunk || Number(point?.chunk) === latestChunk)
+      .map((point) => Number(point?.tNs))
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right);
+    const intervals = timestamps.slice(1)
+      .map((value, index) => value - timestamps[index])
+      .filter((value) => value > 0);
+    if (intervals.length) {
+      const period = intervals.sort((left, right) => left - right)[Math.floor(intervals.length / 2)];
+      if (period > 0) return 1e9 / period;
+    }
+    return 30;
+  }
+
+  function deploymentMergedTrajectoryData(action, chunk, history, runtimeTiming) {
+    const historyPoints = Array.isArray(history?.state) ? history.state : [];
+    const pointsByTimestamp = new Map();
+    historyPoints.concat(state.deploymentLiveStateHistory).forEach((point) => {
+      const timestamp = Number(point?.tNs);
+      if (Number.isFinite(timestamp) && Array.isArray(point?.values)) {
+        pointsByTimestamp.set(timestamp, { tNs: timestamp, values: point.values.map(Number) });
+      }
+    });
+    let actualPoints = Array.from(pointsByTimestamp.values())
+      .sort((left, right) => left.tNs - right.tNs);
+    const latest = actualPoints.length
+      ? actualPoints[actualPoints.length - 1].tNs
+      : Number(state.deploymentLiveStateCapturedNs);
+    if (Number.isFinite(latest)) {
+      const cutoff = latest - 10 * 1e9;
+      actualPoints = actualPoints.filter((point) => point.tNs >= cutoff);
+    }
+
+    let actualRows = actualPoints.map((point) => point.values);
+    let actualXValues = actualPoints.map((point) => (point.tNs - latest) / 1e9);
+    const snapshotState = state.deploymentSnapshot?.robotState;
+    if (!actualRows.length && Array.isArray(snapshotState?.values)) {
+      actualRows = [snapshotState.values.map(Number)];
+      actualXValues = [0];
+    }
+
+    const chunkWidth = chunk[0]?.length || 0;
+    const stateWidth = actualRows[actualRows.length - 1]?.length || 0;
+    const width = stateWidth || chunkWidth;
+    const preferredNames = state.deploymentLiveStateNames.length
+      ? state.deploymentLiveStateNames
+      : (history?.stateNames || snapshotState?.names || action.names || []);
+    const names = Array.from(
+      { length: width },
+      (_, index) => preferredNames[index] || action.names?.[index] || 'joint_' + (index + 1),
+    );
+    const units = Array.from(
+      { length: width },
+      (_, index) => state.deploymentLiveStateUnits[index]
+        || history?.stateUnits?.[index]
+        || snapshotState?.units?.[index]
+        || action.units?.[index]
+        || '',
+    );
+
+    const skipped = Math.min(
+      chunk.length,
+      Math.max(0, Number.parseInt(action?.skippedPrefixSteps, 10) || 0),
+    );
+    const configuredSteps = Number(state.deploymentSnapshot?.scheduler?.actionSteps);
+    let futureChunk = chunk.slice(skipped);
+    if (Number.isFinite(configuredSteps) && configuredSteps > 0) {
+      futureChunk = futureChunk.slice(0, configuredSteps);
+    }
+    const actionNames = Array.isArray(action?.names) ? action.names : [];
+    const actionIndexByName = new Map(actionNames.map((name, index) => [String(name), index]));
+    const sameWidth = chunkWidth === width;
+    const actionIndexes = names.map((name, index) => (
+      actionIndexByName.has(String(name))
+        ? actionIndexByName.get(String(name))
+        : (sameWidth ? index : -1)
+    ));
+    const predictedRows = futureChunk.map((row) => actionIndexes.map((actionIndex) => (
+      actionIndex >= 0 ? Number(row[actionIndex]) : Number.NaN
+    )));
+    const rateHz = deploymentTrajectoryRate(history, runtimeTiming);
+    const predictedXValues = predictedRows.map((_, index) => (index + 1) / rateHz);
+
+    return {
+      actualRows,
+      actualXValues,
+      predictedRows,
+      predictedXValues,
+      names,
+      units,
+      width,
+      rateHz,
+      futureSeconds: predictedXValues.at(-1) || 0,
+    };
+  }
+
+  function renderCurrentDeploymentTrajectory() {
+    const action = state.deploymentSnapshot?.modelIo?.output?.action || {};
+    const chunk = Array.isArray(action.chunk) ? action.chunk.filter(Array.isArray) : [];
+    renderDeploymentActionTrajectory(
+      action,
+      chunk,
+      state.deploymentSnapshot?.trajectoryHistory,
+      state.deploymentSnapshot?.runtimeTiming,
+    );
+  }
+
+  function renderDeploymentActionTrajectory(action, chunk, history = null, runtimeTiming = null) {
+    const canvas = $('#deploymentActionTrajectory');
+    const legend = $('#deploymentTrajectoryLegend');
+    const groupContainer = $('#deploymentTrajectoryGroups');
+    if (!canvas || !legend || !groupContainer) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const cssWidth = Math.max(320, Math.floor(rect.width || 800));
+    const cssHeight = Math.max(210, Math.floor(rect.height || 260));
+    const ratio = Math.min(2, window.devicePixelRatio || 1);
+    if (canvas.width !== Math.floor(cssWidth * ratio) || canvas.height !== Math.floor(cssHeight * ratio)) {
+      canvas.width = Math.floor(cssWidth * ratio);
+      canvas.height = Math.floor(cssHeight * ratio);
+    }
+    const context = canvas.getContext('2d');
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, cssWidth, cssHeight);
+
+    const data = deploymentMergedTrajectoryData(action, chunk, history, runtimeTiming);
+    if (!data.width) {
+      groupContainer.replaceChildren();
+      legend.innerHTML = '<span>' + escapeHtml(t('deployWaitingJointState')) + '</span>';
+      return;
+    }
+
+    const { names, groups } = deploymentTrajectoryGroups({ names: data.names }, data.width);
+    if (!groups.some((group) => group.id === state.deploymentTrajectoryGroup)) {
+      state.deploymentTrajectoryGroup = groups[0]?.id || 'all';
+    }
+    groupContainer.innerHTML = groups.map((group) =>
+      '<button type="button" data-trajectory-group="' + escapeAttr(group.id)
+      + '" class="' + (group.id === state.deploymentTrajectoryGroup ? 'active' : '')
+      + '">' + escapeHtml(group.label) + '</button>'
+    ).join('');
+    const selected = groups.find((group) => group.id === state.deploymentTrajectoryGroup) || groups[0];
+    const indexes = selected?.indexes || [];
+    legend.innerHTML = indexes.map((index, colorIndex) =>
+      '<span><i style="background:' + deploymentTrajectoryColors[colorIndex % deploymentTrajectoryColors.length]
+      + '"></i>' + escapeHtml(names[index]) + '</span>'
+    ).join('');
+
+    const margin = { left: 48, right: 18, top: 22, bottom: 34 };
+    const plotWidth = cssWidth - margin.left - margin.right;
+    const plotHeight = cssHeight - margin.top - margin.bottom;
+    const combinedRows = data.actualRows.concat(data.predictedRows);
+    const perDimension = ($('#deploymentTrajectoryScale')?.value || 'shared') === 'per';
+    const seriesStats = new Map(indexes.map((index) => {
+      const values = combinedRows.map((row) => Number(row[index])).filter(Number.isFinite);
+      return [index, {
+        minimum: values.length ? Math.min(...values) : 0,
+        maximum: values.length ? Math.max(...values) : 0,
+      }];
+    }));
+    const sharedValues = indexes.flatMap((index) => (
+      combinedRows.map((row) => Number(row[index])).filter(Number.isFinite)
+    ));
+    let minimum = perDimension ? 0 : Math.min(...sharedValues);
+    let maximum = perDimension ? 1 : Math.max(...sharedValues);
+    if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) {
+      minimum = perDimension ? 0 : -1;
+      maximum = 1;
+    }
+    const selectedUnits = new Set(
+      indexes.map((index) => String(data.units[index] || '').trim()).filter(Boolean),
+    );
+    const percentageScale = !perDimension
+      && selectedUnits.size === 1
+      && selectedUnits.has('%');
+    const radianScale = !perDimension
+      && selectedUnits.size === 1
+      && selectedUnits.has('rad');
+    if (percentageScale) {
+      minimum = 0;
+      maximum = 100;
+    } else if (!perDimension && minimum === maximum) {
+      const delta = radianScale ? 0.25 : Math.max(0.1, Math.abs(minimum) * 0.1);
+      minimum -= delta;
+      maximum += delta;
+    } else if (!perDimension && radianScale && maximum - minimum < 0.5) {
+      const center = (minimum + maximum) / 2;
+      minimum = center - 0.25;
+      maximum = center + 0.25;
+    } else if (!perDimension) {
+      const padding = (maximum - minimum) * 0.1;
+      minimum -= padding;
+      maximum += padding;
+    }
+
+    const xMinimum = -10;
+    const xMaximum = Math.max(0.5, data.futureSeconds);
+    const x = (seconds) => margin.left
+      + (seconds - xMinimum) / (xMaximum - xMinimum) * plotWidth;
+    const y = (value) => margin.top
+      + (maximum - value) / (maximum - minimum) * plotHeight;
+    const currentX = x(0);
+
+    context.fillStyle = 'rgba(37, 99, 235, 0.035)';
+    context.fillRect(currentX, margin.top, cssWidth - margin.right - currentX, plotHeight);
+    context.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+    context.lineWidth = 1;
+    for (let tick = 0; tick <= 4; tick += 1) {
+      const yy = margin.top + tick / 4 * plotHeight;
+      const value = maximum - tick / 4 * (maximum - minimum);
+      context.strokeStyle = '#e5eaf1';
+      context.setLineDash([]);
+      context.beginPath();
+      context.moveTo(margin.left, yy);
+      context.lineTo(cssWidth - margin.right, yy);
+      context.stroke();
+      context.fillStyle = '#64748b';
+      context.textAlign = 'right';
+      context.fillText(
+        perDimension ? Math.round(value * 100) + '%' : formatModelIoValue(value),
+        margin.left - 7,
+        yy + 3,
+      );
+    }
+    if (!perDimension && minimum < 0 && maximum > 0) {
+      context.strokeStyle = '#cbd5e1';
+      context.setLineDash([3, 4]);
+      context.beginPath();
+      context.moveTo(margin.left, y(0));
+      context.lineTo(cssWidth - margin.right, y(0));
+      context.stroke();
+    }
+    for (let tick = 0; tick <= 5; tick += 1) {
+      const seconds = xMinimum + tick / 5 * (xMaximum - xMinimum);
+      const xx = x(seconds);
+      context.strokeStyle = '#eef2f7';
+      context.setLineDash([]);
+      context.beginPath();
+      context.moveTo(xx, margin.top);
+      context.lineTo(xx, margin.top + plotHeight);
+      context.stroke();
+      context.fillStyle = '#94a3b8';
+      context.textAlign = 'center';
+      const label = Math.abs(seconds) < 0.05
+        ? t('deployNow')
+        : (seconds > 0 ? '+' : '') + seconds.toFixed(1) + 's';
+      context.fillText(label, xx, cssHeight - 13);
+    }
+
+    context.strokeStyle = '#64748b';
+    context.lineWidth = 1.2;
+    context.setLineDash([3, 4]);
+    context.beginPath();
+    context.moveTo(currentX, margin.top);
+    context.lineTo(currentX, margin.top + plotHeight);
+    context.stroke();
+    context.setLineDash([]);
+    context.fillStyle = '#475569';
+    context.textAlign = 'center';
+    context.fillText(t('deployNow'), currentX, 12);
+
+    const drawSeries = (rows, xValues, index, color, dashed, anchorValue = null) => {
+      const stats = seriesStats.get(index);
+      const plotValue = (value) => {
+        if (!perDimension) return value;
+        if (!stats || stats.minimum === stats.maximum) return 0.5;
+        return (value - stats.minimum) / (stats.maximum - stats.minimum);
+      };
+      const values = rows.map((row) => Number(row[index]));
+      const drawValues = anchorValue === null ? values : [Number(anchorValue)].concat(values);
+      const drawXValues = anchorValue === null ? xValues : [0].concat(xValues);
+      context.strokeStyle = color;
+      context.lineWidth = dashed ? 2 : 2.25;
+      context.lineJoin = 'round';
+      context.lineCap = 'round';
+      context.setLineDash(dashed ? [7, 5] : []);
+      context.globalAlpha = dashed ? 0.82 : 0.98;
+      context.beginPath();
+      let segment = [];
+      const flush = () => {
+        traceSmoothDeploymentPath(context, segment);
+        segment = [];
+      };
+      drawValues.forEach((value, pointIndex) => {
+        if (!Number.isFinite(value)) {
+          flush();
+          return;
+        }
+        segment.push({
+          x: x(drawXValues[pointIndex]),
+          y: y(plotValue(value)),
+        });
+      });
+      flush();
+      context.stroke();
+      context.globalAlpha = 1;
+      context.setLineDash([]);
+    };
+
+    indexes.forEach((index, colorIndex) => {
+      const color = deploymentTrajectoryColors[colorIndex % deploymentTrajectoryColors.length];
+      drawSeries(data.actualRows, data.actualXValues, index, color, false);
+      const latestActual = Number(data.actualRows.at(-1)?.[index]);
+      drawSeries(
+        data.predictedRows,
+        data.predictedXValues,
+        index,
+        color,
+        true,
+        Number.isFinite(latestActual) ? latestActual : null,
+      );
+    });
+
+    context.fillStyle = '#64748b';
+    context.textAlign = 'center';
+    const horizon = data.futureSeconds > 0 ? data.futureSeconds.toFixed(2) : '0.00';
+    context.fillText(
+      t('deployTrajectoryTimeline', { horizon })
+        + (perDimension ? ' · ' + t('deployPerDimensionScale') : ''),
+      margin.left + plotWidth / 2,
+      cssHeight - 2,
+    );
+  }
+
   function onDeploymentTrajectoryGroup(event) {
     const button = event.target.closest('[data-trajectory-group]');
     if (!button) return;
@@ -1718,7 +3198,12 @@
     const modelIo = state.deploymentSnapshot?.modelIo;
     const action = modelIo?.output?.action || {};
     const chunk = Array.isArray(action.chunk) ? action.chunk.filter(Array.isArray) : [];
-    renderDeploymentActionTrajectory(action, chunk, state.deploymentSnapshot?.trajectoryHistory);
+    renderDeploymentActionTrajectory(
+      action,
+      chunk,
+      state.deploymentSnapshot?.trajectoryHistory,
+      state.deploymentSnapshot?.runtimeTiming,
+    );
   }
 
   function renderDeploymentComponents(components) {
@@ -1816,7 +3301,6 @@
       browse(state.currentFolder);
     }
     try { renderConvertJobDock(); } catch {}
-    try { renderAugmentJobDock(); } catch {}
     try { renderConvertFidelity(); } catch {}
     try { if (!$('#exportDialog')?.classList.contains('hidden')) renderExportDialog(); } catch {}
     try { if (!$('#mergeDialog')?.classList.contains('hidden')) renderMergeDialog(); } catch {}
@@ -1827,7 +3311,6 @@
         renderQcPagination();
       }
     } catch {}
-    try { fillAugmentColorPresets(); syncAugmentFormVisibility(); } catch {}
     try {
       if ($('#deploymentRobotConfig')?.value.trim() && $('#deploymentModelConfig')?.value.trim()) {
         refreshDeploymentComposition(false).catch(() => {});
@@ -1853,6 +3336,15 @@
         $('#deploymentOfflineHint').textContent = t('deployOfflineCompared', {
           steps: action.comparedHorizon || 0,
           dimensions: action.names?.length || 0,
+        });
+      }
+      if (state.deploymentOfflineReplay) {
+        renderDeploymentOfflineReplay();
+        pauseDeploymentOfflineReplay();
+        $('#deploymentOfflineHint').textContent = t('deployOfflineReplayReady', {
+          episode: state.deploymentOfflineReplay.episode.episodeIndex,
+          frames: state.deploymentOfflineReplay.totalFrames,
+          fps: formatModelIoValue(state.deploymentOfflineReplay.fps),
         });
       }
     } catch {}
@@ -1999,47 +3491,6 @@
         showToast(error.message, true);
       }
     });
-    $('#closeAugment')?.addEventListener('click', closeAugmentDialog);
-    $('#runAugmentPreview')?.addEventListener('click', runAugmentPreview);
-    $('#startAugmentBatch')?.addEventListener('click', startAugmentBatch);
-    $('#augmentType')?.addEventListener('change', () => { syncAugmentFormVisibility(); invalidateAugmentPreview(); });
-    $('#augmentBrightnessMode')?.addEventListener('change', () => { syncAugmentFormVisibility(); invalidateAugmentPreview(); });
-    $('#augmentBatchScope')?.addEventListener('change', syncAugmentFormVisibility);
-    $('#augmentColorMode')?.addEventListener('change', () => { syncAugmentFormVisibility(); invalidateAugmentPreview(); });
-    $('#augmentApplyMode')?.addEventListener('change', () => { fillAugmentColorPresets(); invalidateAugmentPreview(); });
-    ['augmentBrightnessGain', 'augmentBrightnessGamma', 'augmentSamPrompts', 'augmentColorPreset',
-      'augmentColorCustom', 'augmentGpuId'].forEach((id) => {
-      $(`#${id}`)?.addEventListener('input', invalidateAugmentPreview);
-      $(`#${id}`)?.addEventListener('change', invalidateAugmentPreview);
-    });
-    $('#refreshAugmentJobs')?.addEventListener('click', () => refreshAugmentJobs().catch(() => {}));
-    $('#toggleAugmentJobs')?.addEventListener('click', () => {
-      $('#augmentJobDock')?.classList.toggle('collapsed');
-    });
-    $('#augmentJobList')?.addEventListener('click', async (event) => {
-      const cancelButton = event.target.closest('[data-cancel-augment-job]');
-      if (cancelButton) {
-        const jobId = cancelButton.dataset.cancelAugmentJob;
-        if (!jobId) return;
-        try {
-          await api(`/api/augment/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST', body: '{}' });
-          await refreshAugmentJobs();
-        } catch (error) {
-          showToast(error.message, true);
-        }
-        return;
-      }
-      const button = event.target.closest('[data-dismiss-augment-job]');
-      if (!button) return;
-      const jobId = button.dataset.dismissAugmentJob;
-      if (!jobId) return;
-      try {
-        await api(`/api/augment/jobs/${encodeURIComponent(jobId)}/dismiss`, { method: 'POST', body: '{}' });
-        await refreshAugmentJobs();
-      } catch (error) {
-        showToast(error.message, true);
-      }
-    });
     $('#saveEpisodeLabel')?.addEventListener('click', saveEpisodeLabel);
     $('#intervalBreakpoint')?.addEventListener('click', addIntervalBreakpoint);
     $('#undoBreakpoint')?.addEventListener('click', undoIntervalBreakpoint);
@@ -2091,16 +3542,16 @@
   }
 
   function setWorkspaceMode(mode) {
-    const allowed = new Set(['browse', 'annotate', 'filter', 'convert', 'merge', 'augment']);
+    const allowed = new Set(['browse', 'annotate', 'filter', 'convert', 'merge']);
     const next = allowed.has(mode) ? mode : 'browse';
-    // Convert / merge / augment are actions: open a dialog and stay on the prior work mode.
+    // Convert and merge are actions: open a dialog and stay on the prior work mode.
     if (next === 'convert') {
       if (state.dataset) {
         openConvertDialog(state.dataset.path, state.dataset.format || null);
       } else {
         showToast(t('needConvertDataset'), true);
       }
-      const fallback = state.workspaceMode && !['convert', 'merge', 'augment'].includes(state.workspaceMode)
+      const fallback = state.workspaceMode && !['convert', 'merge'].includes(state.workspaceMode)
         ? state.workspaceMode
         : 'browse';
       applyWorkspaceMode(fallback);
@@ -2112,19 +3563,7 @@
       } else {
         showToast(t('needMergeDataset'), true);
       }
-      const fallback = state.workspaceMode && !['convert', 'merge', 'augment'].includes(state.workspaceMode)
-        ? state.workspaceMode
-        : 'browse';
-      applyWorkspaceMode(fallback);
-      return;
-    }
-    if (next === 'augment') {
-      if (state.dataset) {
-        openAugmentDialog(state.dataset.path, state.dataset.format || null);
-      } else {
-        showToast(t('needAugmentDataset'), true);
-      }
-      const fallback = state.workspaceMode && !['convert', 'merge', 'augment'].includes(state.workspaceMode)
+      const fallback = state.workspaceMode && !['convert', 'merge'].includes(state.workspaceMode)
         ? state.workspaceMode
         : 'browse';
       applyWorkspaceMode(fallback);
@@ -2185,7 +3624,6 @@
             </button>
             <div class="folder-actions">
               <button class="folder-convert" data-convert="${escapeAttr(result.path)}" data-format="${escapeAttr(result.format || '')}">${escapeHtml(t('convertFormat'))}</button>
-              <button class="folder-augment" data-augment="${escapeAttr(result.path)}" data-format="${escapeAttr(result.format || '')}">${escapeHtml(t('augmentFormat'))}</button>
             </div>
           </div>` : '',
         ...result.entries.map((entry) => {
@@ -2201,7 +3639,6 @@
             </button>
             ${entry.isDataset ? `<div class="folder-actions">
               <button class="folder-convert" data-convert="${escapeAttr(entry.path)}" data-format="${escapeAttr(entry.format || '')}">${escapeHtml(t('convertFormat'))}</button>
-              <button class="folder-augment" data-augment="${escapeAttr(entry.path)}" data-format="${escapeAttr(entry.format || '')}">${escapeHtml(t('augmentFormat'))}</button>
             </div>` : ''}
           </div>`;
         })
@@ -2211,10 +3648,6 @@
       $$('[data-convert]').forEach((button) => button.addEventListener('click', (event) => {
         event.stopPropagation();
         openConvertDialog(button.dataset.convert, button.dataset.format || null);
-      }));
-      $$('[data-augment]').forEach((button) => button.addEventListener('click', (event) => {
-        event.stopPropagation();
-        openAugmentDialog(button.dataset.augment, button.dataset.format || null);
       }));
     } catch (error) {
       showToast(error.message, true);
@@ -4613,499 +6046,6 @@
     if (!token) return url;
     const join = url.includes('?') ? '&' : '?';
     return `${url}${join}token=${encodeURIComponent(token)}`;
-  }
-
-  async function ensureAugmentOptions() {
-    state.augmentOptions = await api('/api/augment/options');
-    return state.augmentOptions;
-  }
-
-  function syncAugmentFormVisibility() {
-    const augType = $('#augmentType')?.value || 'brightness';
-    const isColor = augType === 'color';
-    const isBrightness = augType === 'brightness';
-    $('#augmentColorFields')?.classList.toggle('hidden', !isColor);
-    $('#augmentBrightnessFields')?.classList.toggle('hidden', !isBrightness);
-    const fixed = $('#augmentColorMode')?.value === 'fixed';
-    $('#augmentFixedColorRow')?.classList.toggle('hidden', !fixed);
-    const manual = $('#augmentBrightnessMode')?.value === 'manual';
-    $('#augmentBrightnessManualRow')?.classList.toggle('hidden', !manual);
-    const random = $('#augmentBatchScope')?.value === 'random';
-    $('#augmentRandomCountRow')?.classList.toggle('hidden', !random);
-  }
-
-  function fillAugmentColorPresets() {
-    const select = $('#augmentColorPreset');
-    const options = state.augmentOptions;
-    if (!select || !options) return;
-    const applyMode = $('#augmentApplyMode')?.value || 'object_recolor';
-    const palette = applyMode === 'background_replace' ? (options.bgColors || {}) : (options.clothColors || {});
-    const previous = select.value;
-    select.innerHTML = Object.entries(palette).map(([name, rgb]) => (
-      `<option value="${escapeAttr(name)}" data-rgb="${escapeAttr(rgb.join(','))}">${escapeHtml(name)}</option>`
-    )).join('');
-    if (previous && palette[previous]) select.value = previous;
-  }
-
-  async function openAugmentDialog(pathOrEvent, formatHint) {
-    let path = null;
-    let format = null;
-    if (typeof pathOrEvent === 'string') {
-      path = pathOrEvent;
-      format = formatHint || null;
-    } else if (state.dataset) {
-      path = state.dataset.path;
-      format = state.dataset.format || null;
-    }
-    if (!path) return showToast(t('needAugmentDataset'), true);
-
-    try {
-      await ensureAugmentOptions();
-    } catch (error) {
-      return showToast(error.message, true);
-    }
-
-    state.augmentContext = { path, format: format || state.augmentContext?.format || null };
-    const colorCapability = state.augmentOptions?.capabilities?.color;
-    const colorOption = $('#augmentType')?.querySelector('option[value="color"]');
-    if (colorOption) colorOption.disabled = !colorCapability?.available;
-    const availability = $('#augmentAvailability');
-    if (availability) {
-      availability.textContent = colorCapability?.available
-        ? t('augmentColorReady')
-        : t('augmentColorUnavailable', { reason: colorCapability?.reason || t('augmentDependencyMissing') });
-    }
-    state.augmentPreviewOk = false;
-    state.lastAugmentPreviewJobId = null;
-    $('#augmentSource').textContent = path;
-    $('#augmentOutput').value = `${path}_augmented`;
-    $('#augmentType').value = 'brightness';
-    $('#augmentBrightnessMode').value = 'auto';
-    $('#augmentBrightnessGain').value = '1.00';
-    $('#augmentBrightnessGamma').value = '1.00';
-    $('#augmentColorMode').value = 'random';
-    $('#augmentApplyMode').value = 'object_recolor';
-    $('#augmentSamPrompts').value = '';
-    $('#augmentGpuId').value = '0';
-    const ep = Number.isInteger(state.currentEpisode) ? state.currentEpisode : 0;
-    $('#augmentPreviewEpisode').value = String(ep);
-    $('#augmentBatchScope').value = 'all';
-    const totalEps = Array.isArray(state.dataset?.episodes) ? state.dataset.episodes.length : 0;
-    $('#augmentRandomCount').value = String(Math.min(10, Math.max(1, totalEps || 10)));
-    $('#startAugmentBatch').disabled = true;
-    $('#augmentPreviewGrid').innerHTML = '';
-    $('#augmentPreviewMeta')?.classList.add('hidden');
-    $('#augmentProgress')?.classList.add('hidden');
-    fillAugmentColorPresets();
-    syncAugmentFormVisibility();
-    $('#augmentDialog')?.classList.remove('hidden');
-  }
-
-  function closeAugmentDialog() {
-    $('#augmentDialog')?.classList.add('hidden');
-  }
-
-  function invalidateAugmentPreview() {
-    if (!state.augmentPreviewOk) return;
-    state.augmentPreviewOk = false;
-    state.lastAugmentPreviewJobId = null;
-    const button = $('#startAugmentBatch');
-    if (button) button.disabled = true;
-    showToast(t('augmentPreviewInvalidated'));
-  }
-
-  function collectAugmentPayload(mode) {
-    const ctx = state.augmentContext || (state.dataset ? { path: state.dataset.path, format: state.dataset.format } : null);
-    if (!ctx?.path) throw new Error(t('needAugmentDataset'));
-    const augType = $('#augmentType').value;
-    const promptsRaw = $('#augmentSamPrompts').value || '';
-    if (augType === 'color' && !promptsRaw.trim()) {
-      throw new Error(t('needSamPrompts'));
-    }
-    const colorMode = $('#augmentColorMode').value || 'random';
-    let colorName = null;
-    let colorRgb = null;
-    if (augType === 'color' && colorMode === 'fixed') {
-      const custom = ($('#augmentColorCustom').value || '').trim();
-      if (custom) {
-        const parts = custom.split(/[,\s]+/).map(Number).filter((n) => Number.isFinite(n));
-        if (parts.length >= 3) {
-          colorRgb = parts.slice(0, 3).map((n) => Math.max(0, Math.min(255, Math.round(n))));
-          colorName = 'custom';
-        }
-      }
-      if (!colorRgb) {
-        const preset = $('#augmentColorPreset');
-        colorName = preset?.value || null;
-        const rgbAttr = preset?.selectedOptions?.[0]?.dataset?.rgb;
-        if (rgbAttr) colorRgb = rgbAttr.split(',').map(Number);
-      }
-    }
-    const brightnessMode = $('#augmentBrightnessMode')?.value || 'auto';
-    let brightnessGain = Number($('#augmentBrightnessGain')?.value);
-    let brightnessGamma = Number($('#augmentBrightnessGamma')?.value);
-    if (!Number.isFinite(brightnessGain)) brightnessGain = 1.0;
-    if (!Number.isFinite(brightnessGamma)) brightnessGamma = 1.0;
-    const previewEpisode = Number($('#augmentPreviewEpisode').value);
-    const payload = {
-      dataset: ctx.path,
-      mode,
-      augType,
-      applyMode: $('#augmentApplyMode').value || 'object_recolor',
-      samPrompts: promptsRaw,
-      colorMode,
-      colorName,
-      colorRgb,
-      brightnessMode,
-      brightnessGain: brightnessMode === 'manual' ? brightnessGain : null,
-      brightnessGamma: brightnessMode === 'manual' ? brightnessGamma : null,
-      gpuId: Number($('#augmentGpuId').value) || 0,
-      previewEpisode: Number.isFinite(previewEpisode) ? previewEpisode : undefined,
-      targetFormat: ctx.format === 'lerobot_v21' ? 'lerobot_v21' : 'lerobot_v3',
-    };
-    if (mode === 'batch') {
-      const output = $('#augmentOutput').value.trim();
-      if (!output) throw new Error(t('needOutputPath'));
-      payload.output = output;
-      const scope = resolveAugmentEpisodeScope();
-      payload.episodes = scope.episodes;
-      payload.sampleCount = scope.sampleCount;
-      payload.previewJobId = state.lastAugmentPreviewJobId;
-    }
-    return payload;
-  }
-
-  function resolveAugmentEpisodeScope() {
-    const scope = $('#augmentBatchScope')?.value || 'all';
-    if (scope === 'current') {
-      if (!Number.isInteger(state.currentEpisode)) return { episodes: null, sampleCount: null };
-      return { episodes: [state.currentEpisode], sampleCount: null };
-    }
-    if (scope === 'filtered') {
-      return {
-        episodes: (state.filtered || []).map((ep) => ep.episodeIndex),
-        sampleCount: null,
-      };
-    }
-    if (scope === 'pass') {
-      return {
-        episodes: Object.entries(state.states || {})
-          .filter(([, value]) => value === 'pass')
-          .map(([key]) => Number(key))
-          .filter((n) => Number.isInteger(n)),
-        sampleCount: null,
-      };
-    }
-    if (scope === 'random') {
-      const count = Math.floor(Number($('#augmentRandomCount')?.value));
-      if (!Number.isFinite(count) || count < 1) {
-        throw new Error(t('needRandomCount'));
-      }
-      const pool = (state.dataset?.episodes || state.filtered || []).map((ep) => ep.episodeIndex);
-      if (pool.length) {
-        const shuffled = pool.slice();
-        for (let i = shuffled.length - 1; i > 0; i -= 1) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-        }
-        return { episodes: shuffled.slice(0, Math.min(count, shuffled.length)), sampleCount: null };
-      }
-      // Dataset not loaded in UI — let backend sample.
-      return { episodes: null, sampleCount: count };
-    }
-    return { episodes: null, sampleCount: null };
-  }
-
-  async function runAugmentPreview() {
-    let payload;
-    try {
-      payload = collectAugmentPayload('preview');
-    } catch (error) {
-      return showToast(error.message, true);
-    }
-    const progress = $('#augmentProgress');
-    progress?.classList.remove('hidden');
-    if (progress) {
-      progress.querySelector('i').style.width = '10%';
-      progress.querySelector('span').textContent = t('augmentPreparing');
-    }
-    $('#runAugmentPreview').disabled = true;
-    $('#startAugmentBatch').disabled = true;
-    state.augmentPreviewOk = false;
-    try {
-      const job = await api('/api/augment/preview', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-      state.lastAugmentPreviewJobId = job.jobId;
-      showToast(t('augmentPreviewStarted', { id: String(job.jobId || '').slice(0, 8) }));
-      trackAugmentJob(job.jobId);
-      await waitAugmentJob(job.jobId, (live) => {
-        if (!progress) return;
-        progress.querySelector('i').style.width = `${Math.round((Number(live.progress) || 0.1) * 100)}%`;
-        progress.querySelector('span').textContent = live.message || t('augmentPreparing');
-      });
-      const finalJob = await api(`/api/augment/status/${encodeURIComponent(job.jobId)}`);
-      if (finalJob.status !== 'completed') {
-        throw new Error(finalJob.message || t('augmentPreviewFailed'));
-      }
-      renderAugmentPreview(finalJob.result || {});
-      state.augmentPreviewOk = true;
-      $('#startAugmentBatch').disabled = false;
-      showToast(t('augmentPreviewReady'));
-    } catch (error) {
-      showToast(error.message || t('augmentPreviewFailed'), true);
-      state.augmentPreviewOk = false;
-      $('#startAugmentBatch').disabled = true;
-    } finally {
-      $('#runAugmentPreview').disabled = false;
-    }
-  }
-
-  function renderAugmentPreview(result) {
-    const grid = $('#augmentPreviewGrid');
-    const meta = $('#augmentPreviewMeta');
-    if (!grid) return;
-    const cameras = result.cameras || [];
-    const notes = [];
-    if (result.colorName || result.colorRgb) {
-      notes.push(t('augmentColorUsed', {
-        name: result.colorName || '—',
-        rgb: (result.colorRgb || []).join(','),
-      }));
-    }
-    if (result.augType === 'brightness' || result.brightnessGain != null || result.brightnessGamma != null) {
-      notes.push(t('augmentBrightnessUsed', {
-        mode: result.brightnessMode === 'manual' ? t('augmentBrightnessManual') : t('augmentBrightnessAuto'),
-        gain: result.brightnessGain != null ? Number(result.brightnessGain).toFixed(3) : '—',
-        gamma: result.brightnessGamma != null ? Number(result.brightnessGamma).toFixed(3) : '—',
-      }));
-    }
-    const brightnessQa = result.meta?.brightness?.cameras?._qa;
-    if (brightnessQa?.status === 'warning' && brightnessQa.camera_p50_spread != null) {
-      notes.push(t('augmentBrightnessQaWarning', {
-        spread: Number(brightnessQa.camera_p50_spread).toFixed(1),
-      }));
-    }
-    if (notes.length) {
-      meta?.classList.remove('hidden');
-      if (meta) meta.textContent = notes.join(' · ');
-    } else {
-      meta?.classList.add('hidden');
-    }
-    if (!cameras.length) {
-      grid.innerHTML = `<div class="empty">${escapeHtml(t('augmentPreviewFailed'))}</div>`;
-      return;
-    }
-
-    const shortName = (name) => {
-      const raw = String(name || '');
-      const parts = raw.split('.');
-      return parts[parts.length - 1] || raw;
-    };
-
-    const tabs = cameras.length > 1
-      ? `<div class="augment-preview-tabs" role="tablist">
-          ${cameras.map((cam, index) => `
-            <button type="button" class="augment-preview-tab${index === 0 ? ' active' : ''}" data-preview-tab="${index}" role="tab" aria-selected="${index === 0 ? 'true' : 'false'}">
-              ${escapeHtml(shortName(cam.camera))}
-            </button>`).join('')}
-        </div>`
-      : '';
-
-    const panels = cameras.map((cam, camIndex) => {
-      const group = `aug-preview-${camIndex}`;
-      const hasVideo = Boolean(cam.originalVideoUrl || cam.resultVideoUrl);
-      const maskBlock = (cam.maskVideoUrl || cam.maskUrl)
-        ? `<div class="augment-preview-mask">
-            <div class="augment-preview-label">${escapeHtml(t(cam.maskVideoUrl ? 'augmentMaskVideo' : 'augmentMask'))}</div>
-            ${cam.maskVideoUrl
-              ? `<video class="augment-preview-video" data-sync-group="${escapeAttr(group)}" controls playsinline muted preload="metadata" poster="${escapeAttr(authedAssetUrl(cam.maskUrl || ''))}" src="${escapeAttr(authedAssetUrl(cam.maskVideoUrl))}"></video>`
-              : `<img class="augment-preview-still" src="${escapeAttr(authedAssetUrl(cam.maskUrl))}" alt="mask">`}
-          </div>`
-        : '';
-
-      const pair = hasVideo
-        ? `<div class="augment-preview-pair">
-            <figure>
-              <div class="augment-preview-label">${escapeHtml(t('augmentOriginalVideo'))}</div>
-              <video class="augment-preview-video" data-sync-group="${escapeAttr(group)}" controls playsinline muted preload="metadata" poster="${escapeAttr(authedAssetUrl(cam.originalUrl || ''))}" src="${escapeAttr(authedAssetUrl(cam.originalVideoUrl))}"></video>
-            </figure>
-            <figure>
-              <div class="augment-preview-label">${escapeHtml(t('augmentResultVideo'))}</div>
-              <video class="augment-preview-video" data-sync-group="${escapeAttr(group)}" controls playsinline muted preload="metadata" poster="${escapeAttr(authedAssetUrl(cam.resultUrl || ''))}" src="${escapeAttr(authedAssetUrl(cam.resultVideoUrl))}"></video>
-            </figure>
-          </div>`
-        : `<div class="augment-preview-pair">
-            <figure>
-              <div class="augment-preview-label">${escapeHtml(t('augmentOriginal'))}</div>
-              <img class="augment-preview-still" src="${escapeAttr(authedAssetUrl(cam.originalUrl))}" alt="original">
-            </figure>
-            <figure>
-              <div class="augment-preview-label">${escapeHtml(t('augmentResult'))}</div>
-              <img class="augment-preview-still" src="${escapeAttr(authedAssetUrl(cam.resultUrl))}" alt="result">
-            </figure>
-          </div>`;
-
-      return `<section class="augment-preview-panel${camIndex === 0 ? ' active' : ''}" data-preview-panel="${camIndex}">
-        <div class="augment-preview-cam-title" title="${escapeAttr(cam.camera || '')}">${escapeHtml(cam.camera || '')}</div>
-        ${pair}
-        ${maskBlock}
-      </section>`;
-    }).join('');
-
-    grid.innerHTML = `<div class="augment-preview-shell">${tabs}<div class="augment-preview-panels">${panels}</div></div>`;
-    grid.querySelectorAll('[data-preview-tab]').forEach((button) => {
-      button.addEventListener('click', () => {
-        const index = button.dataset.previewTab;
-        grid.querySelectorAll('video').forEach((video) => {
-          try { video.pause(); } catch {}
-        });
-        grid.querySelectorAll('[data-preview-tab]').forEach((item) => {
-          const on = item.dataset.previewTab === index;
-          item.classList.toggle('active', on);
-          item.setAttribute('aria-selected', on ? 'true' : 'false');
-        });
-        grid.querySelectorAll('[data-preview-panel]').forEach((panel) => {
-          panel.classList.toggle('active', panel.dataset.previewPanel === index);
-        });
-      });
-    });
-    bindAugmentPreviewVideoSync(grid);
-  }
-
-  function bindAugmentPreviewVideoSync(root) {
-    const videos = Array.from(root.querySelectorAll('video[data-sync-group]'));
-    if (!videos.length) return;
-    const groups = new Map();
-    videos.forEach((video) => {
-      const key = video.dataset.syncGroup;
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(video);
-    });
-    groups.forEach((peers) => {
-      peers.forEach((video) => {
-        video.addEventListener('play', () => {
-          peers.forEach((other) => {
-            if (other !== video && other.paused) other.play().catch(() => {});
-          });
-        });
-        video.addEventListener('pause', () => {
-          peers.forEach((other) => {
-            if (other !== video && !other.paused) other.pause();
-          });
-        });
-        video.addEventListener('seeked', () => {
-          peers.forEach((other) => {
-            if (other !== video && Math.abs((other.currentTime || 0) - (video.currentTime || 0)) > 0.12) {
-              try { other.currentTime = video.currentTime; } catch {}
-            }
-          });
-        });
-      });
-    });
-  }
-
-  async function startAugmentBatch() {
-    if (!state.augmentPreviewOk) return showToast(t('needAugmentPreview'), true);
-    let payload;
-    try {
-      payload = collectAugmentPayload('batch');
-    } catch (error) {
-      return showToast(error.message, true);
-    }
-    $('#startAugmentBatch').disabled = true;
-    try {
-      const job = await api('/api/augment/start', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-      showToast(t('augmentBatchStarted', { id: String(job.jobId || '').slice(0, 8) }));
-      closeAugmentDialog();
-      await refreshAugmentJobs();
-      trackAugmentJob(job.jobId);
-    } catch (error) {
-      showToast(error.message, true);
-      $('#startAugmentBatch').disabled = false;
-    }
-  }
-
-  const augmentJobStatusSeen = new Map();
-  const augmentPoller = createJobPoller({
-    refresh: () => refreshAugmentJobs(),
-    isActive: () => (state.augmentJobs || []).some((job) => job.status === 'queued' || job.status === 'running'),
-  });
-
-  function trackAugmentJob(jobId) {
-    augmentPoller.track(jobId);
-  }
-
-  async function waitAugmentJob(jobId, onUpdate) {
-    for (;;) {
-      const job = await api(`/api/augment/status/${encodeURIComponent(jobId)}`);
-      onUpdate?.(job);
-      if (job.status === 'completed' || job.status === 'failed') return job;
-      await new Promise((resolve) => setTimeout(resolve, 1200));
-    }
-  }
-
-  async function refreshAugmentJobs() {
-    const result = await api('/api/augment/jobs?limit=20');
-    const jobs = result.jobs || [];
-    state.augmentJobs = jobs;
-    augmentPoller.tracked.clear();
-    jobs.forEach((job) => {
-      const prev = augmentJobStatusSeen.get(job.jobId);
-      augmentJobStatusSeen.set(job.jobId, job.status);
-      if (job.status === 'queued' || job.status === 'running') augmentPoller.tracked.add(job.jobId);
-      if (prev && prev !== job.status) {
-        if (job.status === 'completed' && job.mode !== 'preview') {
-          showToast(t('augmentDone', { output: job.result?.output || job.output || '' }));
-        } else if (job.status === 'failed' && job.mode !== 'preview') {
-          showToast(job.message || t('augmentFailed'), true);
-        } else if (job.status === 'cancelled' && job.mode !== 'preview') {
-          showToast(job.message || t('augmentCancelled'));
-        }
-      }
-    });
-    renderAugmentJobDock();
-    if (augmentPoller.tracked.size) augmentPoller.ensure();
-  }
-
-  function renderAugmentJobDock() {
-    const dock = $('#augmentJobDock');
-    const list = $('#augmentJobList');
-    if (!dock || !list) return;
-    const jobs = (state.augmentJobs || []).filter((job) => job.mode !== 'preview' || job.status === 'running' || job.status === 'queued');
-    if (!jobs.length) {
-      dock.classList.add('hidden');
-      list.innerHTML = '';
-      return;
-    }
-    dock.classList.remove('hidden');
-    list.innerHTML = jobs.map((job) => {
-      const pct = Math.max(0, Math.min(100, Math.round((Number(job.progress) || 0) * 100)));
-      const status = job.status || 'unknown';
-      const shortId = String(job.jobId || '').slice(0, 8);
-      const src = String(job.dataset || '').split('/').pop() || job.dataset || '';
-      const detail = job.total ? `${job.current || 0}/${job.total}` : '';
-      const resultPath = job.result?.output || job.output || '';
-      const canDismiss = status === 'completed' || status === 'failed' || status === 'cancelled';
-      const dismissBtn = canDismiss
-        ? `<button type="button" class="convert-job-dismiss" data-dismiss-augment-job="${escapeAttr(job.jobId)}">${escapeHtml(t('dismiss'))}</button>`
-        : `<button type="button" class="convert-job-dismiss" data-cancel-augment-job="${escapeAttr(job.jobId)}">${escapeHtml(t('cancel'))}</button>`;
-      const kind = job.mode === 'preview' ? 'preview' : (job.augType || 'augment');
-      return `<div class="convert-job-item status-${escapeAttr(status)}">
-        <div class="convert-job-top">
-          <strong>${escapeHtml(shortId)}</strong>
-          <span class="convert-job-status">${escapeHtml(statusLabel(status))}</span>
-          ${dismissBtn}
-        </div>
-        <div class="convert-job-meta">${escapeHtml(src)} · ${escapeHtml(kind)}${detail ? ` · ${escapeHtml(detail)}` : ''}</div>
-        <div class="convert-job-bar"><i style="width:${pct}%"></i></div>
-        <div class="convert-job-msg">${escapeHtml(job.message || '')}${status === 'completed' && resultPath ? `<br><span class="muted">${escapeHtml(resultPath)}</span>` : ''}</div>
-      </div>`;
-    }).join('');
   }
 
   function renderLabelPanel() {

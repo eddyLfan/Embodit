@@ -8,7 +8,7 @@ A camera's pixels can live in three places depending on the dataset format:
 - a directory of image files.
 
 ``episode_frame_source`` normalizes all of them into a :class:`FrameSource`
-so consumers (augment, convert) do not care where frames come from.
+so conversion and QC consumers do not care where frames come from.
 """
 
 from __future__ import annotations
@@ -205,7 +205,7 @@ def episode_frame_source(
             return None
 
     if cam.kind == "topic":
-        # Augmentation/conversion only needs frames, so avoid a full temporary
+        # Frame consumers only need decoded frames, so avoid a full temporary
         # MP4 transcode before a short preview can begin.
         stream = getattr(adapter, "iter_topic_frames", None)
         if stream is not None and cam.topic:

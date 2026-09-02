@@ -3,6 +3,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
+from PIL import Image
 
 from deploy.assets.model_adapters import LeRobotAdapter, OpenPIAdapter, StarVLAAdapter, native_observation
 
@@ -65,6 +66,108 @@ def test_openpi_adapter_loads_and_predicts_from_checkpoint(monkeypatch) -> None:
     assert adapter.specification["action_horizon"] == 50
     assert received["action_horizon"] == 50
     assert actions.tolist() == [[1.0, 2.0]]
+
+
+def test_openpi_adapter_can_override_checkpoint_norm_stats_asset(monkeypatch) -> None:
+    @dataclasses.dataclass(frozen=True)
+    class ModelConfig:
+        action_horizon: int = 50
+
+    @dataclasses.dataclass(frozen=True)
+    class AssetsConfig:
+        asset_id: str | None = None
+
+    @dataclasses.dataclass(frozen=True)
+    class DataFactory:
+        assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
+
+    @dataclasses.dataclass(frozen=True)
+    class TrainConfig:
+        model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
+        data: DataFactory = dataclasses.field(default_factory=DataFactory)
+
+    class Policy:
+        metadata = {}
+
+    received = {}
+
+    def create_trained_policy(config, *_args, **_kwargs):
+        received["asset_id"] = config.data.assets.asset_id
+        return Policy()
+
+    training_config = SimpleNamespace(get_config=lambda _name: TrainConfig())
+    policy_config = SimpleNamespace(create_trained_policy=create_trained_policy)
+    _module(monkeypatch, "openpi")
+    _module(monkeypatch, "openpi.policies", policy_config=policy_config)
+    _module(monkeypatch, "openpi.training", config=training_config)
+
+    adapter = OpenPIAdapter()
+    adapter.load(
+        "/root/checkpoints/astribot/10000",
+        config_name="pi05_astribot_full",
+        norm_stats_asset_id="astribot/pick_block_into_basket_fix",
+    )
+
+    assert received["asset_id"] == "astribot/pick_block_into_basket_fix"
+    assert adapter.specification["norm_stats_asset_id"] == (
+        "astribot/pick_block_into_basket_fix"
+    )
+
+
+def test_openpi_adapter_can_match_checkpoint_training_image_resize(monkeypatch) -> None:
+    @dataclasses.dataclass(frozen=True)
+    class ModelConfig:
+        action_horizon: int = 50
+
+    @dataclasses.dataclass(frozen=True)
+    class TrainConfig:
+        model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
+
+    received = {}
+
+    class Policy:
+        metadata = {}
+
+        def infer(self, observation):
+            received.update(observation)
+            return {"actions": np.asarray([[1.0, 2.0]])}
+
+    training_config = SimpleNamespace(get_config=lambda _name: TrainConfig())
+    policy_config = SimpleNamespace(create_trained_policy=lambda *_args, **_kwargs: Policy())
+    _module(monkeypatch, "openpi")
+    _module(monkeypatch, "openpi.policies", policy_config=policy_config)
+    _module(monkeypatch, "openpi.training", config=training_config)
+
+    source = np.asarray(
+        [
+            [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]],
+            [[0, 0, 0], [64, 64, 64], [128, 128, 128], [192, 192, 192]],
+        ],
+        dtype=np.uint8,
+    )
+    expected = np.asarray(Image.fromarray(source).resize((3, 3), Image.Resampling.BICUBIC))
+
+    adapter = OpenPIAdapter()
+    adapter.load(
+        "/root/checkpoints/astribot/215000",
+        config_name="pi05_astribot_full",
+        image_preprocessing={
+            "mode": "stretch",
+            "width": 3,
+            "height": 3,
+            "resample": "bicubic",
+        },
+    )
+    adapter.predict({"observation/image": source, "observation/state": [0.1, 0.2]})
+
+    assert received["observation/image"].shape == (3, 3, 3)
+    assert np.array_equal(received["observation/image"], expected)
+    assert adapter.specification["image_preprocessing"] == {
+        "mode": "stretch",
+        "width": 3,
+        "height": 3,
+        "resample": "bicubic",
+    }
 
 
 def test_lerobot_adapter_uses_checkpoint_embedded_config(monkeypatch) -> None:

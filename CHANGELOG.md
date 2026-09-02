@@ -11,8 +11,7 @@ First open-source release candidate.
 
 - Local workspace for LeRobot v2.1/v3, recognized HDF5 layouts, and MCAP data.
 - Manual review decisions, fixed JSONL label sidecars, automatic QC reports,
-  native-format subsets, cross-format conversion, strict merge, and visual
-  augmentation with optional SAM3-assisted effects.
+  native-format subsets, cross-format conversion, and strict merge.
 - Composable Robot/Model Configs, Recipe v2 validation, SSH/systemd
   orchestration, direct local Robot Host execution, ROS readiness, Dry Run,
   offline single-frame evaluation, Live mode, monitoring, rollback, and software
@@ -36,8 +35,6 @@ First open-source release candidate.
 - Prevented stale workers from reviving terminal jobs and tightened cleanup of
   incomplete staging products.
 - Prevented path traversal and unsafe output/sidecar targeting across data APIs.
-- Allowed CPU-only brightness augmentation without color-augmentation CUDA/GPU
-  validation.
 - Hardened offline evaluation concurrency, deployment teardown, action
   validation, and error recovery.
 

@@ -117,14 +117,24 @@ def test_managed_http_protocol_is_internal_and_operational(tmp_path: Path) -> No
         with urllib.request.urlopen(base + "/health", timeout=2) as response:
             assert json.loads(response.read())["ready"] is True
 
-        body = json.dumps({"observations": {"joints": [0.1, 0.2]}}).encode()
+        body = json.dumps(
+            {
+                "protocolVersion": 2,
+                "sequence": 7,
+                "observations": {"joints": [0.1, 0.2]},
+            }
+        ).encode()
         request = urllib.request.Request(
             base + "/infer",
             data=body,
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=2) as response:
-            assert json.loads(response.read())["action"]["values"] == [[0.1, 0.2]]
+            result = json.loads(response.read())
+        assert result["action"]["values"] == [[0.1, 0.2]]
+        assert result["protocolVersion"] == 2
+        assert result["sequence"] == 7
+        assert result["metrics"]["serverInferenceMs"] >= 0
     finally:
         if server is not None:
             server.shutdown()

@@ -6,7 +6,10 @@ import numpy as np
 import pytest
 
 from datasets.view import CameraRef, DatasetView, EpisodeView, FORMAT_HDF5
-from deploy.offline_evaluation import evaluate_dataset_frame
+from deploy.offline_evaluation import (
+    evaluate_dataset_frame,
+    load_dataset_action_replay,
+)
 
 
 class FakeAdapter:
@@ -48,6 +51,49 @@ class FakeAdapter:
             yield np.full((4, 6, 3), index * 10, dtype=np.uint8)
 
 
+
+class RedundantAdapter(FakeAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.view.features["action"] = {
+            "dtype": "float32",
+            "shape": [5],
+            "names": ["unused_a", "joint_b", "unused_b", "joint_a", "unused_c"],
+        }
+        self.view.features["observation.state"] = {
+            "dtype": "float32",
+            "shape": [4],
+            "names": ["unused_state", "joint_b", "joint_a", "unused_state_2"],
+        }
+
+    def get_timeseries(self, episode_index):
+        assert episode_index == 3
+        frame = np.arange(5, dtype=np.float32)
+        return {
+            "action": np.column_stack((100 + frame, 10 + frame, 200 + frame, 20 + frame, 300 + frame)),
+            "observation.state": np.column_stack((400 + frame, 30 + frame, 40 + frame, 500 + frame)),
+        }
+def test_load_dataset_action_replay_keeps_raw_frames_and_names() -> None:
+    result = load_dataset_action_replay(
+        FakeAdapter(),
+        episode_index=3,
+        start_frame=1,
+        end_frame=4,
+        action_names=["joint_a", "joint_b"],
+    )
+
+    assert result["fps"] == 10
+    assert result["startFrame"] == 1
+    assert result["endFrame"] == 4
+    assert result["action"]["names"] == ["joint_a", "joint_b"]
+    assert result["action"]["values"] == [
+        [1.0, 2.0],
+        [2.0, 4.0],
+        [3.0, 6.0],
+    ]
+
+
+
 def test_offline_evaluation_compares_every_action_dimension() -> None:
     captured = {}
 
@@ -71,6 +117,52 @@ def test_offline_evaluation_compares_every_action_dimension() -> None:
     assert result["action"]["dimensions"][0]["mae"] == pytest.approx(0.5)
     assert result["action"]["dimensions"][1]["maxAbsError"] == pytest.approx(1.0)
     assert result["images"][0]["dataUrl"].startswith("data:image/jpeg;base64,")
+
+
+def test_replay_selects_and_reorders_only_configured_joints() -> None:
+    result = load_dataset_action_replay(
+        RedundantAdapter(),
+        episode_index=3,
+        start_frame=1,
+        end_frame=3,
+        action_names=["joint_a", "joint_b"],
+    )
+
+    assert result["action"]["names"] == ["joint_a", "joint_b"]
+    assert result["action"]["values"] == [[21.0, 11.0], [22.0, 12.0]]
+    assert result["action"]["sourceWidth"] == 5
+    assert result["action"]["sourceIndices"] == [3, 1]
+    assert result["action"]["droppedDimensions"] == 3
+
+
+def test_offline_evaluation_projects_redundant_action_and_state() -> None:
+    captured = {}
+    result = evaluate_dataset_frame(
+        RedundantAdapter(),
+        episode_index=3,
+        frame_index=1,
+        predictor=lambda observations: captured.update(observations)
+        or {"action": {"values": [[21, 11], [22, 12]]}},
+        action_names=["joint_a", "joint_b"],
+        state_names=["joint_a", "joint_b"],
+    )
+
+    assert captured["observation.state"] == [41.0, 31.0]
+    assert result["state"]["names"] == ["joint_a", "joint_b"]
+    assert result["state"]["sourceIndices"] == [2, 1]
+    assert result["action"]["groundTruth"] == [[21.0, 11.0], [22.0, 12.0]]
+    assert result["action"]["overallMae"] == 0
+
+
+def test_replay_rejects_unsafe_wider_anonymous_action() -> None:
+    adapter = RedundantAdapter()
+    adapter.view.features["action"].pop("names")
+    with pytest.raises(ValueError, match="无法将数据集 action 5 维映射"):
+        load_dataset_action_replay(
+            adapter,
+            episode_index=3,
+            action_names=["joint_a", "joint_b"],
+        )
 
 
 def test_offline_evaluation_truncates_prediction_at_episode_end() -> None:

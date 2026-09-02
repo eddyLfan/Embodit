@@ -400,12 +400,12 @@ def test_all_job_route_path_fields_reject_invalid_ids(tmp_path: Path) -> None:
         route
         for route in app.routes
         if getattr(route, "path", "").startswith(
-            ("/api/convert/", "/api/augment/", "/api/qc/scans/")
+            ("/api/convert/", "/api/qc/scans/")
         )
         and ("{job_id}" in route.path or "{scan_id}" in route.path)
     ]
 
-    assert len(job_routes) == 19
+    assert len(job_routes) == 15
     for route in job_routes:
         parameter_name = "job_id" if "{job_id}" in route.path else "scan_id"
         field = next(item for item in route.dependant.path_params if item.name == parameter_name)

@@ -1,7 +1,7 @@
 # Contributing to Embodit
 
 Thank you for improving Embodit. Contributions are welcome across dataset
-adapters, QC, conversion, augmentation, deployment integrations, the web UI,
+adapters, QC, conversion, deployment integrations, the web UI,
 tests, documentation, and security hardening.
 
 Because this project can process valuable datasets and control robot deployment
@@ -40,10 +40,9 @@ bash embodit.sh start /path/to/test-datasets
 Use synthetic or explicitly shareable fixtures. Never point destructive or
 experimental work at the only copy of a dataset or a live production robot.
 
-Optional integrations have separate trust and licensing requirements. SAM3
-color augmentation needs its own compatible CUDA/PyTorch/SAM3 environment and
-checkpoint. Model-provider submodules and checkpoints are not installed by the
-core development setup; see [third_party/README.md](third_party/README.md).
+Optional integrations have separate trust and licensing requirements.
+Model-provider submodules and checkpoints are not installed by the core
+development setup; see [third_party/README.md](third_party/README.md).
 
 ## Repository Map
 
@@ -56,7 +55,6 @@ The main module boundaries are:
 | Conversion/export | `backend/convert/`, `backend/datasets/export.py` | Fidelity matrix, detached conversion, subset publication |
 | Merge | `backend/merge/` | Same-format compatibility and merge publication |
 | QC | `backend/qc/` | Detectors, reports, review decisions, queries |
-| Augmentation | `backend/augment/` | Preview/batch jobs, brightness, optional SAM3 color operations |
 | Labels | `backend/labels/` | Label schema and default JSONL sidecars |
 | Deployment | `backend/deploy/` | Config/Recipe validation, transport, orchestration, robot/model clients |
 | Web UI | `web/` | Browser state, media, localization, interaction |

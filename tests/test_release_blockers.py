@@ -86,60 +86,6 @@ def test_v21_subset_recomputes_statistics_after_renumbering(tmp_path: Path) -> N
     assert episode_rows[0]["stats"]["action"]["mean"] == [11.0]
 
 
-def test_brightness_preview_ignores_color_gpu_range(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    captured: dict[str, object] = {}
-    dataset = tmp_path / "dataset"
-    dataset.mkdir()
-    preview_root = tmp_path / "previews"
-
-    monkeypatch.setattr(
-        app_module,
-        "capabilities_payload",
-        lambda: {
-            "brightness": {"available": True, "builtIn": True},
-            "color": {"available": False, "gpuCount": 0, "reason": "CUDA unavailable"},
-        },
-    )
-
-    def fake_create_job(*, config, jobs_dir):
-        captured.update(config)
-        return {"jobId": "brightness-preview", "mode": "preview", "status": "queued"}
-
-    monkeypatch.setattr(app_module, "create_augment_job", fake_create_job)
-    monkeypatch.setattr(app_module, "write_augment_job", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        app_module,
-        "launch_augment_worker",
-        lambda job_id, jobs_dir: {
-            "jobId": job_id,
-            "mode": "preview",
-            "status": "running",
-        },
-    )
-    monkeypatch.setattr(app_module, "DEFAULT_PREVIEW_DIR", preview_root)
-
-    application = app_module.build_app("secret", tmp_path, Path(app_module.__file__).parents[1] / "web")
-    endpoint = next(
-        route.endpoint
-        for route in application.routes
-        if getattr(route, "path", None) == "/api/augment/preview"
-    )
-    response = endpoint(
-        app_module.AugmentRequest(
-            dataset=str(dataset),
-            augType="brightness",
-            gpuId=99,
-            previewEpisode=0,
-        )
-    )
-
-    assert response["status"] == "running"
-    assert captured["gpuId"] == 0
-
-
 def test_v21_rejects_data_directory_symlink_outside_dataset(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _write_json(

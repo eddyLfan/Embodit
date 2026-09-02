@@ -68,7 +68,6 @@
         <button type="button" class="workspace-tab" data-mode="filter" data-i18n="modeFilter">筛选</button>
         <button type="button" class="workspace-tab" data-mode="convert" data-i18n="modeConvert">转换</button>
         <button type="button" class="workspace-tab" data-mode="merge" data-i18n="modeMerge">合并</button>
-        <button type="button" class="workspace-tab" data-mode="augment" data-i18n="modeAugment">增强</button>
       </nav>
     </section>
     <section id="summary" class="summary"></section>
@@ -233,7 +232,7 @@
                   <div class="deployment-inline-status">
                     <span id="deploymentRobotStatus" class="deployment-component-status idle"><i></i>未检测连接</span>
                     <span class="deployment-connection-actions">
-                      <button id="checkDeploymentRobot" type="button">连接</button>
+                      <button id="checkDeploymentRobot" type="button" disabled>连接</button>
                       <button id="disconnectDeploymentRobot" type="button" disabled>断开</button>
                     </span>
                   </div>
@@ -248,7 +247,7 @@
                   <div class="deployment-step-actions">
                     <span id="deploymentModelStatus" class="deployment-component-status idle"><i></i>未启动</span>
                     <span class="deployment-connection-actions">
-                      <button id="prepareDeploymentModel" class="primary" type="button">启动模型</button>
+                      <button id="prepareDeploymentModel" class="primary" type="button" disabled>启动模型</button>
                       <button id="closeDeploymentModel" type="button" disabled>关闭</button>
                     </span>
                   </div>
@@ -313,7 +312,10 @@
                   </div>
                   <div class="deployment-prompt-actions">
                     <small id="deploymentOfflineHint" data-i18n="deployOfflineChooseFrame">选择数据与起始帧</small>
-                    <button id="runDeploymentOfflineEvaluation" class="primary" type="button" disabled data-i18n="deployOfflineRun">运行对比</button>
+                    <div class="deployment-offline-run-actions">
+                      <button id="replayDeploymentOffline" type="button" disabled data-i18n="deployOfflineReplay">Replay</button>
+                      <button id="runDeploymentOfflineEvaluation" class="primary" type="button" disabled data-i18n="deployOfflineRun">运行对比</button>
+                    </div>
                   </div>
                 </div>
               </section>
@@ -325,6 +327,11 @@
                     <button id="startLiveDeployment" class="primary deploy-launch" disabled>开始评测</button>
                     <button id="stopLiveDeployment" disabled>暂停评测</button>
                   </div>
+                  <label class="deployment-record-option">
+                    <input id="deploymentRecordLive" type="checkbox">
+                    <span>录制主视角头部相机（自动保存到 outputs/deployment-recordings）</span>
+                  </label>
+                  <small id="deploymentRecordingStatus" class="deployment-record-status">未录制</small>
                 </div>
               </section>
             </div>
@@ -361,20 +368,18 @@
                 <option value="tunnel">Tunnel</option>
                 <option value="ros">ROS</option>
               </select>
-              <button id="refreshDeploymentLog" type="button" title="刷新日志">↻</button>
             </div>
             <div class="deployment-log-tools">
               <input id="deploymentLogFilter" type="search" placeholder="筛选日志" autocomplete="off">
-              <label><input id="deploymentLogAutoscroll" type="checkbox" checked> 跟随</label>
-              <button id="clearDeploymentLogView" type="button">清屏</button>
+              <button id="clearDeploymentLogView" type="button" title="仅清空当前显示，不影响运行日志">清空</button>
             </div>
             <div id="deploymentExecutionLog" class="deployment-log-lines" role="log" aria-live="polite"><div class="deployment-log-empty">等待部署启动…</div></div>
           </section>
         </aside>
         <div id="splitDeploymentSidebar" class="splitter splitter-col deployment-splitter" role="separator" aria-orientation="vertical" tabindex="0" title="拖动调整部署操作栏宽度 · 双击复位"></div>
-        <section class="deployment-result-pane" aria-label="模型 I/O 观测">
+        <section class="deployment-result-pane" aria-label="真机与模型观测">
           <div class="deployment-observation-head">
-            <div class="deployment-pane-title"><strong>模型 I/O 观测</strong><small id="deploymentResultHint" data-i18n="deployReady">等待操作</small></div>
+            <div class="deployment-pane-title"><strong>真机与模型观测</strong><small id="deploymentResultHint" data-i18n="deployReady">等待操作</small></div>
           </div>
           <div class="deployment-observation-stage">
             <div id="deploymentOfflineResult" class="deployment-offline-result hidden">
@@ -387,49 +392,71 @@
               <div class="deployment-offline-legend"><span><i class="predicted"></i><span data-i18n="deployOfflinePredicted">模型输出</span></span><span><i class="truth"></i><span data-i18n="deployOfflineRecorded">真实动作</span></span></div>
               <div id="deploymentOfflineDimensionGrid" class="deployment-offline-dimension-grid"></div>
             </div>
+            <div id="deploymentOfflineReplay" class="deployment-offline-replay hidden">
+              <div class="deployment-offline-result-head">
+                <div><strong data-i18n="deployOfflineReplayTitle">离线数据 Replay</strong><small id="deploymentOfflineReplayMeta">—</small></div>
+                <button id="closeDeploymentOfflineReplay" type="button" data-i18n="deployOfflineBackLive">返回实时观测</button>
+              </div>
+              <div id="deploymentOfflineReplayCameraGrid" class="deployment-camera-grid deployment-replay-camera-grid"></div>
+              <div class="deployment-replay-controls">
+                <button id="deploymentOfflineReplayPlay" class="primary" type="button" data-i18n="deployOfflineReplayPlay">播放</button>
+                <button id="deploymentOfflineReplayRobot" type="button" data-i18n="deployOfflineReplayRobot">真机 Replay</button>
+                <button id="deploymentOfflineReplayRobotStop" type="button" class="hidden" data-i18n="deployOfflineReplayRobotStop">停止真机 Replay</button>
+                <small id="deploymentOfflineReplayRobotStatus" data-i18n="deployOfflineReplayRobotIdle">本体连接后可回放记录动作</small>
+                <input id="deploymentOfflineReplayTimeline" type="range" min="0" max="0" step="1" value="0" aria-label="Replay timeline">
+                <span id="deploymentOfflineReplayTime">frame 0</span>
+                <select id="deploymentOfflineReplaySpeed" aria-label="Replay speed">
+                  <option value="0.25">0.25×</option>
+                  <option value="0.5">0.5×</option>
+                  <option value="1" selected>1×</option>
+                  <option value="1.5">1.5×</option>
+                  <option value="2">2×</option>
+                </select>
+              </div>
+              <section class="deployment-replay-trajectory">
+                <div class="deployment-replay-trajectory-head">
+                  <strong data-i18n="deployOfflineReplayTrajectory">记录轨迹</strong>
+                  <select id="deploymentOfflineReplaySource" aria-label="Replay trajectory source"></select>
+                </div>
+                <div id="deploymentOfflineReplayGroups" class="deployment-trajectory-groups"></div>
+                <canvas id="deploymentOfflineReplayChart" width="960" height="230"></canvas>
+                <div id="deploymentOfflineReplayLegend" class="deployment-trajectory-legend"></div>
+                <div id="deploymentOfflineReplayReadout" class="deployment-replay-readout"></div>
+              </section>
+            </div>
             <div id="deploymentModelIoPlaceholder" class="deployment-observation-placeholder">
               <span class="deployment-observation-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-              <strong>等待模型 I/O</strong>
+              <strong>等待本体观测</strong>
             </div>
             <div id="deploymentModelIo" class="deployment-model-io hidden">
               <section class="deployment-io-section">
-                <div class="deployment-io-heading"><strong>模型输入</strong><small id="deploymentInputMeta">—</small></div>
+                <div class="deployment-io-heading"><strong>实时画面</strong><small id="deploymentLivePreviewMeta">等待本体观测</small></div>
                 <div id="deploymentCameraGrid" class="deployment-camera-grid"></div>
-                <div class="deployment-vector-panel">
-                  <div class="deployment-vector-heading"><strong id="deploymentStateLabel">关节状态</strong><code id="deploymentStateKey">—</code></div>
-                  <div id="deploymentStateGrid" class="deployment-vector-grid"></div>
-                </div>
               </section>
-              <section class="deployment-io-section">
-                <div class="deployment-io-heading"><strong>模型输出</strong><small id="deploymentOutputMeta">—</small></div>
-                <div class="deployment-vector-panel">
-                  <div class="deployment-vector-heading"><strong>动作输出</strong><code id="deploymentActionShape">—</code></div>
+              <section id="deploymentModelOutputSection" class="deployment-io-section">
+                <div class="deployment-io-heading">
+                  <strong data-i18n="deployJointTrajectory">关节动作轨迹</strong>
+                  <small id="deploymentOutputMeta">等待模型输出</small>
+                </div>
+                <div class="deployment-vector-panel deployment-trajectory-panel">
+                  <div class="deployment-vector-heading"><strong data-i18n="deployMeasuredAndPredicted">实测状态与未来动作</strong><code id="deploymentActionShape">—</code></div>
                   <div class="deployment-trajectory-toolbar">
                     <div class="deployment-trajectory-view-controls">
-                      <select id="deploymentTrajectorySource" aria-label="轨迹来源">
-                        <option value="executed">实际执行</option>
-                        <option value="state" selected>关节状态</option>
-                        <option value="planned">模型计划</option>
-                        <option value="chunk">当前动作块</option>
-                      </select>
-                      <select id="deploymentTrajectoryWindow" aria-label="轨迹时间窗">
-                        <option value="5">最近 5 秒</option>
-                        <option value="10">最近 10 秒</option>
-                        <option value="20" selected>最近 20 秒</option>
-                        <option value="60">最近 60 秒</option>
-                      </select>
+                      <div class="deployment-trajectory-line-keys" aria-label="曲线类型">
+                        <span><i class="measured"></i><span data-i18n="deployMeasuredState">实测状态 · 近 10s</span></span>
+                        <span><i class="predicted"></i><span data-i18n="deployPredictedAction">模型输出 · 未来</span></span>
+                      </div>
                       <select id="deploymentTrajectoryScale" aria-label="轨迹量程">
-                        <option value="per" selected>逐维变化</option>
-                        <option value="shared">统一量程</option>
+                        <option value="shared" selected>真实物理量程</option>
+                        <option value="per">相对变化（放大）</option>
                       </select>
                     </div>
                     <div id="deploymentTrajectoryGroups" class="deployment-trajectory-groups"></div>
                   </div>
                   <div class="deployment-trajectory-chart">
-                    <canvas id="deploymentActionTrajectory" width="960" height="300" aria-label="实时动作轨迹"></canvas>
+                    <canvas id="deploymentActionTrajectory" width="960" height="300" aria-label="实时关节状态与未来模型动作轨迹"></canvas>
                     <div id="deploymentTrajectoryLegend" class="deployment-trajectory-legend"></div>
                   </div>
-                  <div id="deploymentActionGrid" class="deployment-vector-grid"></div>
                 </div>
               </section>
             </div>
@@ -653,105 +680,6 @@
     </section>
   </div>
 
-  <div id="augmentDialog" class="modal hidden">
-    <section class="modal-card modal-card-wide modal-card-compact augment-card" role="dialog" aria-modal="true" aria-labelledby="augmentDialogTitle">
-      <div class="modal-title">
-        <div>
-          <h2 id="augmentDialogTitle" data-i18n="augmentTitle">数据增强</h2>
-        </div>
-        <button id="closeAugment" data-i18n="close">关闭</button>
-      </div>
-      <div class="modal-scroll-body">
-      <div class="auto-filter-fields augment-fields">
-        <div class="field-block augment-source-field">
-          <span class="field-label" data-i18n="augmentSourceLabel">源数据集</span>
-          <div id="augmentSource" class="convert-source-path">—</div>
-        </div>
-        <label data-i18n="augmentType">增强类型
-          <select id="augmentType">
-            <option value="brightness" data-i18n="augmentTypeBrightness">亮度调节</option>
-            <option value="color" data-i18n="augmentTypeColor">颜色替换</option>
-          </select>
-        </label>
-        <p id="augmentAvailability" class="field-hint augment-availability"></p>
-        <div id="augmentBrightnessFields" class="augment-brightness-fields">
-          <label data-i18n="augmentBrightnessMode">亮度参数
-            <select id="augmentBrightnessMode">
-              <option value="auto" data-i18n="augmentBrightnessAuto">自动适配（默认）</option>
-              <option value="manual" data-i18n="augmentBrightnessManual">手动指定</option>
-            </select>
-          </label>
-          <p class="field-hint" data-i18n="augmentBrightnessHint">自动按多相机曝光估计 gain/gamma；手动可调参数后反复测试效果。</p>
-          <div id="augmentBrightnessManualRow" class="augment-brightness-manual hidden">
-            <label data-i18n="augmentBrightnessGain">Gain（曝光增益）
-              <input id="augmentBrightnessGain" type="number" min="0.4" max="2.0" step="0.01" value="1.00">
-            </label>
-            <label data-i18n="augmentBrightnessGamma">Gamma（对比曲线）
-              <input id="augmentBrightnessGamma" type="number" min="0.4" max="2.0" step="0.01" value="1.00">
-            </label>
-          </div>
-        </div>
-        <div id="augmentColorFields" class="augment-color-fields hidden">
-          <label data-i18n="augmentSamPrompts">SAM3 查询词（必填，逗号分隔）
-            <textarea id="augmentSamPrompts" rows="2" placeholder="clothes, cup, table"></textarea>
-          </label>
-          <p class="field-hint" data-i18n="augmentSamHint">用英文物体名描述要选中的目标；测试预览会显示掩码，可反复改词。</p>
-          <label data-i18n="augmentApplyMode">应用方式
-            <select id="augmentApplyMode">
-              <option value="object_recolor" data-i18n="augmentObjectRecolor">物体换色</option>
-              <option value="background_replace" data-i18n="augmentBackgroundReplace">背景替换（保留选中物体）</option>
-            </select>
-          </label>
-          <label data-i18n="augmentColorMode">目标色
-            <select id="augmentColorMode">
-              <option value="random" data-i18n="augmentColorRandom">随机（默认）</option>
-              <option value="fixed" data-i18n="augmentColorFixed">指定颜色</option>
-            </select>
-          </label>
-          <div id="augmentFixedColorRow" class="augment-fixed-color hidden">
-            <label data-i18n="augmentColorPreset">预设
-              <select id="augmentColorPreset"></select>
-            </label>
-            <label data-i18n="augmentColorCustom">自定义 RGB
-              <input id="augmentColorCustom" placeholder="220,40,40" spellcheck="false">
-            </label>
-          </div>
-          <label data-i18n="augmentGpuId">GPU ID
-            <input id="augmentGpuId" type="number" min="0" value="0">
-          </label>
-        </div>
-        <label data-i18n="augmentPreviewEpisode">测试 episode
-          <input id="augmentPreviewEpisode" type="number" min="0" step="1">
-        </label>
-        <label data-i18n="augmentBatchScope">批量范围
-          <select id="augmentBatchScope">
-            <option value="all" data-i18n="augmentScopeAll">全部 episodes</option>
-            <option value="random" data-i18n="augmentScopeRandom">随机抽样</option>
-            <option value="filtered" data-i18n="augmentScopeFiltered">当前列表</option>
-            <option value="pass" data-i18n="augmentScopePass">已通过</option>
-            <option value="current" data-i18n="augmentScopeCurrent">仅当前 episode</option>
-          </select>
-        </label>
-        <div id="augmentRandomCountRow" class="augment-random-count hidden">
-          <label data-i18n="augmentRandomCount">随机数量
-            <input id="augmentRandomCount" type="number" min="1" step="1" value="10">
-          </label>
-          <p class="field-hint" data-i18n="augmentRandomHint">从数据集中无放回随机抽取指定条数做增强。</p>
-        </div>
-        <label data-i18n="outputPath">输出路径<input id="augmentOutput" spellcheck="false"></label>
-      </div>
-      <div id="augmentProgress" class="auto-filter-progress hidden"><div><i></i></div><span data-i18n="augmentPreparing">准备中…</span></div>
-      <div id="augmentPreviewMeta" class="augment-preview-meta muted hidden"></div>
-      <div id="augmentPreviewGrid" class="augment-preview-grid"></div>
-      </div>
-      <div class="modal-actions">
-        <span class="modal-action-hint" data-i18n="augmentBgHint">批量任务在后台执行，关闭页面不会中断。</span>
-        <button id="runAugmentPreview" class="primary" data-i18n="augmentRunPreview">生成测试</button>
-        <button id="startAugmentBatch" disabled data-i18n="augmentStartBatch">确认并批量生成</button>
-      </div>
-    </section>
-  </div>
-
   <aside id="convertJobDock" class="convert-job-dock hidden" aria-live="polite">
     <div class="convert-job-dock-head">
       <strong data-i18n="convertJobsTitle">数据任务</strong>
@@ -759,15 +687,6 @@
       <button type="button" id="toggleConvertJobs" data-i18n="collapse">收起</button>
     </div>
     <div id="convertJobList" class="convert-job-list"></div>
-  </aside>
-
-  <aside id="augmentJobDock" class="convert-job-dock augment-job-dock hidden" aria-live="polite">
-    <div class="convert-job-dock-head">
-      <strong data-i18n="augmentJobsTitle">增强任务</strong>
-      <button type="button" id="refreshAugmentJobs" data-i18n="refresh">刷新</button>
-      <button type="button" id="toggleAugmentJobs" data-i18n="collapse">收起</button>
-    </div>
-    <div id="augmentJobList" class="convert-job-list"></div>
   </aside>
 
   <!--I18N_INLINE-->

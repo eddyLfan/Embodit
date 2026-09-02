@@ -21,6 +21,7 @@ import json
 import math
 import signal
 import sys
+import time
 import threading
 import traceback
 from http import HTTPStatus
@@ -184,7 +185,23 @@ class ModelRequestHandler(BaseHTTPRequestHandler):
             request = json.loads(self.rfile.read(length))
             if not isinstance(request, dict) or not isinstance(request.get("observations"), dict):
                 raise ValueError("请求必须包含 observations 对象")
+            sequence = request.get("sequence")
+            if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+                raise ValueError("请求 sequence 必须是非负整数")
+            protocol_version = request.get("protocolVersion")
+            if protocol_version != 2:
+                raise ValueError("请求 protocolVersion 必须是 2")
+            started = time.perf_counter()
             result = self.server.provider.predict(decode_observation(request["observations"]))
+            server_inference_ms = (time.perf_counter() - started) * 1000
+            result = {
+                **result,
+                "protocolVersion": 2,
+                "sequence": sequence,
+                "metrics": {
+                    "serverInferenceMs": server_inference_ms,
+                },
+            }
             self.send_json(HTTPStatus.OK, result)
         except (TypeError, ValueError) as error:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})

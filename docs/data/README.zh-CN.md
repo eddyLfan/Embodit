@@ -2,7 +2,7 @@
 
 [English](README.md) · **中文**
 
-Embodit 提供本地机器人数据浏览、复核、标注、自动质检、转换、合并与增强工作台。源数据按只读对象处理，派生数据写入新路径。
+Embodit 提供本地机器人数据浏览、复核、标注、自动质检、转换与合并工作台。源数据按只读对象处理，派生数据写入新路径。
 
 ## 1. 启动与路径范围
 
@@ -12,7 +12,7 @@ bash embodit.sh start /path/to/datasets
 
 该路径是工作台初始目录。localhost 模式下它不是安全边界：通过认证的客户端仍可请求服务账号有权访问的其他绝对路径。非本地监听会自动启用 `EMBODIT_SANDBOX=1`，把客户端提交的数据路径限制在该根目录；内部状态与缓存目录仍单独保存。
 
-首次启动只同步 lockfile 中的**核心环境**，不会安装 CUDA、SAM3、模型 Provider 专用环境、Checkpoint 或系统工具。
+首次启动只同步 lockfile 中的**核心环境**，不会安装 CUDA、模型 Provider 专用环境、Checkpoint 或系统工具。
 
 | 变量 | 作用 |
 |---|---|
@@ -88,7 +88,7 @@ Web UI 可创建 Episode 与区间标签；后端 schema 还接受 Frame 标签�
 
 ## 5. 子集导出与保真边界
 
-所有子集写出都要求新输出路径。验证输出前请保留源数据。LeRobot、HDF5、MCAP 和增强写出在其受支持写出路径中使用 staging 与禁止覆盖发布；失败或取消时，不会把部分暂存产物发布为目标。
+所有子集写出都要求新输出路径。验证输出前请保留源数据。LeRobot、HDF5 和 MCAP 写出在其受支持写出路径中使用 staging 与禁止覆盖发布；失败或取消时，不会把部分暂存产物发布为目标。
 
 “同格式子集”表示同一数据家族中可用的结构保持子集，不表示逐字节或容器级无损复制：
 
@@ -130,23 +130,9 @@ Web UI 可创建 Episode 与区间标签；后端 schema 还接受 Frame 标签�
 
 源顺序决定输出 Episode 顺序，且输出必须不存在。选择复制标签时会重映射索引；目录数据集将 manifest/labels 写在输出内，单文件格式使用相邻 sidecar。`hardlink`/`copy` 主要影响 LeRobot 视频媒体。
 
-## 8. 视觉增强
+## 8. 后台任务、缓存与清理
 
-批量增强必须先有配置匹配且成功的预览。亮度增强可直接使用核心环境，不需要 CUDA；物体换色和背景替换需要独立且兼容的 CUDA/SAM3 环境与 Checkpoint：
-
-```bash
-export AUGMENT_PYTHON=/path/to/augment-env/bin/python
-export AUGMENT_SAM3_CHECKPOINT=/path/to/sam3.pt
-bash embodit.sh start /path/to/datasets
-```
-
-四种支持格式只要至少有一个可解码相机即可作为输入。批量输出重建为 LeRobot v2.1 或 v3，仅包含增强相机、任务文本和已识别的标准 `observation.state`/`action`。自定义列、标定、源统计、容器 metadata 与原时间戳不会透传；时间戳按 FPS 重建，长度不一致时可能使用最近邻对齐。失败 Episode 可被跳过并写入增强 manifest。
-
-SAM3 安装、信任与许可证边界见 [`../../third_party/README.md`](../../third_party/README.md)。
-
-## 9. 后台任务、缓存与清理
-
-QC、转换、合并和增强使用独立 worker；关闭浏览器不会停止任务。
+QC、转换和合并使用独立 worker；关闭浏览器不会停止任务。
 
 ```bash
 bash embodit.sh clean --dry-run
@@ -155,23 +141,21 @@ bash embodit.sh clean --cache
 bash embodit.sh clean --all
 ```
 
-`--cache` 删除可重建的预览/媒体缓存；`--all` 还删除缓存根目录内的任务历史和 QC 报告。它不会删除数据集、派生输出、标签、Review 文件、部署状态、Python 环境或服务 Token/日志。清理前应归档重要报告。
+`--cache` 删除可重建的媒体缓存；`--all` 还删除缓存根目录内的任务历史和 QC 报告。它不会删除数据集、派生输出、标签、Review 文件、部署状态、Python 环境或服务 Token/日志。清理前应归档重要报告。
 
 保留策略会在服务启动时执行一次，并在服务运行期间定期执行。应在启动 Embodit 前配置：
 
 | 变量 | 默认值 | 作用 |
 |---|---:|---|
-| `EMBODIT_PREVIEW_TTL_DAYS` | `7` | 预览任务记录与资源 |
 | `EMBODIT_MEDIA_TTL_DAYS` | `7` | 可重建的播放媒体缓存文件 |
-| `EMBODIT_SAM_CACHE_TTL_DAYS` | `30` | SAM3 分割缓存文件 |
-| `EMBODIT_JOB_TTL_DAYS` | `30` | 已结束的导出、转换、合并、QC 和增强任务记录/日志 |
-| `EMBODIT_TEMP_TTL_DAYS` | `1` | 无引用预览及临时/staging 产物 |
+| `EMBODIT_JOB_TTL_DAYS` | `30` | 已结束的导出、转换、合并和 QC 任务记录/日志 |
+| `EMBODIT_TEMP_TTL_DAYS` | `1` | 临时/staging 产物 |
 | `EMBODIT_QC_REPORTS_PER_DATASET` | `5` | 每个数据集保留的最近报告数；旧报告被任务引用时继续保留 |
 | `EMBODIT_MAINTENANCE_INTERVAL_HOURS` | `24` | 定期清理间隔；正值最短按一小时执行，`0` 只关闭定期清理 |
 
 TTL 或报告数设置为 `0` 时，匹配且未受保护的条目会立即满足清理条件；即使定期间隔为 `0`，启动时维护仍会执行。
 
-## 10. 排查与扩展
+## 9. 排查与扩展
 
 | 问题 | 检查项 |
 |---|---|
@@ -182,4 +166,4 @@ TTL 或报告数设置为 `0` 时，匹配且未受保护的条目会立即满�
 | 硬链接失败 | 使用 `copy`，或让源/输出位于同一文件系统 |
 | 路径被拒绝 | 使用合适的数据根目录启动；局域网保持沙箱开启 |
 
-扩展边界：数据适配器位于 `backend/datasets/`，QC Detector 位于 `backend/qc/detectors/`，转换位于 `backend/convert/`，增强位于 `backend/augment/`。贡献边界统一见 [CONTRIBUTING.md](../../CONTRIBUTING.md)。
+扩展边界：数据适配器位于 `backend/datasets/`，QC Detector 位于 `backend/qc/detectors/`，转换位于 `backend/convert/`。贡献边界统一见 [CONTRIBUTING.md](../../CONTRIBUTING.md)。

@@ -358,6 +358,8 @@ def _write_astribot_hdf5(path: Path, frames: int = 4) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     action = np.arange(frames * 35, dtype=np.float64).reshape(frames, 35)
     state = np.arange(frames * 37, dtype=np.float64).reshape(frames, 37)
+    joint_action = np.arange(frames * 25, dtype=np.float64).reshape(frames, 25)
+    joint_state = joint_action + 0.25
     with h5py.File(path, "w") as handle:
         handle.attrs["created_at"] = "2026_04_20_14_10_05"
         commands = handle.create_group("command_poses_dict")
@@ -367,6 +369,9 @@ def _write_astribot_hdf5(path: Path, frames: int = 4) -> Path:
         poses.create_dataset("merge_pose", data=state)
         poses.create_dataset("astribot_arm_left", data=state[:, :7])
         poses.create_dataset("astribot_arm_right", data=state[:, 7:14])
+        joints = handle.create_group("joints_dict")
+        joints.create_dataset("joints_position_command", data=joint_action)
+        joints.create_dataset("joints_position_state", data=joint_state)
         handle.create_dataset("time", data=1000.0 + np.arange(frames) / 30.0)
 
         images = handle.create_group("images_dict")
@@ -406,12 +411,18 @@ def test_astribot_hdf5_inspect_timeseries_and_frames(tmp_path: Path):
     assert view.episodes[0].tasks == ["pick_cube"]
     assert sorted(view.episodes[0].cameras) == ["head", "left"]
     assert view.features["head"]["shape"] == [24, 32, 3]
-    assert view.features["action"]["shape"] == [35]
-    assert view.features["observation.state"]["shape"] == [37]
+    assert view.features["action"]["shape"] == [25]
+    assert view.features["observation.state"]["shape"] == [25]
+    assert view.features["action"]["names"][7:23] == (
+        [f"left_arm_{index}" for index in range(1, 8)]
+        + ["left_gripper"]
+        + [f"right_arm_{index}" for index in range(1, 8)]
+        + ["right_gripper"]
+    )
 
     series = adapter.get_timeseries(0)
-    assert series["action"].shape == (4, 35)
-    assert series["observation.state"].shape == (4, 37)
+    assert series["action"].shape == (4, 25)
+    assert series["observation.state"].shape == (4, 25)
     assert series["eef.astribot_arm_left"].shape == (4, 7)
 
     decoded = list(adapter.get_frames(0, "head", chunk=2))

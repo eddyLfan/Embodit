@@ -1,7 +1,4 @@
 /.convert_jobs
-/.augment_jobs
-/.augment_previews
-/.augment_cache
 /.embodit_cache
 /.embodit/
 /config/local/

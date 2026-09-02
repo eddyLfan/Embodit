@@ -79,6 +79,82 @@ def _mapped_observations(observations: dict[str, Any], mapping: dict[str, str] |
     return {target: converted[source] for target, source in mapping.items()}
 
 
+def _normalize_image_preprocessing(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("image_preprocessing 必须是对象")
+    mode = str(value.get("mode") or "policy").strip().lower()
+    if mode == "policy":
+        return None
+    if mode != "stretch":
+        raise ValueError("image_preprocessing.mode 必须是 policy 或 stretch")
+    width = value.get("width")
+    height = value.get("height")
+    if (
+        isinstance(width, bool)
+        or not isinstance(width, int)
+        or width <= 0
+        or isinstance(height, bool)
+        or not isinstance(height, int)
+        or height <= 0
+    ):
+        raise ValueError("stretch 图像预处理要求正整数 width 和 height")
+    resample = str(value.get("resample") or "bicubic").strip().lower()
+    if resample not in {"nearest", "bilinear", "bicubic", "lanczos"}:
+        raise ValueError("image_preprocessing.resample 必须是 nearest、bilinear、bicubic 或 lanczos")
+    return {
+        "mode": mode,
+        "width": width,
+        "height": height,
+        "resample": resample,
+    }
+
+
+def _preprocess_model_images(
+    values: dict[str, Any],
+    specification: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Apply an explicitly configured checkpoint-training image transform once."""
+    if specification is None:
+        return values
+
+    import numpy as np
+    from PIL import Image
+
+    resampling = getattr(Image, "Resampling", Image)
+    methods = {
+        "nearest": resampling.NEAREST,
+        "bilinear": resampling.BILINEAR,
+        "bicubic": resampling.BICUBIC,
+        "lanczos": resampling.LANCZOS,
+    }
+    size = (int(specification["width"]), int(specification["height"]))
+    result = dict(values)
+    for key, value in values.items():
+        lowered = key.lower()
+        if "image" not in lowered and "camera" not in lowered:
+            continue
+        if isinstance(value, Image.Image):
+            image = value.convert("RGB")
+        else:
+            array = np.asarray(value)
+            if array.ndim != 3 or array.shape[-1] not in {1, 3, 4}:
+                raise ValueError(f"模型图像 {key} 必须是 H×W×C")
+            if array.dtype != np.uint8:
+                if np.issubdtype(array.dtype, np.floating) and array.size and float(np.nanmax(array)) <= 1.0:
+                    array = array * 255.0
+                array = np.clip(array, 0, 255).astype(np.uint8)
+            if array.shape[-1] == 1:
+                array = array[..., 0]
+            image = Image.fromarray(array).convert("RGB")
+        result[key] = np.asarray(
+            image.resize(size, methods[specification["resample"]]),
+            dtype=np.uint8,
+        )
+    return result
+
+
 def _auto_map_lerobot_features(
     values: dict[str, Any],
     expected: set[str],
@@ -132,6 +208,8 @@ class OpenPIAdapter:
         default_prompt: str | None = None,
         device: str | None = None,
         observation_map: dict[str, str] | None = None,
+        image_preprocessing: dict[str, Any] | None = None,
+        norm_stats_asset_id: str | None = None,
         **policy_kwargs: Any,
     ) -> None:
         _add_source_path(source_path)
@@ -147,6 +225,28 @@ class OpenPIAdapter:
                 config,
                 model=dataclasses.replace(config.model, action_horizon=action_horizon),
             )
+        if norm_stats_asset_id is not None:
+            if (
+                not isinstance(norm_stats_asset_id, str)
+                or not norm_stats_asset_id.strip()
+                or "\x00" in norm_stats_asset_id
+            ):
+                raise ValueError("norm_stats_asset_id 必须是非空字符串")
+            try:
+                data_factory = config.data
+                assets = data_factory.assets
+                config = dataclasses.replace(
+                    config,
+                    data=dataclasses.replace(
+                        data_factory,
+                        assets=dataclasses.replace(
+                            assets,
+                            asset_id=norm_stats_asset_id.strip(),
+                        ),
+                    ),
+                )
+            except (AttributeError, TypeError) as error:
+                raise ValueError("当前 OpenPI config 不支持覆盖归一化资产 ID") from error
         self.policy = policy_config.create_trained_policy(
             config,
             checkpoint,
@@ -155,11 +255,14 @@ class OpenPIAdapter:
             sample_kwargs=policy_kwargs or None,
         )
         self.observation_map = observation_map
+        self.image_preprocessing = _normalize_image_preprocessing(image_preprocessing)
         self.specification = {
             "family": "openpi",
             "config_name": resolved_name,
             "action_horizon": action_horizon or getattr(config.model, "action_horizon", None),
             "checkpoint": checkpoint,
+            "image_preprocessing": self.image_preprocessing or {"mode": "policy"},
+            "norm_stats_asset_id": norm_stats_asset_id,
             **(getattr(self.policy, "metadata", None) or {}),
         }
 
@@ -193,6 +296,7 @@ class OpenPIAdapter:
 
     def predict(self, observations: dict[str, Any], **_: Any) -> Any:
         values = _mapped_observations(observations, self.observation_map)
+        values = _preprocess_model_images(values, self.image_preprocessing)
         if self.observation_map is None:
             images = [value for key, value in values.items() if "image" in key.lower() or "camera" in key.lower()]
             states = [value for key, value in values.items() if "state" in key.lower() or "joint" in key.lower()]

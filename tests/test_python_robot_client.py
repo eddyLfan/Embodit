@@ -14,14 +14,19 @@ import pytest
 import deploy.assets.python_robot_client as python_robot_client
 
 from deploy.assets.python_robot_client import (
+    align_async_action_chunk,
     expand_synthetic,
     hold_action_chunk,
     model_io_snapshot,
     move_to_pose,
+    resolve_action_constraints,
+    replay_actions,
     resolve_action_scheduler,
+    resolve_runtime_action_scheduler,
     resolve_adapter,
     start_async_inference,
     StatusWriter,
+    TrajectoryHistory,
     transport_safe,
     validate_action,
 )
@@ -39,6 +44,53 @@ def action_config():
         "maximum": [2.0, 2.0, 100.0],
         "max_step": [0.2, 0.2, 20.0],
     }
+
+
+def test_action_constraints_prefer_connected_robot_absolute_limits() -> None:
+    class Adapter:
+        @staticmethod
+        def get_action_limits():
+            return {
+                "minimum": [-3.0, -1.0, 0.0],
+                "maximum": [3.0, 1.0, 100.0],
+            }
+
+    effective, metadata = resolve_action_constraints(action_config(), Adapter())
+    assert effective["minimum"] == [-3.0, -1.0, 0.0]
+    assert effective["maximum"] == [3.0, 1.0, 100.0]
+    assert effective["max_step"] == [0.2, 0.2, 20.0]
+    assert metadata["source"] == "adapter"
+
+
+def test_action_constraints_reject_invalid_adapter_dimensions() -> None:
+    class Adapter:
+        @staticmethod
+        def get_action_limits():
+            return {"minimum": [-1.0], "maximum": [1.0]}
+
+    with pytest.raises(ValueError, match="3 维"):
+        resolve_action_constraints(action_config(), Adapter())
+
+
+def test_trajectory_history_omits_stale_async_action_prefix() -> None:
+    history = TrajectoryHistory({"telemetry": {"history_seconds": 20}}, 10)
+    history.record_inference(
+        {
+            "capturedMonotonicNs": time.monotonic_ns(),
+            "input": {},
+            "output": {
+                "action": {
+                    "names": ["joint"],
+                    "units": ["rad"],
+                    "chunk": [[0.0], [0.1], [0.2], [0.3]],
+                    "skippedPrefixSteps": 2,
+                }
+            },
+        }
+    )
+    planned = history.snapshot()["planned"]
+    assert [item["values"] for item in planned] == [[0.2], [0.3]]
+    assert [item["step"] for item in planned] == [2, 3]
 
 
 def test_synthetic_observations_expand_without_robot_dependencies() -> None:
@@ -229,6 +281,160 @@ def test_recorded_pose_uses_generic_adapter_and_respects_step_limits(tmp_path) -
     )
 
 
+def test_hardware_replay_uses_generic_adapter_and_recorded_fps(tmp_path) -> None:
+    module_path = tmp_path / "replay_adapter.py"
+    module_path.write_text(
+        "APPLIED = []\n"
+        "class Adapter:\n"
+        "    def __init__(self, config): pass\n"
+        "    def start(self): pass\n"
+        "    def observe(self): return {'state': [0.0, 0.0, 0.0]}\n"
+        "    def apply_action(self, row): APPLIED.append(list(row))\n"
+        "    def stop(self): pass\n",
+        encoding="utf-8",
+    )
+    status_path = tmp_path / "replay-status.json"
+    config = {
+        "adapter": {
+            "entrypoint": "replay_adapter:Adapter",
+            "source_path": str(tmp_path),
+        },
+        "action": action_config(),
+        "control": {"rate_hz": 20, "watchdog_timeout_s": 1},
+        "status_path": str(status_path),
+    }
+    actions = [[0.1, -0.1, 10.0], [0.3, -0.3, 30.0]]
+
+    result = replay_actions(
+        config,
+        {"actions": actions, "fps": 10, "move_to_start_duration_s": 0.01},
+    )
+
+    module = sys.modules["replay_adapter"]
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert result["status"] == "finished"
+    assert result["framesApplied"] == 2
+    assert module.APPLIED[-2:] == actions
+    assert status["status"] == "finished"
+    assert status["framesApplied"] == 2
+
+
+def test_hardware_replay_keeps_dataset_clock_when_adapter_is_slower(tmp_path) -> None:
+    module_path = tmp_path / "slow_replay_adapter.py"
+    module_path.write_text(
+        "import time\n"
+        "APPLIED = []\n"
+        "class Adapter:\n"
+        "    def __init__(self, config): pass\n"
+        "    def start(self): pass\n"
+        "    def observe(self): return {'state': [0.0, 0.0, 0.0]}\n"
+        "    def apply_action(self, row):\n"
+        "        APPLIED.append(list(row))\n"
+        "        time.sleep(0.04)\n"
+        "    def stop(self): pass\n",
+        encoding="utf-8",
+    )
+    status_path = tmp_path / "slow-replay-status.json"
+    config = {
+        "adapter": {
+            "entrypoint": "slow_replay_adapter:Adapter",
+            "source_path": str(tmp_path),
+        },
+        "action": action_config(),
+        "control": {"rate_hz": 50, "watchdog_timeout_s": 1},
+        "status_path": str(status_path),
+    }
+    actions = [
+        [index * 0.02, -index * 0.02, float(index)]
+        for index in range(20)
+    ]
+
+    result = replay_actions(
+        config,
+        {"actions": actions, "fps": 50, "move_to_start_duration_s": 0.01},
+    )
+
+    module = sys.modules["slow_replay_adapter"]
+    assert result["status"] == "finished"
+    assert result["framesApplied"] == len(actions)
+    assert result["commandsSent"] < len(actions)
+    assert result["framesSkipped"] > 0
+    assert result["timingDegraded"] is True
+    assert result["replayDurationS"] < 0.65
+    assert module.APPLIED[-1] == actions[-1]
+
+def test_recorded_pose_holds_final_target_until_feedback_is_within_robot_tolerance(tmp_path) -> None:
+    module_path = tmp_path / "feedback_pose_adapter.py"
+    module_path.write_text(
+        "class Adapter:\n"
+        "    def __init__(self, config): self.current = [0.0, 0.0, 0.0]; self.target = None\n"
+        "    def start(self): pass\n"
+        "    def observe(self):\n"
+        "        if self.target is not None:\n"
+        "            self.current = [a + (b - a) * 0.6 for a, b in zip(self.current, self.target)]\n"
+        "        return {'state': list(self.current)}\n"
+        "    def apply_action(self, row): self.target = list(row)\n"
+        "    def stop(self): pass\n",
+        encoding="utf-8",
+    )
+    config = {
+        "adapter": {"entrypoint": "feedback_pose_adapter:Adapter", "source_path": str(tmp_path)},
+        "action": action_config(),
+        "control": {
+            "rate_hz": 100,
+            "watchdog_timeout_s": 1,
+            "pose_return": {
+                "tolerance": [0.01, 0.01, 0.5],
+                "final_hold_s": 0,
+                "settle_timeout_s": 1,
+                "sample_interval_s": 0.001,
+                "stable_samples": 2,
+            },
+        },
+    }
+
+    result = move_to_pose(config, {"values": [0.5, -0.3, 10.0], "duration_s": 0.01})
+
+    assert result["verified"] is True
+    assert result["maxError"] <= 0.5
+    assert all(
+        error <= tolerance
+        for error, tolerance in zip(result["errors"], config["control"]["pose_return"]["tolerance"])
+    )
+
+
+def test_recorded_pose_reports_failure_when_feedback_never_reaches_target(tmp_path) -> None:
+    module_path = tmp_path / "stuck_pose_adapter.py"
+    module_path.write_text(
+        "class Adapter:\n"
+        "    def __init__(self, config): pass\n"
+        "    def start(self): pass\n"
+        "    def observe(self): return {'state': [0.0, 0.0, 0.0]}\n"
+        "    def apply_action(self, row): pass\n"
+        "    def stop(self): pass\n",
+        encoding="utf-8",
+    )
+    config = {
+        "adapter": {"entrypoint": "stuck_pose_adapter:Adapter", "source_path": str(tmp_path)},
+        "action": action_config(),
+        "control": {
+            "rate_hz": 100,
+            "watchdog_timeout_s": 1,
+            "pose_return": {
+                "tolerance": [0.01, 0.01, 0.5],
+                "final_hold_s": 0,
+                "settle_timeout_s": 0.01,
+                "sample_interval_s": 0.001,
+                "stable_samples": 1,
+            },
+        },
+        "telemetry": {"action": {"names": ["joint_a", "joint_b", "gripper"]}},
+    }
+
+    with pytest.raises(RuntimeError, match="回位未达到配置精度：joint_a"):
+        move_to_pose(config, {"values": [0.5, 0.0, 0.0], "duration_s": 0.01})
+
+
 def test_action_scheduler_supports_sync_and_configurable_async_prefetch() -> None:
     assert resolve_action_scheduler({}, 50) == {
         "mode": "synchronous",
@@ -272,6 +478,38 @@ def test_action_scheduler_supports_sync_and_configurable_async_prefetch() -> Non
             },
             50,
         )
+
+
+def test_async_action_alignment_drops_rows_that_expired_during_inference() -> None:
+    actions = [[float(index)] for index in range(6)]
+    assert align_async_action_chunk(actions, elapsed_steps=2, maximum_steps=6) == [
+        [2.0],
+        [3.0],
+        [4.0],
+        [5.0],
+    ]
+    with pytest.raises(RuntimeError, match="整段动作已过期"):
+        align_async_action_chunk(actions, elapsed_steps=6, maximum_steps=6)
+
+
+def test_runtime_scheduler_replans_early_for_the_fresh_action_suffix() -> None:
+    scheduler = resolve_runtime_action_scheduler(
+        {
+            "inference_mode": "asynchronous",
+            "action_steps": 50,
+            "asynchronous": {"request_after_steps": "auto", "latency_margin_ms": 30},
+        },
+        50,
+        available_steps=45,
+        skipped_steps=5,
+        inference_latency_ms=160,
+        rate_hz=30,
+    )
+    assert scheduler["outputSteps"] == 50
+    assert scheduler["configuredActionSteps"] == 50
+    assert scheduler["actionSteps"] == 45
+    assert scheduler["requestAfterSteps"] == 39
+    assert scheduler["skippedPrefixSteps"] == 5
 
 
 class ModelHandler(BaseHTTPRequestHandler):
@@ -406,6 +644,74 @@ def test_dry_run_completes_inference_without_importing_vendor_adapter(tmp_path, 
     finally:
         process.terminate()
         assert process.wait(timeout=5) == 0
+
+
+def test_observe_mode_streams_preview_without_model_or_actions(tmp_path) -> None:
+    events_path = tmp_path / "observe-events.jsonl"
+    module_path = tmp_path / "observe_adapter.py"
+    module_path.write_text(
+        """
+import json
+class Adapter:
+    def __init__(self, config): self.path = config['path']; self.samples = 0
+    def record(self, value):
+        with open(self.path, 'a') as handle: handle.write(json.dumps(value) + '\\n')
+    def start_observation(self): self.record('start_observation')
+    def observe(self):
+        self.samples += 1
+        self.record({'observe': self.samples})
+        return {'state': [0.1, 0.2, 0.3], 'camera': [[[0, 0, 0]]]}
+    def apply_action(self, row): self.record({'apply_action': row})
+    def stop_observation(self): self.record('stop_observation')
+    def start(self): self.record('start')
+    def stop(self): self.record('stop')
+""".strip(),
+        encoding="utf-8",
+    )
+    config = runtime_config(tmp_path, "http://127.0.0.1:1")
+    config["preview_status_path"] = str(tmp_path / "preview.json")
+    config["adapter"] = {
+        "entrypoint": "observe_adapter:Adapter",
+        "source_path": str(tmp_path),
+        "config": {"path": str(events_path)},
+    }
+    config["telemetry"] = {
+        "preview_rate_hz": 20,
+        "cameras": [{"key": "camera", "label": "Main camera"}],
+        "state": {"key": "state", "names": ["a", "b", "c"]},
+    }
+    config_path = tmp_path / "observe-client.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    process = subprocess.Popen(
+        [sys.executable, str(ASSET_PATH), "--config", str(config_path)],
+        env={**os.environ, "EMBODIT_DEPLOYMENT_MODE": "observe"},
+    )
+    try:
+        status = wait_status(tmp_path / "status.json", "ready")
+        deadline = time.monotonic() + 5
+        preview = None
+        while time.monotonic() < deadline:
+            if (tmp_path / "preview.json").exists():
+                preview = json.loads((tmp_path / "preview.json").read_text(encoding="utf-8"))
+                if preview.get("state", {}).get("values") == [0.1, 0.2, 0.3]:
+                    break
+            time.sleep(0.02)
+        assert status["mode"] == "observe"
+        assert status["observationOnly"] is True
+        assert status["hardwareActive"] is False
+        assert preview is not None
+        assert preview["state"]["values"] == [0.1, 0.2, 0.3]
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        assert process.wait(timeout=5) == 0
+
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert events[0] == "start_observation"
+    assert not any(isinstance(event, dict) and "apply_action" in event for event in events)
+    assert "start" not in events
+    assert "stop" not in events
+    assert events[-1] == "stop_observation"
 
 
 def test_adapter_dry_run_streams_real_observations_without_applying_actions(tmp_path, model_server) -> None:
@@ -688,8 +994,11 @@ class Adapter:
     assert len(applied) == 10
     assert len(PrefetchModelHandler.request_times) >= 2
     # The second request starts after action 3 and before action 4, while actions
-    # 4-5 continue to drain from the current chunk.
+    # from the current chunk continue until the response is ready.
     assert applied[2]["time"] <= PrefetchModelHandler.request_times[1] < applied[3]["time"]
+    # The new chunk is aligned to the observation time, so its already elapsed
+    # first row is never sent after the response arrives.
+    assert applied[4]["row"] != PrefetchModelHandler.actions[0]
     status = wait_status(tmp_path / "status.json", "finished")
     assert status["steps"] == 10
 
@@ -739,7 +1048,7 @@ def test_live_async_runtime_validates_next_chunk_against_last_applied_action(
 
         def infer(self, _observations):
             self.calls += 1
-            values = [[0.1], [0.2]] if self.calls == 1 else [[0.0], [0.0]]
+            values = [[0.1], [0.2]] if self.calls == 1 else [[-0.1], [-0.1]]
             return values, 1.0
 
     adapter = Adapter()
@@ -778,10 +1087,75 @@ def test_live_async_runtime_validates_next_chunk_against_last_applied_action(
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGINT, previous_sigint)
 
-    assert adapter.applied == [[0.1], [0.2], [0.2], [0.2]]
+    assert adapter.applied == [[0.1], [0.1], [0.1], [0.1]]
     status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
-    assert status["safetyRejections"] == 1
+    assert status["safetyRejections"] >= 1
     assert "max_step" in status["safetyError"]
+
+
+def test_live_synchronous_validates_only_actions_selected_for_execution(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class Adapter:
+        def __init__(self):
+            self.applied = []
+
+        def start(self):
+            pass
+
+        def observe(self):
+            return {"state": [0.0]}
+
+        def apply_action(self, row):
+            self.applied.append(list(row))
+
+        def stop(self):
+            pass
+
+    class Model:
+        last_metrics = {}
+
+        @staticmethod
+        def infer(_observations):
+            return [[0.1], [0.2], [9.0]], 1.0
+
+    adapter = Adapter()
+    monkeypatch.setenv("EMBODIT_DEPLOYMENT_MODE", "live")
+    monkeypatch.setattr(python_robot_client, "resolve_adapter", lambda _config: adapter)
+    monkeypatch.setattr(python_robot_client, "ModelClient", lambda _config: Model())
+    config = {
+        "status_path": str(tmp_path / "status.json"),
+        "adapter": {"entrypoint": "unused:Adapter"},
+        "action": {
+            "width": 1,
+            "horizon": 3,
+            "baseline_observation": "state",
+            "minimum": [-1.0],
+            "maximum": [1.0],
+            "max_step": [1.0],
+        },
+        "control": {
+            "rate_hz": 100,
+            "max_episode_steps": 2,
+            "watchdog_timeout_s": 1,
+            "inference_mode": "synchronous",
+            "action_steps": 2,
+        },
+        "model": {"endpoint": "http://unused"},
+    }
+
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    try:
+        python_robot_client.run(config)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
+
+    assert adapter.applied == [[0.1], [0.2]]
+    status = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))
+    assert status["safetyRejections"] == 0
 
 
 def test_live_runtime_faults_when_adapter_call_exceeds_watchdog(tmp_path, model_server) -> None:

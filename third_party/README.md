@@ -79,24 +79,3 @@ requirements; then run Embodit's adapter and deployment tests with a real
 checkpoint. Update this table and `backend/app.py`'s model catalog in the same
 change. Do not patch vendored source silently: contribute fixes upstream or
 record any temporary fork, commit, rationale, and license here.
-
-## Optional augmentation components
-
-Embodit contains its own brightness, mask recoloring, and solid-background
-algorithms under `backend/augment/`.
-
-Color augmentation additionally uses **SAM3** from Meta:
-
-- Source: <https://github.com/facebookresearch/sam3>
-- License: the `SAM License` distributed in that repository
-- Checkpoint access: follow the upstream repository and its linked Hugging Face page
-
-SAM3 source code and model weights are not redistributed by Embodit. Install
-SAM3 into a separate environment, select it with `AUGMENT_PYTHON`, and place an
-authorized checkpoint at the default repository path `checkpoints/sam3.pt` or
-set `AUGMENT_SAM3_CHECKPOINT` to its absolute path. By using SAM3 you accept its
-upstream license and usage restrictions.
-
-The readiness check verifies required package metadata and imports PyTorch only
-to confirm CUDA availability and GPU count. Model weights are loaded only by
-the detached color worker when a preview or batch job starts.

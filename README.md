@@ -37,7 +37,7 @@ access-control gateway, or independent hardware safety chain.
 |---|---|
 | Dataset inspection | LeRobot v2.1/v3, recognized RoboMimic/Astribot-style HDF5, and MCAP; timeline-aligned cameras, task text, state, and action series |
 | Data governance | `pass/review/quarantine` decisions, episode/interval labels, configurable reasons, automatic QC, finding review, CSV reports |
-| Data processing | Native subset export, fidelity-aware conversion, strict same-format merge, built-in brightness augmentation, optional SAM3-assisted color augmentation |
+| Data processing | Native subset export, fidelity-aware conversion, and strict same-format merge |
 | Model integration | Custom Python models, OpenPI, LeRobot, StarVLA, or an existing compatible service; model weights are not bundled |
 | Robot deployment | Composable Robot/Model Configs, Recipe v2, SSH/systemd orchestration, restricted model tunnel, ROS readiness, Dry Run, offline single-frame evaluation, Live mode, monitoring, rollback, and emergency software stop |
 
@@ -67,7 +67,7 @@ Core workspace:
 
 Robot deployment additionally requires a usable systemd manager on each target.
 Remote targets require OpenSSH access; a robot colocated with Embodit may run
-directly as a local target. ROS, CUDA, SAM3, provider-specific Python environments,
+directly as a local target. ROS, CUDA, provider-specific Python environments,
 checkpoints, and vendor SDKs are optional components that must be installed
 separately for the workflows that use them.
 
@@ -155,10 +155,10 @@ The full data-specific environment reference is in the
 4. Save review progress to `*.review.json`; labels use the dataset's fixed
    sidecar (`labels.jsonl` for directory datasets or
    `<filename>.labels.jsonl` for file datasets).
-5. Export selected episodes, convert formats, strictly merge compatible
-   datasets, or preview and run augmentation into a new output path.
+5. Export selected episodes, convert formats, or strictly merge compatible
+   datasets into a new output path.
 
-QC, conversion, merge, and augmentation run in detached workers. Closing the
+QC, conversion, and merge run in detached workers. Closing the
 browser does not stop them. Details, fidelity limits, thresholds, and cleanup
 policy are documented in the [data guide](docs/data/README.md).
 
@@ -233,9 +233,9 @@ Read [SECURITY.md](SECURITY.md) before LAN access or robot deployment.
 
 | Document | Scope |
 |---|---|
-| [Data guide](docs/data/README.md) | Formats, review, labels, QC, conversion, merge, augmentation, jobs, and cleanup |
+| [Data guide](docs/data/README.md) | Formats, review, labels, QC, conversion, merge, jobs, and cleanup |
 | [Deployment guide](docs/deployment/README.md) | Robot/Model Config fields, Recipe lifecycle, safety, offline evaluation, Dry Run, and Live |
-| [Third-party components](third_party/README.md) | Pinned source integrations, model/SAM3 ownership, and license boundaries |
+| [Third-party components](third_party/README.md) | Pinned model-provider integrations, ownership, and license boundaries |
 | [Contributing](CONTRIBUTING.md) | Development setup, checks, and pull-request expectations |
 | [Security policy](SECURITY.md) | Supported versions, reporting, threat model, and robot safety |
 | [Changelog](CHANGELOG.md) | Release-level changes |
@@ -248,8 +248,8 @@ the complete validation matrix, and pull-request expectations.
 ## License and third-party software
 
 Embodit-owned source is licensed under the [MIT License](LICENSE). Git
-submodules, model weights, checkpoints, datasets, SAM3, FFmpeg builds, and other
+submodules, model weights, checkpoints, datasets, FFmpeg builds, and other
 third-party assets retain their own licenses and usage terms. Embodit does not
-redistribute provider checkpoints or SAM3 weights. Review
+redistribute provider checkpoints. Review
 [third_party/README.md](third_party/README.md) and the license attached to every
 asset before use or redistribution.

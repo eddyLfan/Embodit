@@ -21,18 +21,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _default_sam3_checkpoint() -> Path:
-    """Return an explicit override or the repository-local checkpoint path."""
-    override = os.environ.get("AUGMENT_SAM3_CHECKPOINT", "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    local = PROJECT_ROOT / "checkpoints" / "sam3.pt"
-    return local
-
-
-# SAM3 checkpoint for color augmentation (override: AUGMENT_SAM3_CHECKPOINT).
-SAM3_CHECKPOINT = _default_sam3_checkpoint()
-
 # Fallback fps for HDF5 datasets whose env_args carry no control frequency
 # (override: EMBODIT_HDF5_FPS).
 HDF5_DEFAULT_FPS = _env_float("EMBODIT_HDF5_FPS", 20.0)
@@ -55,6 +43,15 @@ REVIEW_CONFIG_PATH = (
     else DATA_CONFIG_DIR / "review.json"
 )
 
+# User-facing generated artifacts belong to a stable output root independent
+# of the dataset browse root (override: EMBODIT_OUTPUT_DIR).
+_output_override = os.environ.get("EMBODIT_OUTPUT_DIR", "").strip()
+OUTPUT_DIR = (
+    Path(_output_override).expanduser().resolve()
+    if _output_override
+    else PROJECT_ROOT / "outputs"
+)
+
 # All generated cache, previews, detached job state and QC reports live under
 # one root.  Keeping this outside source datasets guarantees that maintenance
 # never mutates training payloads.
@@ -69,10 +66,7 @@ CACHE_DIR = (
 # for callers that only need to validate that a report is under the cache root.
 JOBS_DIR = CACHE_DIR / "jobs"
 CONVERT_JOBS_DIR = JOBS_DIR / "convert"
-AUGMENT_JOBS_DIR = JOBS_DIR / "augment"
 QC_JOBS_DIR = JOBS_DIR / "qc"
-AUGMENT_PREVIEW_DIR = CACHE_DIR / "previews" / "augment"
-SAM_TRACK_CACHE_DIR = CACHE_DIR / "reusable" / "sam_tracks"
 HDF5_VIDEO_CACHE_DIR = CACHE_DIR / "media" / "hdf5"
 MCAP_VIDEO_CACHE_DIR = CACHE_DIR / "media" / "mcap"
 QC_REPORT_DIR = CACHE_DIR / "reports" / "qc"

@@ -180,6 +180,39 @@ def model_io_snapshot(
     pipeline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the bounded, model-facing input/output view exposed to the UI."""
+    preview = observation_preview_snapshot(observations, config)
+    action_spec = (
+        config.get("telemetry", {}).get("action")
+        if isinstance(config.get("telemetry"), dict)
+        else {}
+    )
+    action_spec = action_spec if isinstance(action_spec, dict) else {}
+    action_names, action_units = _display_metadata(action_spec, len(actions[0]), "action")
+    prompt = observations.get("prompt")
+    return {
+        "capturedMonotonicNs": time.monotonic_ns(),
+        "input": {
+            "cameras": preview["cameras"],
+            "state": preview["state"],
+            "prompt": prompt if isinstance(prompt, str) else None,
+        },
+        "output": {
+            "action": {
+                "names": action_names,
+                "units": action_units,
+                "chunk": actions,
+            },
+            "inferenceLatencyMs": float(latency_ms),
+            "pipeline": dict(pipeline or {}),
+        },
+    }
+
+
+def observation_preview_snapshot(
+    observations: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a camera/state preview independent from model inference cadence."""
     telemetry = config.get("telemetry") if isinstance(config.get("telemetry"), dict) else {}
     maximum_bytes = int(telemetry.get("max_image_bytes", 750_000))
     camera_specs = telemetry.get("cameras")
@@ -221,26 +254,72 @@ def model_io_snapshot(
             "values": state_values,
         }
 
-    action_spec = telemetry.get("action") if isinstance(telemetry.get("action"), dict) else {}
-    action_names, action_units = _display_metadata(action_spec, len(actions[0]), "action")
-    prompt = observations.get("prompt")
     return {
         "capturedMonotonicNs": time.monotonic_ns(),
-        "input": {
-            "cameras": cameras,
-            "state": state,
-            "prompt": prompt if isinstance(prompt, str) else None,
-        },
-        "output": {
-            "action": {
-                "names": action_names,
-                "units": action_units,
-                "chunk": actions,
-            },
-            "inferenceLatencyMs": float(latency_ms),
-            "pipeline": dict(pipeline or {}),
-        },
+        "cameras": cameras,
+        "state": state,
     }
+
+
+class LivePreviewPublisher:
+    """Publish recent observations without coupling UI video to inference calls."""
+
+    def __init__(
+        self,
+        path: str,
+        observe: Any,
+        config: dict[str, Any],
+    ) -> None:
+        self.path = Path(path)
+        self.observe = observe
+        self.config = config
+        telemetry = config.get("telemetry") if isinstance(config.get("telemetry"), dict) else {}
+        self.rate_hz = min(15.0, max(0.5, float(telemetry.get("preview_rate_hz", 8))))
+        self.stop_requested = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.thread is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="embodit-live-preview",
+        )
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_requested.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+
+    def _run(self) -> None:
+        period = 1.0 / self.rate_hz
+        deadline = time.monotonic()
+        while not self.stop_requested.is_set():
+            try:
+                observations = self.observe()
+                value = observation_preview_snapshot(observations, self.config)
+                value["rateHz"] = self.rate_hz
+                temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+                temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+                temporary.replace(self.path)
+            except Exception as error:  # noqa: BLE001
+                value = {
+                    "capturedMonotonicNs": time.monotonic_ns(),
+                    "error": str(error),
+                    "rateHz": self.rate_hz,
+                }
+                temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+                temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+                temporary.replace(self.path)
+            deadline += period
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self.stop_requested.wait(remaining)
+            else:
+                deadline = time.monotonic()
 
 
 class TrajectoryHistory:
@@ -282,12 +361,17 @@ class TrajectoryHistory:
         self.names = list(action.get("names") or self.names)
         self.units = list(action.get("units") or self.units)
         if isinstance(chunk, list):
+            try:
+                skipped = int(action.get("skippedPrefixSteps") or 0)
+            except (TypeError, ValueError):
+                skipped = 0
+            skipped = min(len(chunk), max(0, skipped))
             self.sequence += 1
-            for index, row in enumerate(chunk):
+            for index, row in enumerate(chunk[skipped:], start=skipped):
                 if isinstance(row, list):
                     self.planned.append(
                         {
-                            "tNs": captured + index * self.period_ns,
+                            "tNs": captured + (index - skipped) * self.period_ns,
                             "values": list(row),
                             "chunk": self.sequence,
                             "step": index,
@@ -339,6 +423,51 @@ def numerical_tolerances(config: dict[str, Any], width: int) -> list[float]:
     ):
         raise ValueError("动作 numerical_tolerance 必须是非负有限数值或与 width 等长的数组")
     return [float(value) for value in values]
+
+
+def resolve_action_constraints(
+    configured: dict[str, Any],
+    adapter: Any | None,
+    *,
+    timeout_s: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prefer absolute limits reported by the connected robot over copied values."""
+    effective = dict(configured)
+    metadata: dict[str, Any] = {"source": "config", "fields": []}
+    getter = getattr(adapter, "get_action_limits", None) if adapter is not None else None
+    if not callable(getter):
+        return effective, metadata
+
+    reported = (
+        call_with_timeout(getter, timeout_s, "get_action_limits()")
+        if timeout_s is not None
+        else getter()
+    )
+    if not isinstance(reported, dict):
+        raise TypeError("Robot Adapter get_action_limits() 必须返回对象")
+    if "minimum" not in reported or "maximum" not in reported:
+        raise ValueError("Robot Adapter get_action_limits() 必须包含 minimum 和 maximum")
+    width = int(configured["width"])
+    limits: dict[str, list[float]] = {}
+    for key in ("minimum", "maximum"):
+        values = reported[key]
+        if (
+            not isinstance(values, list)
+            or len(values) != width
+            or not all(_finite_number(item) for item in values)
+        ):
+            raise ValueError(f"Robot Adapter {key} 必须是 {width} 维有限数值数组")
+        limits[key] = [float(item) for item in values]
+    if any(low >= high for low, high in zip(limits["minimum"], limits["maximum"])):
+        raise ValueError("Robot Adapter minimum 必须逐维小于 maximum")
+
+    effective.update(limits)
+    metadata = {
+        "source": "adapter",
+        "fields": ["minimum", "maximum"],
+        **limits,
+    }
+    return effective, metadata
 
 
 def validate_action(values: Any, config: dict[str, Any], baseline: Any) -> list[list[float]]:
@@ -443,6 +572,71 @@ def resolve_action_scheduler(
     }
 
 
+def align_async_action_chunk(
+    actions: list[list[float]],
+    *,
+    elapsed_steps: int,
+    maximum_steps: int,
+) -> list[list[float]]:
+    """Drop action rows that became stale while an asynchronous request ran."""
+    if isinstance(elapsed_steps, bool) or not isinstance(elapsed_steps, int) or elapsed_steps < 0:
+        raise ValueError("异步动作 elapsed_steps 必须是非负整数")
+    if isinstance(maximum_steps, bool) or not isinstance(maximum_steps, int) or maximum_steps <= 0:
+        raise ValueError("异步动作 maximum_steps 必须是正整数")
+    available = min(len(actions), maximum_steps)
+    if elapsed_steps >= available:
+        raise RuntimeError(
+            f"异步推理返回时整段动作已过期：elapsed_steps={elapsed_steps}, available={available}"
+        )
+    return [list(row) for row in actions[elapsed_steps:available]]
+
+
+def resolve_runtime_action_scheduler(
+    control: dict[str, Any],
+    horizon: int,
+    *,
+    available_steps: int,
+    skipped_steps: int = 0,
+    inference_latency_ms: float | None = None,
+    rate_hz: float | None = None,
+) -> dict[str, Any]:
+    """Resolve the scheduler for the non-stale suffix currently available."""
+    configured = resolve_action_scheduler(
+        control,
+        horizon,
+        inference_latency_ms=inference_latency_ms,
+        rate_hz=rate_hz,
+    )
+    if configured["mode"] != "asynchronous":
+        return configured
+    if isinstance(available_steps, bool) or not isinstance(available_steps, int):
+        raise ValueError("异步动作 available_steps 必须是整数")
+    execution_steps = min(int(configured["actionSteps"]), available_steps)
+    if execution_steps < 2:
+        raise RuntimeError("异步推理没有足够的新鲜动作继续预取")
+
+    runtime_control = dict(control)
+    runtime_control["action_steps"] = execution_steps
+    asynchronous = dict(runtime_control.get("asynchronous") or {})
+    configured_request_after = asynchronous.get("request_after_steps", "auto")
+    adjusted = False
+    if isinstance(configured_request_after, int) and not isinstance(configured_request_after, bool):
+        if configured_request_after >= execution_steps:
+            asynchronous["request_after_steps"] = execution_steps - 1
+            adjusted = True
+    runtime_control["asynchronous"] = asynchronous
+    runtime = resolve_action_scheduler(
+        runtime_control,
+        horizon,
+        inference_latency_ms=inference_latency_ms,
+        rate_hz=rate_hz,
+    )
+    runtime["configuredActionSteps"] = int(configured["actionSteps"])
+    runtime["skippedPrefixSteps"] = int(skipped_steps)
+    runtime["prefetchAdjusted"] = adjusted
+    return runtime
+
+
 def start_async_inference(
     model: "ModelClient",
     observations: dict[str, Any],
@@ -497,7 +691,12 @@ class StatusWriter:
             self.model_io = values["modelIo"]
         elif self.model_io is not None:
             values["modelIo"] = self.model_io
-        for key in ("trajectoryHistory", "scheduler", "runtimeTiming"):
+        for key in (
+            "trajectoryHistory",
+            "scheduler",
+            "runtimeTiming",
+            "actionConstraints",
+        ):
             if key in values:
                 self.sticky[key] = values[key]
             elif key in self.sticky:
@@ -519,10 +718,11 @@ class ModelClient:
     def infer(self, observations: dict[str, Any]) -> tuple[Any, float]:
         endpoint = self.config["endpoint"].rstrip("/") + self.config.get("infer_path", "/infer")
         serialization_started = time.perf_counter()
+        sequence = self.sequence
         body = json.dumps(
             {
                 "protocolVersion": 2,
-                "sequence": self.sequence,
+                "sequence": sequence,
                 "capturedMonotonicNs": time.monotonic_ns(),
                 "observations": transport_safe(observations),
             },
@@ -556,6 +756,24 @@ class ModelClient:
             "requestBytes": len(body),
             "responseBytes": len(payload),
         }
+        if not isinstance(result, dict):
+            raise RuntimeError("模型响应必须是对象")
+        protocol_version = result.get("protocolVersion")
+        if protocol_version not in {None, 2}:
+            raise RuntimeError(f"模型响应协议版本不兼容：{protocol_version}")
+        response_sequence = result.get("sequence")
+        if response_sequence is not None and response_sequence != sequence:
+            raise RuntimeError(
+                f"模型响应序号不匹配：request={sequence}, response={response_sequence}"
+            )
+        server_metrics = result.get("metrics")
+        if isinstance(server_metrics, dict):
+            server_inference_ms = server_metrics.get("serverInferenceMs")
+            if _finite_number(server_inference_ms):
+                self.last_metrics["serverInferenceMs"] = float(server_inference_ms)
+                self.last_metrics["networkAndProtocolMs"] = max(
+                    0.0, latency_ms - float(server_inference_ms)
+                )
         action = result.get("action", result) if isinstance(result, dict) else result
         return action.get("values") if isinstance(action, dict) else None, latency_ms
 
@@ -625,9 +843,31 @@ def hold_action_chunk(config: dict[str, Any], baseline: Any) -> list[list[float]
 
 def run(config: dict[str, Any]) -> None:
     mode = os.environ.get("EMBODIT_DEPLOYMENT_MODE", "dry_run")
-    if mode not in {"dry_run", "live"}:
-        raise ValueError("EMBODIT_DEPLOYMENT_MODE 必须是 dry_run 或 live")
+    if mode not in {"observe", "dry_run", "live"}:
+        raise ValueError("EMBODIT_DEPLOYMENT_MODE 必须是 observe、dry_run 或 live")
     prompt = str(config.get("task_prompt") or config.get("default_prompt") or "").strip()
+    runtime_control_path = config.get("runtime_control_path")
+    runtime_control_file = Path(runtime_control_path) if isinstance(runtime_control_path, str) else None
+    runtime_control_mtime_ns: int | None = None
+
+    def refresh_prompt() -> str:
+        nonlocal prompt, runtime_control_mtime_ns
+        if runtime_control_file is None:
+            return prompt
+        try:
+            stat = runtime_control_file.stat()
+            if stat.st_mtime_ns == runtime_control_mtime_ns:
+                return prompt
+            value = json.loads(runtime_control_file.read_text(encoding="utf-8"))
+            next_prompt = value.get("task_prompt") if isinstance(value, dict) else None
+            if isinstance(next_prompt, str) and next_prompt.strip():
+                prompt = next_prompt.strip()
+                runtime_control_mtime_ns = stat.st_mtime_ns
+        except (OSError, ValueError, json.JSONDecodeError):
+            # A writer may briefly be replacing the small control file. Keep the
+            # last valid prompt and retry on the next observation/inference.
+            pass
+        return prompt
     status = StatusWriter(config["status_path"])
     model = ModelClient(config["model"])
     control = config.get("control", {})
@@ -639,19 +879,35 @@ def run(config: dict[str, Any]) -> None:
     signal.signal(signal.SIGINT, lambda *_args: stopping.__setitem__("value", True))
     status.write("starting", mode=mode)
     adapter = None
+    preview_publisher: LivePreviewPublisher | None = None
+    observation_lock = threading.Lock()
     dry_run_source = str(config.get("dry_run_observation_source", "synthetic"))
     observation_latency_ms = 0.0
 
     def observe(current_adapter: Any) -> tuple[dict[str, Any], float]:
         started = time.perf_counter()
-        result = call_with_timeout(current_adapter.observe, watchdog_timeout_s, "observe()")
+        with observation_lock:
+            result = call_with_timeout(current_adapter.observe, watchdog_timeout_s, "observe()")
         latency = (time.perf_counter() - started) * 1000
         if not isinstance(result, dict):
             raise TypeError("Robot Adapter observe() 必须返回对象")
         return result, latency
 
+    def observe_preview(current_adapter: Any) -> dict[str, Any]:
+        with observation_lock:
+            result = current_adapter.observe()
+        if not isinstance(result, dict):
+            raise TypeError("Robot Adapter observe() 必须返回对象")
+        return mapped_observations(result, config.get("observation_map"))
+
     try:
-        if mode == "dry_run":
+        if mode == "observe":
+            adapter = resolve_adapter(config["adapter"])
+            observation_starter = getattr(adapter, "start_observation", None)
+            if callable(observation_starter):
+                observation_starter()
+            observations, observation_latency_ms = observe(adapter)
+        elif mode == "dry_run":
             if dry_run_source == "synthetic":
                 observations = expand_synthetic(config["dry_run_observations"])
             elif dry_run_source == "adapter":
@@ -671,8 +927,31 @@ def run(config: dict[str, Any]) -> None:
         if not isinstance(observations, dict):
             raise TypeError("Robot Adapter observe() 必须返回对象")
         observations = mapped_observations(observations, config.get("observation_map"))
-        if prompt:
-            observations["prompt"] = prompt
+        if adapter is not None and config.get("preview_status_path"):
+            preview_publisher = LivePreviewPublisher(
+                str(config["preview_status_path"]),
+                lambda: observe_preview(adapter),
+                config,
+            )
+            preview_publisher.start()
+        if mode == "observe":
+            status.write(
+                "ready",
+                mode=mode,
+                hardwareActive=False,
+                observationOnly=True,
+                observationLatencyMs=observation_latency_ms,
+            )
+            while not stopping["value"]:
+                time.sleep(0.25)
+            return
+        effective_action, action_constraints = resolve_action_constraints(
+            config["action"], adapter, timeout_s=watchdog_timeout_s
+        )
+        config = {**config, "action": effective_action}
+        active_prompt = refresh_prompt()
+        if active_prompt:
+            observations["prompt"] = active_prompt
         baseline_key = str(config["action"]["baseline_observation"])
         values, latency_ms = model.infer(observations)
         actions = normalize_action(values, config["action"])
@@ -692,26 +971,33 @@ def run(config: dict[str, Any]) -> None:
         )
         trajectory = TrajectoryHistory(config, telemetry_rate_hz)
         trajectory.record_inference(model_io)
-        safety_rejections = 0
-        last_safety_error = None
-        safety_error = None
-        try:
-            actions = validate_action(actions, config["action"], observations.get(baseline_key))
-        except ActionSafetyError as error:
-            safety_error = str(error)
-            last_safety_error = safety_error
-            safety_rejections = 1
-            actions = hold_action_chunk(config["action"], observations.get(baseline_key))
         scheduler = (
-            resolve_action_scheduler(
+            resolve_runtime_action_scheduler(
                 control,
                 int(config["action"]["horizon"]),
+                available_steps=min(
+                    len(actions), int(control.get("action_steps", len(actions)))
+                ),
                 inference_latency_ms=latency_ms,
                 rate_hz=float(control.get("rate_hz", 10)),
             )
             if mode == "live"
             else None
         )
+        if scheduler is not None:
+            actions = actions[: int(scheduler["actionSteps"])]
+        safety_rejections = 0
+        last_safety_error = None
+        safety_error = None
+        safety_config = dict(config["action"])
+        safety_config["horizon"] = len(actions)
+        try:
+            actions = validate_action(actions, safety_config, observations.get(baseline_key))
+        except ActionSafetyError as error:
+            safety_error = str(error)
+            last_safety_error = safety_error
+            safety_rejections = 1
+            actions = hold_action_chunk(safety_config, observations.get(baseline_key))
         status.write(
             "ready",
             mode=mode,
@@ -722,6 +1008,7 @@ def run(config: dict[str, Any]) -> None:
             safetyPassed=safety_error is None,
             safetyError=last_safety_error,
             safetyRejections=safety_rejections,
+            actionConstraints=action_constraints,
             modelIo=model_io,
             trajectoryHistory=trajectory.snapshot(),
         )
@@ -741,8 +1028,9 @@ def run(config: dict[str, Any]) -> None:
                 started = time.monotonic()
                 observations, observation_latency_ms = observe(adapter)
                 observations = mapped_observations(observations, config.get("observation_map"))
-                if prompt:
-                    observations["prompt"] = prompt
+                active_prompt = refresh_prompt()
+                if active_prompt:
+                    observations["prompt"] = active_prompt
                 values, latency_ms = model.infer(observations)
                 actions = normalize_action(values, config["action"])
                 pipeline = {
@@ -796,6 +1084,7 @@ def run(config: dict[str, Any]) -> None:
         period = 1.0 / rate_hz
         steps = 0
         action_steps = int(scheduler["actionSteps"])
+        configured_action_steps = int(control.get("action_steps", config["action"]["horizon"]))
         inference_mode = str(scheduler["mode"])
         request_after_steps = scheduler.get("requestAfterSteps")
         actions = actions[:action_steps]
@@ -805,12 +1094,17 @@ def run(config: dict[str, Any]) -> None:
         schedule_lags_ms: list[float] = []
         while not stopping["value"] and (maximum_steps is None or steps < maximum_steps):
             pending: tuple[threading.Event, dict[str, Any]] | None = None
+            pending_capture_step: int | None = None
             for chunk_step, action in enumerate(actions, start=1):
                 if stopping["value"] or (maximum_steps is not None and steps >= maximum_steps):
+                    break
+                if inference_mode == "asynchronous" and pending is not None and pending[0].is_set():
                     break
                 remaining = next_action_at - time.monotonic()
                 if remaining > 0:
                     time.sleep(remaining)
+                if inference_mode == "asynchronous" and pending is not None and pending[0].is_set():
+                    break
                 applied_at = time.monotonic()
                 schedule_lags_ms.append(max(0.0, (applied_at - next_action_at) * 1000))
                 apply_started = time.perf_counter()
@@ -834,11 +1128,13 @@ def run(config: dict[str, Any]) -> None:
                     next_observations = mapped_observations(
                         next_observations, config.get("observation_map")
                     )
-                    if prompt:
-                        next_observations["prompt"] = prompt
+                    active_prompt = refresh_prompt()
+                    if active_prompt:
+                        next_observations["prompt"] = active_prompt
                     pending = start_async_inference(
                         model, next_observations, config, next_observation_latency_ms
                     )
+                    pending_capture_step = steps
 
             if stopping["value"] or (maximum_steps is not None and steps >= maximum_steps):
                 break
@@ -846,6 +1142,8 @@ def run(config: dict[str, Any]) -> None:
             if inference_mode == "asynchronous":
                 if pending is None:
                     raise RuntimeError("异步推理未在配置的动作步触发")
+                if pending_capture_step is None:
+                    raise RuntimeError("异步推理缺少观测对应的执行步")
                 done, inference = pending
                 while not done.wait(0.01):
                     if stopping["value"]:
@@ -859,14 +1157,22 @@ def run(config: dict[str, Any]) -> None:
                 next_actions = inference["actions"]
                 latency_ms = float(inference["latencyMs"])
                 model_io = inference["modelIo"]
+                skipped_prefix_steps = steps - pending_capture_step
+                next_actions = align_async_action_chunk(
+                    next_actions,
+                    elapsed_steps=skipped_prefix_steps,
+                    maximum_steps=configured_action_steps,
+                )
+                model_io["output"]["action"]["skippedPrefixSteps"] = skipped_prefix_steps
                 # If inference exceeded the remaining chunk time, resume from now;
                 # never burst actions to catch up with stale deadlines.
                 next_action_at = max(next_action_at, time.monotonic())
             else:
                 observations, observation_latency_ms = observe(adapter)
                 observations = mapped_observations(observations, config.get("observation_map"))
-                if prompt:
-                    observations["prompt"] = prompt
+                active_prompt = refresh_prompt()
+                if active_prompt:
+                    observations["prompt"] = active_prompt
                 values, latency_ms = model.infer(observations)
                 next_actions = normalize_action(values, config["action"])
                 pipeline = {
@@ -880,15 +1186,19 @@ def run(config: dict[str, Any]) -> None:
                 # Synchronous inference intentionally pauses action output. Resume
                 # from a fresh clock instead of catching up with an unsafe burst.
                 next_action_at = time.monotonic()
+                skipped_prefix_steps = 0
+
+            if inference_mode == "synchronous":
+                next_actions = next_actions[:configured_action_steps]
 
             safety_error = None
             safety_baseline = observations.get(baseline_key)
-            safety_config = config["action"]
+            safety_config = dict(config["action"])
+            safety_config["horizon"] = len(next_actions)
             if inference_mode == "asynchronous":
                 if last_applied_action is None:
                     raise RuntimeError("异步动作连续性检查缺少最后已执行动作")
                 safety_baseline = last_applied_action
-                safety_config = dict(config["action"])
                 safety_config["initial_max_step"] = list(safety_config["max_step"])
             try:
                 next_actions = validate_action(
@@ -902,17 +1212,21 @@ def run(config: dict[str, Any]) -> None:
                 last_safety_error = safety_error
                 safety_rejections += 1
                 next_actions = hold_action_chunk(
-                    config["action"], safety_baseline
+                    safety_config, safety_baseline
                 )
             status.remember_model_io(model_io)
             trajectory.record_inference(model_io)
-            actions = next_actions[:action_steps]
-            scheduler = resolve_action_scheduler(
+            actions = next_actions
+            scheduler = resolve_runtime_action_scheduler(
                 control,
                 int(config["action"]["horizon"]),
+                available_steps=len(actions),
+                skipped_steps=skipped_prefix_steps,
                 inference_latency_ms=latency_ms,
                 rate_hz=rate_hz,
             )
+            action_steps = int(scheduler["actionSteps"])
+            actions = actions[:action_steps]
             request_after_steps = scheduler.get("requestAfterSteps")
             runtime_timing = {
                 "targetRateHz": rate_hz,
@@ -958,14 +1272,258 @@ def run(config: dict[str, Any]) -> None:
         status.write("fault", mode=mode, error=str(error))
         raise
     finally:
+        if preview_publisher is not None:
+            preview_publisher.stop()
         if adapter is not None:
-            stopper_name = "stop_observation" if mode == "dry_run" else "stop"
+            stopper_name = "stop_observation" if mode in {"observe", "dry_run"} else "stop"
             stopper = getattr(adapter, stopper_name, None)
             if callable(stopper):
                 try:
                     call_with_timeout(stopper, watchdog_timeout_s, f"{stopper_name}()")
                 except Exception as error:
                     status.write("fault", mode=mode, error=f"Robot Adapter {stopper_name}() 失败：{error}")
+
+
+def replay_actions(config: dict[str, Any], replay: dict[str, Any]) -> dict[str, Any]:
+    """Replay an absolute joint-action trajectory through the generic adapter."""
+
+    raw_actions = replay.get("actions")
+    width = int(config["action"]["width"])
+    if (
+        not isinstance(raw_actions, list)
+        or not raw_actions
+        or len(raw_actions) > 100_000
+        or any(
+            not isinstance(row, list)
+            or len(row) != width
+            or not all(_finite_number(value) for value in row)
+            for row in raw_actions
+        )
+    ):
+        raise ValueError(f"Replay 动作必须是非空且不超过 100000 帧的 [时间, {width}] 数组")
+    actions = [[float(value) for value in row] for row in raw_actions]
+    fps = float(replay.get("fps", 0))
+    move_duration_s = float(replay.get("move_to_start_duration_s", 3.0))
+    control = config.get("control", {})
+    control = control if isinstance(control, dict) else {}
+    rate_hz = float(control.get("rate_hz", 10))
+    watchdog_timeout_s = float(control.get("watchdog_timeout_s", 1))
+    if not math.isfinite(fps) or fps <= 0 or fps > rate_hz * 1.01:
+        raise ValueError(
+            f"Replay FPS 必须大于 0 且不高于本体控制频率 {rate_hz:g} Hz"
+        )
+    if not math.isfinite(move_duration_s) or not 0 < move_duration_s <= 60:
+        raise ValueError("move_to_start_duration_s 必须在 0 到 60 秒之间")
+
+    status = StatusWriter(config["status_path"])
+    adapter = resolve_adapter(config["adapter"])
+    stopping = {"value": False}
+    signal.signal(signal.SIGTERM, lambda *_args: stopping.__setitem__("value", True))
+    signal.signal(signal.SIGINT, lambda *_args: stopping.__setitem__("value", True))
+    started = time.monotonic()
+    frames_applied = 0
+    commands_sent = 0
+    frames_skipped = 0
+    replay_elapsed_s = 0.0
+    try:
+        status.write("starting", mode="replay", hardwareActive=False)
+        starter = getattr(adapter, "start", None)
+        if callable(starter):
+            call_with_timeout(starter, watchdog_timeout_s, "start()")
+        observations = call_with_timeout(
+            adapter.observe, watchdog_timeout_s, "observe()"
+        )
+        if not isinstance(observations, dict):
+            raise TypeError("Robot Adapter observe() 必须返回对象")
+        observations = mapped_observations(observations, config.get("observation_map"))
+        effective_action, constraints = resolve_action_constraints(
+            config["action"], adapter, timeout_s=watchdog_timeout_s
+        )
+        baseline_key = str(effective_action["baseline_observation"])
+        current = observations.get(baseline_key)
+        if (
+            not isinstance(current, list)
+            or len(current) != width
+            or not all(_finite_number(value) for value in current)
+        ):
+            raise ValueError("当前本体受控关节状态不是正确维度的有限数值数组")
+        current = [float(value) for value in current]
+
+        replay_check = dict(effective_action)
+        replay_check["horizon"] = len(actions)
+        replay_interval_scale = max(1.0, rate_hz / fps)
+        replay_check["max_step"] = [
+            float(step) * replay_interval_scale
+            for step in effective_action["max_step"]
+        ]
+        actions = validate_action(actions, replay_check, actions[0])
+        target_check = dict(effective_action)
+        target_check["horizon"] = 1
+        target_check["max_step"] = [
+            max(float(step), float(high) - float(low))
+            for step, low, high in zip(
+                effective_action["max_step"],
+                effective_action["minimum"],
+                effective_action["maximum"],
+            )
+        ]
+        start_target = validate_action([actions[0]], target_check, current)[0]
+        max_step = [float(value) for value in effective_action["max_step"]]
+        transition_steps = max(
+            1,
+            math.ceil(move_duration_s * rate_hz),
+            max(
+                math.ceil(abs(target - actual) / step)
+                for target, actual, step in zip(start_target, current, max_step)
+            ),
+        )
+        transition_check = dict(effective_action)
+        transition_check["horizon"] = transition_steps
+        transition_rows = [
+            [
+                actual + (target - actual) * index / transition_steps
+                for actual, target in zip(current, start_target)
+            ]
+            for index in range(1, transition_steps + 1)
+        ]
+        transition_rows = validate_action(
+            transition_rows, transition_check, current
+        )
+        transition_started = time.monotonic()
+        transition_index = 0
+        status.write(
+            "moving_to_start",
+            mode="replay",
+            hardwareActive=True,
+            totalFrames=len(actions),
+            framesApplied=0,
+            actionConstraints=constraints,
+        )
+        while transition_index < transition_steps and not stopping["value"]:
+            scheduled_at = transition_started + transition_index / rate_hz
+            remaining = scheduled_at - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            if stopping["value"]:
+                break
+            due_index = min(
+                transition_steps - 1,
+                max(
+                    transition_index,
+                    int((time.monotonic() - transition_started) * rate_hz),
+                ),
+            )
+            call_with_timeout(
+                adapter.apply_action,
+                watchdog_timeout_s,
+                "apply_action()",
+                transition_rows[due_index],
+            )
+            transition_index = due_index + 1
+        transition_remaining = (
+            transition_started + transition_steps / rate_hz - time.monotonic()
+        )
+        if transition_remaining > 0 and not stopping["value"]:
+
+            time.sleep(transition_remaining)
+        if not stopping["value"]:
+            status.write(
+                "replaying",
+                mode="replay",
+                hardwareActive=True,
+                totalFrames=len(actions),
+                framesApplied=0,
+                fps=fps,
+                startFrame=int(replay.get("start_frame", 0)),
+                actionConstraints=constraints,
+            )
+            replay_started = time.monotonic()
+            replay_index = 0
+            last_reported = 0
+            report_every = max(1, round(fps / 5))
+            while replay_index < len(actions) and not stopping["value"]:
+                scheduled_at = replay_started + replay_index / fps
+                remaining = scheduled_at - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
+                if stopping["value"]:
+                    break
+                due_index = min(
+                    len(actions) - 1,
+                    max(
+                        replay_index,
+                        int((time.monotonic() - replay_started) * fps),
+                    ),
+                )
+                frames_skipped += due_index - replay_index
+                call_with_timeout(
+                    adapter.apply_action,
+                    watchdog_timeout_s,
+                    "apply_action()",
+                    actions[due_index],
+                )
+                commands_sent += 1
+                frames_applied = due_index + 1
+                replay_index = due_index + 1
+                if (
+                    frames_applied == 1
+                    or frames_applied - last_reported >= report_every
+                    or frames_applied == len(actions)
+                ):
+                    last_reported = frames_applied
+                    status.write(
+                        "replaying",
+                        mode="replay",
+                        hardwareActive=True,
+                        totalFrames=len(actions),
+                        framesApplied=frames_applied,
+                        commandsSent=commands_sent,
+                        framesSkipped=frames_skipped,
+                        fps=fps,
+                        startFrame=int(replay.get("start_frame", 0)),
+                    )
+            replay_remaining = (
+                replay_started + len(actions) / fps - time.monotonic()
+            )
+            if replay_remaining > 0 and not stopping["value"]:
+                time.sleep(replay_remaining)
+            replay_elapsed_s = time.monotonic() - replay_started
+        final_status = "stopped" if stopping["value"] else "finished"
+        result = {
+            "status": final_status,
+            "framesApplied": frames_applied,
+            "totalFrames": len(actions),
+            "fps": fps,
+            "durationS": time.monotonic() - started,
+            "commandsSent": commands_sent,
+            "framesSkipped": frames_skipped,
+            "timingDegraded": frames_skipped > 0,
+            "effectiveCommandHz": (
+                commands_sent / replay_elapsed_s
+                if replay_elapsed_s > 0
+                else 0
+            ),
+            "replayDurationS": replay_elapsed_s,
+        }
+        status.write(final_status, mode="replay", hardwareActive=False, **{key: value for key, value in result.items() if key != "status"})
+        return result
+    except Exception as error:
+        status.write(
+            "fault",
+            mode="replay",
+            hardwareActive=False,
+            framesApplied=frames_applied,
+            totalFrames=len(actions),
+            error=str(error),
+        )
+        raise
+    finally:
+        stopper = getattr(adapter, "stop", None)
+        if callable(stopper):
+            try:
+                call_with_timeout(stopper, watchdog_timeout_s, "stop()")
+            except Exception:
+                pass
 
 
 def move_to_pose(config: dict[str, Any], pose: dict[str, Any]) -> dict[str, Any]:
@@ -980,9 +1538,42 @@ def move_to_pose(config: dict[str, Any], pose: dict[str, Any]) -> dict[str, Any]
         raise ValueError("位姿移动 duration_s 必须在 0 到 60 秒之间")
 
     adapter = resolve_adapter(config["adapter"])
-    watchdog_timeout_s = float(config.get("control", {}).get("watchdog_timeout_s", 5.0))
+    control_config = config.get("control", {})
+    control_config = control_config if isinstance(control_config, dict) else {}
+    watchdog_timeout_s = float(control_config.get("watchdog_timeout_s", 5.0))
+    pose_return = control_config.get("pose_return", {})
+    pose_return = pose_return if isinstance(pose_return, dict) else {}
+    rate_hz = float(control_config.get("rate_hz", 10))
+    if not math.isfinite(rate_hz) or rate_hz <= 0:
+        raise ValueError("control.rate_hz 必须大于 0")
+    final_hold_s = float(pose_return.get("final_hold_s", max(0.1, 2.0 / rate_hz)))
+    settle_timeout_s = float(pose_return.get("settle_timeout_s", 5.0))
+    sample_interval_s = float(pose_return.get("sample_interval_s", max(0.05, 1.0 / rate_hz)))
+    stable_samples = pose_return.get("stable_samples", 2)
+    if not math.isfinite(final_hold_s) or not 0 <= final_hold_s <= 5:
+        raise ValueError("control.pose_return.final_hold_s 必须在 0 到 5 秒之间")
+    if not math.isfinite(settle_timeout_s) or not 0 < settle_timeout_s <= 60:
+        raise ValueError("control.pose_return.settle_timeout_s 必须在 0 到 60 秒之间")
+    if not math.isfinite(sample_interval_s) or not 0 < sample_interval_s <= 2:
+        raise ValueError("control.pose_return.sample_interval_s 必须在 0 到 2 秒之间")
+    if isinstance(stable_samples, bool) or not isinstance(stable_samples, int) or not 1 <= stable_samples <= 20:
+        raise ValueError("control.pose_return.stable_samples 必须在 1 到 20 之间")
+    tolerance_value = pose_return.get("tolerance")
+    if tolerance_value is None:
+        tolerances = None
+    elif _finite_number(tolerance_value):
+        tolerances = [float(tolerance_value)] * width
+    elif isinstance(tolerance_value, list) and len(tolerance_value) == width and all(
+        _finite_number(item) for item in tolerance_value
+    ):
+        tolerances = [float(item) for item in tolerance_value]
+    else:
+        raise ValueError(f"control.pose_return.tolerance 必须是正数或 {width} 维正数数组")
+    if tolerances is not None and any(value <= 0 for value in tolerances):
+        raise ValueError("control.pose_return.tolerance 必须逐维大于 0")
     starter = getattr(adapter, "start", None)
     stopper = getattr(adapter, "stop", None)
+    move_started = time.monotonic()
     try:
         if callable(starter):
             call_with_timeout(starter, watchdog_timeout_s, "start()")
@@ -1007,9 +1598,6 @@ def move_to_pose(config: dict[str, Any], pose: dict[str, Any]) -> dict[str, Any]
             )
         ]
         normalized_target = validate_action([target], target_check, current)[0]
-        rate_hz = float(config.get("control", {}).get("rate_hz", 10))
-        if not math.isfinite(rate_hz) or rate_hz <= 0:
-            raise ValueError("control.rate_hz 必须大于 0")
         max_step = [float(item) for item in action_config["max_step"]]
         required_steps = max(
             1,
@@ -1036,7 +1624,62 @@ def move_to_pose(config: dict[str, Any], pose: dict[str, Any]) -> dict[str, Any]
             remaining = deadline - time.monotonic()
             if remaining > 0:
                 time.sleep(remaining)
-        return {"values": normalized_target, "steps": required_steps, "duration_s": required_steps / rate_hz}
+
+        # Some adapters (including filtered vendor controllers) send from a
+        # background thread. Keep the final setpoint alive long enough to be
+        # transmitted repeatedly before reading feedback or stopping.
+        call_with_timeout(adapter.apply_action, watchdog_timeout_s, "apply_action()", normalized_target)
+        if final_hold_s > 0:
+            time.sleep(final_hold_s)
+
+        def measured_state() -> list[float]:
+            feedback = call_with_timeout(adapter.observe, watchdog_timeout_s, "observe()")
+            if not isinstance(feedback, dict):
+                raise TypeError("Robot Adapter observe() 必须返回对象")
+            feedback = mapped_observations(feedback, config.get("observation_map"))
+            values = feedback.get(baseline_key)
+            if not isinstance(values, list) or len(values) != width or not all(
+                _finite_number(item) for item in values
+            ):
+                raise ValueError("回位后的模型关节状态不是正确维度的有限数值数组")
+            return [float(item) for item in values]
+
+        observed = measured_state()
+        errors = [abs(actual - expected) for actual, expected in zip(observed, normalized_target)]
+        verified = False
+        if tolerances is not None:
+            stable = 1 if all(error <= tolerance for error, tolerance in zip(errors, tolerances)) else 0
+            settle_deadline = time.monotonic() + settle_timeout_s
+            while stable < stable_samples:
+                remaining = settle_deadline - time.monotonic()
+                if remaining <= 0:
+                    worst_index = max(range(width), key=errors.__getitem__)
+                    names = ((config.get("telemetry") or {}).get("action") or {}).get("names") or []
+                    label = names[worst_index] if worst_index < len(names) else f"joint_{worst_index}"
+                    raise RuntimeError(
+                        f"回位未达到配置精度：{label} 误差 {errors[worst_index]:.6g}，"
+                        f"容差 {tolerances[worst_index]:.6g}"
+                    )
+                time.sleep(min(sample_interval_s, remaining))
+                observed = measured_state()
+                errors = [abs(actual - expected) for actual, expected in zip(observed, normalized_target)]
+                if all(error <= tolerance for error, tolerance in zip(errors, tolerances)):
+                    stable += 1
+                else:
+                    stable = 0
+            verified = True
+        worst_index = max(range(width), key=errors.__getitem__)
+        return {
+            "values": normalized_target,
+            "observedValues": observed,
+            "errors": errors,
+            "maxError": errors[worst_index],
+            "worstIndex": worst_index,
+            "verified": verified,
+            "steps": required_steps,
+            "duration_s": required_steps / rate_hz,
+            "totalDurationS": time.monotonic() - move_started,
+        }
     finally:
         if callable(stopper):
             try:
@@ -1049,11 +1692,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Embodit generic Python Robot Adapter runtime")
     parser.add_argument("--config", required=True)
     parser.add_argument("--move-pose")
+    parser.add_argument("--replay-actions")
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
     if args.move_pose:
         pose = json.loads(Path(args.move_pose).read_text(encoding="utf-8"))
         print(json.dumps(move_to_pose(config, pose), ensure_ascii=False))
+    elif args.replay_actions:
+        replay = json.loads(Path(args.replay_actions).read_text(encoding="utf-8"))
+        print(json.dumps(replay_actions(config, replay), ensure_ascii=False))
     else:
         run(config)
     return 0

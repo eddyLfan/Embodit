@@ -6,6 +6,7 @@ const path = require('path');
 
 const webRoot = __dirname;
 const appPath = path.join(webRoot, 'app.js');
+const indexPath = path.join(webRoot, 'index.html');
 const stylesPath = path.join(webRoot, 'styles.css');
 const utilsPath = path.join(webRoot, 'utils.js');
 
@@ -158,8 +159,17 @@ assert.notEqual(
 );
 
 const appSource = fs.readFileSync(appPath, 'utf8');
+const htmlSource = fs.readFileSync(indexPath, 'utf8');
 assert.equal(appSource.includes('setInterval(refreshDeploymentSession'), false);
 assert.ok(appSource.includes('state.deploymentTimer = window.setTimeout(poll, 500)'));
+assert.ok(appSource.includes('nextPreviewAt += 125'));
+assert.ok(appSource.includes('Math.max(0, nextPreviewAt - performance.now())'));
+assert.ok(appSource.includes('/live-preview'));
+assert.ok(appSource.includes('?includePreview=false'));
+assert.ok(appSource.includes('includeModelImages=false'));
+assert.ok(appSource.includes('trajectoryPoints=360'));
+assert.ok(appSource.includes('deploymentConfigsReady'));
+assert.ok(appSource.includes('const configsReady = state.deploymentConfigsReady'));
 assert.ok(appSource.includes('generation !== state.deploymentPollGeneration'));
 assert.ok(appSource.includes('state.deploymentOfflineDatasetMeta = { path, metadata }'));
 assert.ok(appSource.includes("addEventListener('click', () => loadDeploymentOfflineDataset())"));
@@ -168,8 +178,94 @@ assert.ok(appSource.includes('state.deploymentOfflineRunning'));
 assert.ok(appSource.includes('deploymentOfflineDatasetPath() === path'));
 assert.ok(appSource.includes('cancelDeploymentOfflineChartDraw();'));
 assert.ok(appSource.includes('$(selector)?.replaceChildren();'));
+assert.ok(appSource.includes('async function startDeploymentOfflineReplay()'));
+assert.ok(appSource.includes('async function startDeploymentHardwareReplay()'));
+assert.ok(appSource.includes('/hardware-replay'));
+assert.ok(appSource.includes('/hardware-replay/stop'));
+assert.ok(htmlSource.includes('id="deploymentOfflineReplayRobot"'));
+assert.ok(htmlSource.includes('id="deploymentOfflineReplayRobotStop"'));
+assert.ok(appSource.includes('/api/timeseries?dataset='));
+assert.ok(appSource.includes('deploymentOfflineReplayVideoSource'));
+assert.ok(appSource.includes('/api/hdf5/video?dataset='));
+assert.ok(appSource.includes('/api/mcap/video?dataset='));
+assert.ok(appSource.includes('window.requestAnimationFrame(syncDeploymentOfflineReplay)'));
+assert.ok(appSource.includes('video.playbackRate = speed'));
+assert.ok(appSource.includes('The episode clock is authoritative'));
+assert.ok(appSource.includes('Do not count browser/media startup latency as replay time'));
+const offlineReplaySyncFunction = appSource.slice(
+  appSource.indexOf('function syncDeploymentOfflineReplay'),
+  appSource.indexOf('function closeDeploymentOfflineReplay'),
+);
+assert.equal(offlineReplaySyncFunction.includes('video === master'), false);
+assert.ok(appSource.includes('seekDeploymentOfflineReplay(Number(event.target.value), true)'));
+assert.ok(appSource.includes('state.deploymentOfflineReplaySource'));
+assert.ok(appSource.includes('function deploymentOfflineReplayGroups(source, width)'));
+assert.ok(appSource.includes('for (let start = 0; start < width; start += 8)'));
 assert.ok(appSource.includes('renderKey !== state.deploymentModelIoRenderKey'));
 assert.ok(appSource.includes('state.deploymentModelIoRenderKey = renderKey'));
+assert.ok(appSource.includes('renderDeploymentLivePreview(snapshot.livePreview'));
+assert.equal(htmlSource.includes('id="deploymentStateGrid"'), false);
+assert.equal(htmlSource.includes('id="deploymentActionGrid"'), false);
+assert.equal(htmlSource.includes('id="deploymentTrajectorySource"'), false);
+assert.equal(htmlSource.includes('id="deploymentTrajectoryWindow"'), false);
+assert.ok(htmlSource.includes('class="deployment-trajectory-line-keys"'));
+assert.ok(appSource.includes('historyPoints.concat(state.deploymentLiveStateHistory)'));
+assert.ok(appSource.includes('const xMinimum = -10;'));
+assert.ok(appSource.includes('context.setLineDash(dashed ? [7, 5] : [])'));
+assert.ok(appSource.includes('action?.skippedPrefixSteps'));
+assert.ok(htmlSource.includes('<option value="shared" selected>真实物理量程</option>'));
+assert.ok(appSource.includes('context.bezierCurveTo('));
+assert.ok(offlineReplaySyncFunction.includes('const frameChanged = nextFrame !== replay.frame;'));
+assert.ok(appSource.includes('const robotState = snapshot?.robotState;'));
+assert.ok(appSource.includes('snapshot?.components?.client?.active'));
+assert.ok(
+  appSource.indexOf('const robotStartingSteps = new Set(')
+    < appSource.indexOf("['hardware_replay_prepare', 'hardware_replay_client_stop'"),
+);
+assert.ok(appSource.includes("robotConfigId: $('#deploymentRobotSelect')?.value || null"));
+const poseButtonSyncFunction = appSource.slice(
+  appSource.indexOf('function syncDeploymentPoseButtons'),
+  appSource.indexOf('function orchestrationLogRows'),
+);
+assert.equal(poseButtonSyncFunction.includes('modelIo'), false);
+assert.equal(htmlSource.includes('id="refreshDeploymentLog"'), false);
+assert.equal(htmlSource.includes('id="deploymentLogAutoscroll"'), false);
+assert.equal(appSource.includes('hint.textContent = snapshot.lastError ||'), false);
+assert.ok(appSource.includes("pose_move_failed: '回位失败'"));
+assert.ok(appSource.includes("pose_move_failed: 'Move to pose failed'"));
+assert.ok(appSource.includes("event.event !== 'step_started'"));
+assert.ok(appSource.includes('const nearBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 28'));
+assert.ok(appSource.includes("recordVideo: Boolean($('#deploymentRecordLive')?.checked)"));
+assert.ok(appSource.includes('renderDeploymentRecording(snapshot.recording, snapshot.state)'));
+assert.ok(appSource.includes("setBusy(true, t('deployPausingEvaluation'), t('deployPausingEvaluationHint'))"));
+assert.equal(appSource.includes('MediaRecorder'), false);
+assert.equal(appSource.includes('captureStream'), false);
+assert.ok(appSource.includes("const changing = ['starting', 'replaying', 'stopping'].includes(snapshot?.state)"));
+assert.ok(appSource.includes('startDeploymentPolling();\n      setDeploymentResult(snapshot, t(\'deployDisconnectingRobot\'))'));
+const robotConnectionFunction = appSource.slice(
+  appSource.indexOf('async function checkDeploymentRobotConnection'),
+  appSource.indexOf('async function prepareDeploymentModel'),
+);
+assert.equal(robotConnectionFunction.includes('/start-dry-run'), false);
+assert.equal(robotConnectionFunction.includes('/api/deploy/robot-connection'), false);
+assert.ok(robotConnectionFunction.includes('/api/deploy/orchestrations/connect-robot'));
+assert.ok(robotConnectionFunction.includes('/connect-robot'));
+assert.ok(robotConnectionFunction.includes('composeDeploymentRecipe()'));
+assert.ok(robotConnectionFunction.includes('error.status !== 404'));
+assert.ok(robotConnectionFunction.includes('result = await createConnection()'));
+assert.ok(robotConnectionFunction.includes("await api('/api/deploy/orchestrations')"));
+assert.ok(robotConnectionFunction.includes('Recovered robot connection after a lost connect response'));
+assert.ok(appSource.includes('error.status = response.status'));
+assert.ok(appSource.includes('if (state.deploymentSessionId) {'));
+assert.ok(appSource.includes('Never overwrite that'));
+const modelPreparationFunction = appSource.slice(
+  appSource.indexOf('async function prepareDeploymentModel'),
+  appSource.indexOf('async function disconnectDeploymentRobot'),
+);
+assert.ok(modelPreparationFunction.includes('error.status !== 404'));
+assert.ok(modelPreparationFunction.includes('snapshot = await createPreparation()'));
+assert.ok(appSource.includes("['model_ready', 'robot_ready'].includes(snapshot?.state)"));
+assert.ok(appSource.includes("['robot_ready', 'dry_run', 'running'].includes(stateName)"));
 assert.ok(appSource.includes('return mediaIdentity(state.dataset?.path, video, cameraKey);'));
 
 const utilsSource = fs.readFileSync(utilsPath, 'utf8');
@@ -177,6 +273,10 @@ assert.ok(utilsSource.includes("JSON.stringify([String(datasetPath || ''), sourc
 
 const stylesSource = fs.readFileSync(stylesPath, 'utf8');
 const rootTheme = readEffectiveDeclarations(stylesSource, ':root');
+assert.equal(
+  readEffectiveDeclarations(stylesSource, '.deployment-observation-stage')['overflow-anchor'],
+  'none',
+);
 assert.equal(rootTheme['color-scheme'], 'light');
 
 for (const variable of ['--bg', '--surface', '--surface-2', '--surface-3']) {
@@ -355,6 +455,7 @@ assert.doesNotThrow(
 for (const selector of [
   '.deployment-offline-dimension canvas',
   '.deployment-trajectory-chart',
+  '#deploymentOfflineReplayChart',
   '#trajCanvas',
 ]) {
   assert.equal(

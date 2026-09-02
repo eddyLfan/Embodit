@@ -25,12 +25,9 @@ class CacheLayout:
     root: Path
     jobs: Path
     convert_jobs: Path
-    augment_jobs: Path
     qc_jobs: Path
     previews: Path
-    augment_previews: Path
     reusable: Path
-    sam_tracks: Path
     media: Path
     hdf5_media: Path
     mcap_media: Path
@@ -44,12 +41,9 @@ class CacheLayout:
             root=root,
             jobs=root / "jobs",
             convert_jobs=root / "jobs" / "convert",
-            augment_jobs=root / "jobs" / "augment",
             qc_jobs=root / "jobs" / "qc",
             previews=root / "previews",
-            augment_previews=root / "previews" / "augment",
             reusable=root / "reusable",
-            sam_tracks=root / "reusable" / "sam_tracks",
             media=root / "media",
             hdf5_media=root / "media" / "hdf5",
             mcap_media=root / "media" / "mcap",
@@ -60,10 +54,7 @@ class CacheLayout:
     def managed_dirs(self) -> tuple[Path, ...]:
         return (
             self.convert_jobs,
-            self.augment_jobs,
             self.qc_jobs,
-            self.augment_previews,
-            self.sam_tracks,
             self.hdf5_media,
             self.mcap_media,
             self.qc_reports,
@@ -152,7 +143,7 @@ def _replace_prefix(value: str, replacements: list[tuple[Path, Path]]) -> str:
 
 def _rewrite_job_paths(layout: CacheLayout, replacements: list[tuple[Path, Path]]) -> int:
     changed = 0
-    for folder in (layout.convert_jobs, layout.augment_jobs, layout.qc_jobs):
+    for folder in (layout.convert_jobs, layout.qc_jobs):
         for path in folder.glob("*.json"):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
@@ -192,9 +183,6 @@ def migrate_legacy(
     removed_links = remove_legacy_links(layout, project_root)
     mappings = [
         (project_root / ".convert_jobs", layout.convert_jobs),
-        (project_root / ".augment_jobs", layout.augment_jobs),
-        (project_root / ".augment_previews", layout.augment_previews),
-        (project_root / ".augment_cache" / "sam_tracks", layout.sam_tracks),
         (layout.root / "qc_jobs", layout.qc_jobs),
         (layout.root / "qc", layout.qc_reports),
         (temp_root / "embody-hdf5-video", layout.hdf5_media),
@@ -223,9 +211,6 @@ def remove_legacy_links(layout: CacheLayout | None = None, project_root: Path | 
     removed: list[str] = []
     for path in (
         project_root / ".convert_jobs",
-        project_root / ".augment_jobs",
-        project_root / ".augment_previews",
-        project_root / ".augment_cache" / "sam_tracks",
         layout.root / "qc_jobs",
         layout.root / "qc",
     ):
@@ -237,12 +222,6 @@ def remove_legacy_links(layout: CacheLayout | None = None, project_root: Path | 
             continue
         path.unlink(missing_ok=True)
         removed.append(str(path))
-    legacy_augment_cache = project_root / ".augment_cache"
-    if legacy_augment_cache.is_dir() and not legacy_augment_cache.is_symlink():
-        try:
-            legacy_augment_cache.rmdir()
-        except OSError:
-            pass
     return removed
 
 
@@ -262,9 +241,7 @@ def _env_int(name: str, default: int) -> int:
 
 def retention_policy() -> dict[str, int]:
     return {
-        "previewDays": _env_days("EMBODIT_PREVIEW_TTL_DAYS", 7),
         "mediaDays": _env_days("EMBODIT_MEDIA_TTL_DAYS", 7),
-        "samDays": _env_days("EMBODIT_SAM_CACHE_TTL_DAYS", 30),
         "jobDays": _env_days("EMBODIT_JOB_TTL_DAYS", 30),
         "tempDays": _env_days("EMBODIT_TEMP_TTL_DAYS", 1),
         "qcReportsPerDataset": _env_int("EMBODIT_QC_REPORTS_PER_DATASET", 5),
@@ -344,7 +321,6 @@ def _read_job(path: Path) -> dict[str, Any] | None:
 def _clean_terminal_jobs(cleaner: Cleaner, policy: dict[str, int]) -> None:
     families = (
         ("convert", cleaner.layout.convert_jobs),
-        ("augment", cleaner.layout.augment_jobs),
         ("qc", cleaner.layout.qc_jobs),
     )
     for family, folder in families:
@@ -353,26 +329,11 @@ def _clean_terminal_jobs(cleaner: Cleaner, policy: dict[str, int]) -> None:
             if not payload or payload.get("status") not in TERMINAL_JOB_STATES:
                 continue
             days = policy["jobDays"]
-            if family == "augment" and payload.get("mode") == "preview":
-                days = min(days, policy["previewDays"])
             if cleaner.now - _job_timestamp(payload, job_path) < days * DAY:
                 continue
             job_id = str(payload.get("jobId") or job_path.stem)
             cleaner.remove(job_path, f"过期的{family}终态任务")
             cleaner.remove(folder / f"{job_id}.log", f"过期的{family}任务日志")
-            if family == "augment":
-                cleaner.remove(cleaner.layout.augment_previews / job_id, "过期预览任务的资源")
-
-
-def _clean_orphan_previews(cleaner: Cleaner, policy: dict[str, int]) -> None:
-    if not cleaner.layout.augment_previews.is_dir():
-        return
-    for path in cleaner.layout.augment_previews.iterdir():
-        if not path.is_dir():
-            continue
-        job_path = cleaner.layout.augment_jobs / f"{path.name}.json"
-        if not job_path.is_file() and cleaner.expired(path, policy["tempDays"]):
-            cleaner.remove(path, "无任务引用的预览资源")
 
 
 def _clean_old_files(cleaner: Cleaner, root: Path, days: int, reason: str) -> None:
@@ -463,9 +424,7 @@ def cleanup(
             cleaner.remove(path, reason)
     else:
         _clean_terminal_jobs(cleaner, policy)
-        _clean_orphan_previews(cleaner, policy)
         _clean_old_files(cleaner, layout.media, policy["mediaDays"], "过期播放媒体缓存")
-        _clean_old_files(cleaner, layout.sam_tracks, policy["samDays"], "过期 SAM3 分割缓存")
         _clean_qc_reports(cleaner, policy)
         _clean_stale_atomic_files(cleaner, policy)
     if not dry_run:

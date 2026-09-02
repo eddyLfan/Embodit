@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import math
+import re
 from typing import Any, Callable
 
 import numpy as np
@@ -111,13 +112,139 @@ def _action_values(result: dict[str, Any]) -> np.ndarray:
     return array
 
 
-def _names(view: Any, width: int, configured: list[str] | None) -> list[str]:
-    feature = view.features.get("action", {}) if isinstance(view.features, dict) else {}
+def _feature_names(view: Any, key: str, width: int) -> list[str]:
+    features = view.features if isinstance(view.features, dict) else {}
+    feature = features.get(key, {})
     candidates = feature.get("names") if isinstance(feature, dict) else None
-    candidates = candidates if isinstance(candidates, list) else configured
     if isinstance(candidates, list) and len(candidates) == width:
-        return [str(item) for item in candidates]
-    return [f"action_{index + 1}" for index in range(width)]
+        names = [str(item).strip() for item in candidates]
+        if all(names) and len(set(names)) == width:
+            return names
+    return []
+
+
+def _synthetic_names(names: list[str]) -> bool:
+    if not names:
+        return True
+    return all(
+        re.fullmatch(
+            r"(?:action|actions|state|states|joint|command|merge_pose|dimension)[._-]?\d+",
+            name.strip().lower(),
+        )
+        is not None
+        for name in names
+    )
+
+
+def _configured_names(configured: list[str] | None, label: str) -> list[str]:
+    if configured is None:
+        return []
+    if not isinstance(configured, list):
+        raise ValueError(f"{label}配置 names 必须是字符串数组")
+    names = [str(item).strip() for item in configured]
+    if not names or not all(names) or len(set(names)) != len(names):
+        raise ValueError(f"{label}配置 names 不能为空或重复")
+    return names
+
+
+def _project_dimensions(
+    matrix: np.ndarray,
+    *,
+    source_names: list[str],
+    target_names: list[str] | None,
+    label: str,
+) -> tuple[np.ndarray, list[str], dict[str, Any]]:
+    """Select and reorder recorded columns by the robot's configured names."""
+    width = int(matrix.shape[1])
+    source = source_names if len(source_names) == width else []
+    target = _configured_names(target_names, label)
+    if not target:
+        names = source or [f"{label}_{index + 1}" for index in range(width)]
+        indices = list(range(width))
+    elif source and all(name in source for name in target):
+        lookup = {name: index for index, name in enumerate(source)}
+        indices = [lookup[name] for name in target]
+        names = target
+    elif width == len(target) and _synthetic_names(source):
+        # Positional fallback is only safe when widths already agree and the
+        # dataset has no meaningful names. Wider anonymous arrays are rejected.
+        indices = list(range(width))
+        names = target
+    else:
+        missing = [name for name in target if name not in source]
+        suffix = f"；缺少 {', '.join(missing[:6])}" if missing else ""
+        raise ValueError(
+            f"无法将数据集 {label} {width} 维映射到本体配置的 {len(target)} 维"
+            f"{suffix}。请在数据中保存维度名称或增加对应数据格式适配器"
+        )
+    projected = matrix[:, indices]
+    return projected, names, {
+        "sourceWidth": width,
+        "sourceNames": source,
+        "sourceIndices": indices,
+        "droppedDimensions": width - len(indices),
+    }
+
+
+def _part_names(view: Any, parts: list[tuple[str, np.ndarray]]) -> list[str]:
+    names: list[str] = []
+    for key, matrix in parts:
+        part_names = _feature_names(view, key, int(matrix.shape[1]))
+        if not part_names:
+            return []
+        names.extend(part_names)
+    return names
+
+
+def load_dataset_action_replay(
+    adapter: Any,
+    *,
+    episode_index: int,
+    start_frame: int = 0,
+    end_frame: int | None = None,
+    action_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Load an undownsampled recorded action segment for robot replay."""
+
+    view = adapter.inspect()
+    episode = _episode(view, episode_index)
+    action_key, raw_actions = _pick_series(
+        adapter.get_timeseries(episode_index), "action"
+    )
+    actions = _matrix(raw_actions, "真实动作")
+    actions, names, mapping = _project_dimensions(
+        actions,
+        source_names=_feature_names(view, "action", int(actions.shape[1])),
+        target_names=action_names,
+        label="action",
+    )
+    available = min(int(episode.length or actions.shape[0]), actions.shape[0])
+    stop = available if end_frame is None else min(int(end_frame), available)
+    if start_frame < 0 or start_frame >= available:
+        raise ValueError(f"起始帧必须在 0 到 {max(0, available - 1)} 之间")
+    if stop <= start_frame:
+        raise ValueError("结束帧必须晚于起始帧")
+    segment = actions[start_frame:stop]
+    if segment.shape[0] > 100_000:
+        raise ValueError("单次真机 Replay 不能超过 100000 帧")
+    fps = float(view.fps)
+    if not math.isfinite(fps) or fps <= 0 or fps > 200:
+        raise ValueError("数据集 FPS 必须在 0 到 200 之间")
+    return {
+        "dataset": view.path,
+        "datasetName": view.name,
+        "format": view.format_id,
+        "episodeIndex": int(episode_index),
+        "startFrame": int(start_frame),
+        "endFrame": int(stop),
+        "fps": fps,
+        "action": {
+            "key": action_key,
+            "names": names,
+            "values": segment.tolist(),
+            **mapping,
+        },
+    }
 
 
 def evaluate_dataset_frame(
@@ -128,6 +255,7 @@ def evaluate_dataset_frame(
     predictor: Predictor,
     prompt: str | None = None,
     action_names: list[str] | None = None,
+    state_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run one dataset frame through a resident model and compare its action chunk."""
 
@@ -138,15 +266,30 @@ def evaluate_dataset_frame(
     truth = _matrix(raw_truth, "真实动作")
     state_parts = _series_parts(series, "observation.state")
     state_key = "+".join(key for key, _matrix_value in state_parts)
+    truth, names, action_mapping = _project_dimensions(
+        truth,
+        source_names=_feature_names(view, "action", int(truth.shape[1])),
+        target_names=action_names,
+        label="action",
+    )
     states = np.concatenate([matrix for _key, matrix in state_parts], axis=1)
     available = min(int(episode.length or truth.shape[0]), truth.shape[0], states.shape[0])
     if frame_index < 0 or frame_index >= available:
         raise ValueError(f"帧索引必须在 0 到 {max(0, available - 1)} 之间")
+    states, projected_state_names, state_mapping = _project_dimensions(
+        states,
+        source_names=_part_names(view, state_parts),
+        target_names=state_names,
+        label="state",
+    )
 
-    observations: dict[str, Any] = {
-        key: matrix[frame_index].tolist()
-        for key, matrix in state_parts
-    }
+    if state_names is not None:
+        observation_state_key = state_parts[0][0] if len(state_parts) == 1 else "observation.state"
+        observations: dict[str, Any] = {
+            observation_state_key: states[frame_index].tolist()
+        }
+    else:
+        observations = {key: matrix[frame_index].tolist() for key, matrix in state_parts}
     images: list[dict[str, Any]] = []
     for camera_key in sorted(episode.cameras):
         source = episode_frame_source(adapter, view, episode, camera_key)
@@ -183,7 +326,6 @@ def evaluate_dataset_frame(
         )
 
     error = predicted - aligned_truth
-    names = _names(view, predicted.shape[1], action_names)
     dimensions = []
     for index, name in enumerate(names):
         values = error[:, index]
@@ -197,6 +339,12 @@ def evaluate_dataset_frame(
             }
         )
 
+    state_result: dict[str, Any] = {
+        "key": state_key,
+        "values": states[frame_index].tolist(),
+    }
+    if state_names is not None:
+        state_result.update({"names": projected_state_names, **state_mapping})
     return {
         "dataset": view.path,
         "datasetName": view.name,
@@ -205,7 +353,7 @@ def evaluate_dataset_frame(
         "frameIndex": int(frame_index),
         "fps": float(view.fps),
         "prompt": effective_prompt,
-        "state": {"key": state_key, "values": states[frame_index].tolist()},
+        "state": state_result,
         "images": images,
         "action": {
             "key": action_key,
@@ -218,5 +366,6 @@ def evaluate_dataset_frame(
             "dimensions": dimensions,
             "overallMae": float(np.mean(np.abs(error))),
             "overallRmse": float(math.sqrt(float(np.mean(np.square(error))))),
+            **action_mapping,
         },
     }

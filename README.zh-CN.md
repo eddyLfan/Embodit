@@ -28,7 +28,7 @@ Embodit **不替代**数采 SDK、训练框架、机器人驱动、访问控制�
 |---|---|
 | 数据检查 | LeRobot v2.1/v3、已识别的 RoboMimic/Astribot 风格 HDF5、MCAP；统一时间轴相机、任务文本、state 与 action 时序 |
 | 数据治理 | `pass/review/quarantine` 决策、Episode/区间标签、可配置原因、自动 QC、Finding 复核、CSV 报告 |
-| 数据处理 | 原生子集导出、保真度感知转换、严格同格式合并、内置亮度增强、可选 SAM3 辅助颜色增强 |
+| 数据处理 | 原生子集导出、保真度感知转换与严格同格式合并 |
 | 模型接入 | 自定义 Python 模型、OpenPI、LeRobot、StarVLA 或已有兼容服务；仓库不附带模型权重 |
 | 机器人部署 | 可组合本体/模型配置、Recipe v2、SSH/systemd 编排、受限模型隧道、ROS readiness、Dry Run、离线单帧评测、Live、监控、回滚与软件急停 |
 
@@ -54,8 +54,7 @@ Embodit **不替代**数采 SDK、训练框架、机器人驱动、访问控制�
 - Git（用于克隆仓库和可选模型子模块）。
 
 机器人部署还要求目标主机具备可用的 systemd manager；远端目标必须能通过
-OpenSSH 访问，本体与 Embodit 同机时也可以直接本地执行。ROS、CUDA、SAM3、
-模型专用 Python 环境、Checkpoint 和厂商 SDK 都是按工作流单独准备的可选组件。
+OpenSSH 访问，本体与 Embodit 同机时也可以直接本地执行。ROS、CUDA、模型专用 Python 环境、Checkpoint 和厂商 SDK 都是按工作流单独准备的可选组件。
 
 Embodit 是应用仓库（`tool.uv.package = false`），不是常规 PyPI 库；`embodit.sh` 是受支持的服务与部署入口。
 
@@ -129,9 +128,9 @@ bash embodit.sh clean --all
 2. 检查 Episode metadata、相机、任务文本和 state/action 信号。
 3. 运行自动 QC，再复核 Finding 和最终 Episode 决策。
 4. Review 进度保存为 `*.review.json`；标签固定使用数据集 sidecar：目录数据集为 `labels.jsonl`，单文件数据集为 `<文件名>.labels.jsonl`。
-5. 导出选中 Episode、转换格式、严格合并兼容数据集，或先预览再把增强结果写入新路径。
+5. 导出选中 Episode、转换格式，或把兼容数据集严格合并到新路径。
 
-QC、转换、合并和增强运行在独立 worker 中，关闭浏览器不会停止任务。格式细节、保真边界、阈值和清理策略见[数据指南](docs/data/README.zh-CN.md)。
+QC、转换和合并运行在独立 worker 中，关闭浏览器不会停止任务。格式细节、保真边界、阈值和清理策略见[数据指南](docs/data/README.zh-CN.md)。
 
 ## 模型与机器人工作流
 
@@ -184,9 +183,9 @@ bash embodit.sh recipe-run /tmp/my-deployment.json --mode dry_run
 
 | 文档 | 内容 |
 |---|---|
-| [数据指南](docs/data/README.zh-CN.md) | 格式、Review、标签、QC、转换、合并、增强、任务与清理 |
+| [数据指南](docs/data/README.zh-CN.md) | 格式、Review、标签、QC、转换、合并、任务与清理 |
 | [部署指南](docs/deployment/README.zh-CN.md) | 本体/模型配置、Recipe 生命周期、安全、离线评测、Dry Run 与 Live |
-| [第三方组件](third_party/README.md) | 固定源码集成、模型/SAM3 归属和许可证边界 |
+| [第三方组件](third_party/README.md) | 固定模型 Provider 源码集成、归属和许可证边界 |
 | [参与贡献](CONTRIBUTING.md) | 开发环境、检查命令与 Pull Request 要求 |
 | [安全策略](SECURITY.md) | 支持版本、漏洞报告、威胁模型与真机安全 |
 | [变更记录](CHANGELOG.md) | 版本级变更 |
@@ -198,4 +197,4 @@ bash embodit.sh recipe-run /tmp/my-deployment.json --mode dry_run
 
 ## 许可证与第三方软件
 
-Embodit 自有源码采用 [MIT License](LICENSE)。Git 子模块、模型权重、Checkpoint、数据集、SAM3、FFmpeg 构建和其他第三方资产继续适用各自许可证及使用条款。Embodit 不分发 Provider Checkpoint 或 SAM3 权重。使用或再分发前，请阅读 [third_party/README.md](third_party/README.md) 和每项资产附带的许可证。
+Embodit 自有源码采用 [MIT License](LICENSE)。Git 子模块、模型权重、Checkpoint、数据集、FFmpeg 构建和其他第三方资产继续适用各自许可证及使用条款。Embodit 不分发 Provider Checkpoint。使用或再分发前，请阅读 [third_party/README.md](third_party/README.md) 和每项资产附带的许可证。

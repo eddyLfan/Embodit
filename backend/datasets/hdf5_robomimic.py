@@ -98,8 +98,15 @@ def _episode_length(group) -> int:
             dset = obs[name]
             if getattr(dset, "ndim", 0) >= 1:
                 return int(dset.shape[0])
-    # Astribot stores one episode per file. Commands and camera frames live
-    # in root-level dictionaries instead of RoboMimic's ``obs`` group.
+    # Astribot stores one episode per file. Prefer joint-space trajectories:
+    # pose commands are end-effector poses and are not safe to replay as joints.
+    if "joints_dict" in group:
+        joints = group["joints_dict"]
+        for name in ("joints_position_command", "joints_position_state"):
+            if name in joints:
+                return int(joints[name].shape[0])
+    # Commands and camera frames live in root-level dictionaries instead of
+    # RoboMimic's ``obs`` group.
     if "command_poses_dict" in group and "command" in group["command_poses_dict"]:
         return int(group["command_poses_dict"]["command"].shape[0])
     if "poses_dict" in group and "merge_pose" in group["poses_dict"]:
@@ -174,6 +181,64 @@ def _astribot_fps(group) -> float | None:
         return None
     fps = 1.0 / float(np.median(diffs))
     return fps if np.isfinite(fps) and fps > 0 else None
+
+
+def _dimension_names(dataset: Any, fallback: list[str]) -> list[str]:
+    """Read optional dimension names, otherwise use the dialect schema."""
+    width = int(dataset.shape[1])
+    for owner in (dataset, getattr(dataset, "parent", None)):
+        attrs = getattr(owner, "attrs", None)
+        if attrs is None:
+            continue
+        for key in ("names", "joint_names", "action_names", "state_names"):
+            if key not in attrs:
+                continue
+            raw = attrs[key]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except json.JSONDecodeError:
+                    raw = [item.strip() for item in raw.split(",")]
+            if isinstance(raw, np.ndarray):
+                raw = raw.tolist()
+            if isinstance(raw, (list, tuple)) and len(raw) == width:
+                names = [
+                    item.decode("utf-8", errors="replace")
+                    if isinstance(item, bytes)
+                    else str(item)
+                    for item in raw
+                ]
+                if all(names) and len(set(names)) == width:
+                    return names
+    return fallback
+
+
+def _astribot_joint_names(width: int) -> list[str]:
+    """Names for Astribot's legacy full-body 25-column joint recording."""
+    if width == 25:
+        return (
+            [f"astribot_uncontrolled_joint_{index}" for index in range(1, 8)]
+            + [f"left_arm_{index}" for index in range(1, 8)]
+            + ["left_gripper"]
+            + [f"right_arm_{index}" for index in range(1, 8)]
+            + ["right_gripper"]
+            + [f"astribot_uncontrolled_joint_{index}" for index in range(8, 10)]
+        )
+    return [f"joint.{index}" for index in range(width)]
+
+
+def _astribot_joint_source(group: Any, kind: str) -> Any | None:
+    joints = group.get("joints_dict")
+    if joints is None:
+        return None
+    name = (
+        "joints_position_command"
+        if kind == "action"
+        else "joints_position_state"
+    )
+    return joints.get(name)
 
 
 def _decode_compressed_frame(payload: np.ndarray, *, camera_key: str) -> np.ndarray:
@@ -296,6 +361,15 @@ class Hdf5Adapter(DatasetAdapter):
                             "dtype": "float32",
                             "shape": list(group["actions"].shape[1:]),
                         }
+                    elif is_astribot and _astribot_joint_source(group, "action") is not None:
+                        src = _astribot_joint_source(group, "action")
+                        features["action"] = {
+                            "dtype": str(src.dtype),
+                            "shape": list(src.shape[1:]),
+                            "names": _dimension_names(
+                                src, _astribot_joint_names(int(src.shape[1]))
+                            ),
+                        }
                     elif (
                         is_astribot
                         and "command_poses_dict" in group
@@ -312,6 +386,15 @@ class Hdf5Adapter(DatasetAdapter):
                         features["observation.state"] = {
                             "dtype": "float32",
                             "shape": list(src.shape[1:]),
+                        }
+                    elif is_astribot and _astribot_joint_source(group, "state") is not None:
+                        src = _astribot_joint_source(group, "state")
+                        features["observation.state"] = {
+                            "dtype": str(src.dtype),
+                            "shape": list(src.shape[1:]),
+                            "names": _dimension_names(
+                                src, _astribot_joint_names(int(src.shape[1]))
+                            ),
                         }
                     elif is_astribot and "poses_dict" in group and "merge_pose" in group["poses_dict"]:
                         src = group["poses_dict"]["merge_pose"]
@@ -389,22 +472,32 @@ class Hdf5Adapter(DatasetAdapter):
                     if name in group["obs"]:
                         result[f"eef.{name}"] = np.asarray(group["obs"][name][()], dtype=np.float64)
             if _is_astribot(group):
+                joint_action = _astribot_joint_source(group, "action")
                 commands = group.get("command_poses_dict")
                 if (
+                    joint_action is not None
+                    and (keys is None or "action" in keys or "command" in keys)
+                ):
+                    result["action"] = np.asarray(joint_action[()], dtype=np.float64)
+                elif (
                     commands is not None
                     and "command" in commands
                     and (keys is None or "action" in keys or "command" in keys)
                 ):
                     result["action"] = np.asarray(commands["command"][()], dtype=np.float64)
+                joint_state = _astribot_joint_source(group, "state")
                 poses = group.get("poses_dict")
                 if (
+                    joint_state is not None
+                    and (keys is None or "observation.state" in keys or "merge_pose" in keys)
+                ):
+                    result["observation.state"] = np.asarray(joint_state[()], dtype=np.float64)
+                elif (
                     poses is not None
                     and "merge_pose" in poses
                     and (keys is None or "observation.state" in keys or "merge_pose" in keys)
                 ):
-                    result["observation.state"] = np.asarray(
-                        poses["merge_pose"][()], dtype=np.float64
-                    )
+                    result["observation.state"] = np.asarray(poses["merge_pose"][()], dtype=np.float64)
                 if poses is not None:
                     for name in ("astribot_arm_left", "astribot_arm_right"):
                         if name in poses:

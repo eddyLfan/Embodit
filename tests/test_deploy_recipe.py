@@ -1,4 +1,5 @@
 import io
+import importlib.util
 import json
 import os
 import pwd
@@ -34,6 +35,11 @@ CHECKPOINT_MODEL_PATHS = {
 }
 PYTHON_ADAPTER_CLIENT_PATH = PROJECT_ROOT / "examples" / "deployment" / "python_robot_client.example.json"
 PYTHON_ADAPTER_SOURCE_PATH = PROJECT_ROOT / "examples" / "deployment" / "python_robot_adapter.py"
+PYTHON_CLIENT_SOURCE_PATH = PROJECT_ROOT / "backend" / "deploy" / "assets" / "python_robot_client.py"
+PYTHON_CLIENT_SPEC = importlib.util.spec_from_file_location("embodit_test_python_robot_client", PYTHON_CLIENT_SOURCE_PATH)
+assert PYTHON_CLIENT_SPEC and PYTHON_CLIENT_SPEC.loader
+PYTHON_CLIENT = importlib.util.module_from_spec(PYTHON_CLIENT_SPEC)
+PYTHON_CLIENT_SPEC.loader.exec_module(PYTHON_CLIENT)
 
 
 def raw_recipe() -> dict:
@@ -151,6 +157,9 @@ class HarnessOrchestration(DeploymentOrchestration):
     def _wait_ros_readiness(self): self._called("ros_readiness")
     def _run_operation(self, operation, label): self._called("power_on" if label == "上电" else label)
     def _move_initial_pose(self): self._called("initial_pose")
+    def _stop_observation_client(self):
+        self._called("observation_client_stop")
+        self.components["client"]["active"] = False
     def _start_client(self): self._called("client")
     def _wait_client_health(self): self._called("client_health")
     def _monitor(self): self._called("monitor")
@@ -391,6 +400,46 @@ def test_python_robot_adapter_model_io_is_exposed_in_snapshot(tmp_path: Path) ->
     assert orchestration.snapshot()["modelIo"] == model_io
 
 
+def test_python_robot_adapter_live_preview_is_exposed_in_snapshot(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+
+    class PreviewRunner:
+        def run(self, args, **kwargs):
+            return RemoteResult(
+                0,
+                json.dumps({"capturedMonotonicNs": 123, "cameras": [], "state": {"values": [0.1]}, "rateHz": 8}),
+            )
+
+    preview_runner = PreviewRunner()
+    orchestration._runners[orchestration.robot_host_name] = preview_runner
+    orchestration.robot_manager.runner = preview_runner
+    orchestration.robot_manager._home = "/root"
+    orchestration._refresh_python_adapter_live_preview()
+    assert orchestration.snapshot()["livePreview"] == {
+        "capturedMonotonicNs": 123,
+        "cameras": [],
+        "state": {"values": [0.1]},
+        "rateHz": 8,
+    }
+    assert orchestration.snapshot(include_preview=False)["livePreview"] is None
+    assert orchestration.live_preview_snapshot()["livePreview"]["capturedMonotonicNs"] == 123
+
+
+def test_python_robot_preview_snapshot_uses_telemetry_state_metadata() -> None:
+    config = python_adapter_recipe()["robot"]["client"]["config"]
+    preview = PYTHON_CLIENT.observation_preview_snapshot(
+        {"joint_position": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]},
+        config,
+    )
+    assert preview["state"]["key"] == "joint_position"
+    assert preview["state"]["names"] == [f"joint_{index}" for index in range(6)]
+    assert preview["state"]["values"] == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+
+
 def test_latest_dry_run_safety_rejection_blocks_live_challenge(tmp_path: Path) -> None:
     orchestration = DeploymentOrchestration(
         parse_recipe(python_adapter_recipe()),
@@ -420,12 +469,45 @@ def test_latest_dry_run_safety_rejection_blocks_live_challenge(tmp_path: Path) -
         orchestration.arm_challenge()
 
 
+
+def test_python_robot_replay_status_preserves_delivery_timing(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    orchestration._ingest_python_adapter_status(
+        json.dumps(
+            {
+                "status": "replaying",
+                "mode": "replay",
+                "totalFrames": 100,
+                "framesApplied": 60,
+                "commandsSent": 42,
+                "framesSkipped": 18,
+                "timingDegraded": True,
+                "effectiveCommandHz": 20.8,
+                "replayDurationS": 2.0,
+                "fps": 30.0,
+            }
+        )
+    )
+
+    replay = orchestration.snapshot()["hardwareReplay"]
+    assert replay["framesApplied"] == 60
+    assert replay["commandsSent"] == 42
+    assert replay["framesSkipped"] == 18
+    assert replay["timingDegraded"] is True
+    assert replay["effectiveCommandHz"] == 20.8
+    assert replay["replayDurationS"] == 2.0
+
 def test_component_monitor_debounces_transient_failure_and_records_recovery(tmp_path: Path) -> None:
     orchestration = DeploymentOrchestration(
         parse_recipe(python_adapter_recipe()),
         tmp_path,
         runner_factory=lambda _name, _host: FakeRunner(),
     )
+    orchestration.components["model"]["active"] = True
     orchestration._managers[orchestration.model_host_name] = SequenceStatusManager(
         {
             "model": [
@@ -458,6 +540,7 @@ def test_component_monitor_faults_only_after_persistent_inactive_status(tmp_path
         tmp_path,
         runner_factory=lambda _name, _host: FakeRunner(),
     )
+    orchestration.components["client"]["active"] = True
     orchestration._managers[orchestration.model_host_name] = SequenceStatusManager()
     orchestration._managers[orchestration.robot_host_name] = SequenceStatusManager(
         {
@@ -502,6 +585,30 @@ def test_remote_service_status_preserves_systemd_diagnostics() -> None:
         "ExecMainStatus": "0",
         "NRestarts": "2",
     }
+
+
+def test_stop_many_uses_one_systemd_round_trip() -> None:
+    class RecordingRunner:
+        def __init__(self):
+            self.commands = []
+
+        def run(self, args, **_kwargs):
+            self.commands.append(args)
+            return RemoteResult(0, "")
+
+    recipe = parse_recipe(raw_recipe())
+    runner = RecordingRunner()
+    manager = RemoteServiceManager(runner, recipe.hosts[recipe.robot.host], recipe.deployment_id)
+
+    manager.stop_many(["client", "ros", "tunnel"])
+
+    assert len(runner.commands) == 1
+    assert runner.commands[0][: len(manager.systemctl) + 1] == [*manager.systemctl, "stop"]
+    assert runner.commands[0][len(manager.systemctl) + 1 :] == [
+        manager.unit_name("client"),
+        manager.unit_name("ros"),
+        manager.unit_name("tunnel"),
+    ]
 
 
 def test_python_robot_adapter_rejects_wrong_action_telemetry_width() -> None:
@@ -809,6 +916,41 @@ def test_ros1_topic_rate_uses_remote_timeout_and_unbuffered_output(tmp_path: Pat
     assert captured["timeout"] == 4.5
 
 
+def test_ros_topic_observability_checks_topics_in_parallel(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(raw_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    template = orchestration.recipe.robot.readiness.topics[0]
+    orchestration.recipe.robot.readiness.topics = [
+        template.model_copy(update={"name": f"/camera_{index}"})
+        for index in range(3)
+    ]
+    lock = threading.Lock()
+    release = threading.Event()
+    active = 0
+    peak = 0
+
+    def check_freshness(_topic):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if active == 3:
+                release.set()
+        assert release.wait(timeout=1)
+        with lock:
+            active -= 1
+
+    orchestration._check_single_topic_freshness = check_freshness
+    orchestration._check_single_topic_rate = lambda _topic: None
+
+    orchestration._check_topic_observability()
+
+    assert peak == 3
+
+
 def test_tunnel_credential_python_snippets_are_valid(tmp_path: Path) -> None:
     class CredentialRunner:
         def __init__(self, host_name: str):
@@ -897,6 +1039,60 @@ def test_orchestration_can_prepare_model_then_start_prompted_dry_run(tmp_path: P
     assert orchestration.calls == [
         "precheck", "model", "model_health", "robot_precheck", "tunnel_credentials", "tunnel", "tunnel_health",
         "ros", "ros_readiness", "power_on", "initial_pose", "client", "client_health", "monitor",
+    ]
+
+
+def test_robot_connection_starts_observation_without_model_tunnel_or_actions(tmp_path: Path) -> None:
+    orchestration = HarnessOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+
+    orchestration.connect_robot()
+    orchestration._thread.join(timeout=2)
+
+    assert orchestration.state == OrchestrationState.ROBOT_READY
+    assert orchestration.mode == "observe"
+    assert orchestration.components["model"]["active"] is False
+    assert orchestration.calls == [
+        "robot_precheck", "ros", "ros_readiness", "client", "client_health", "monitor",
+    ]
+    assert "model" not in orchestration.calls
+    assert "tunnel" not in orchestration.calls
+    assert "initial_pose" not in orchestration.calls
+    assert "power_on" not in orchestration.calls
+
+
+def test_robot_observation_can_prepare_model_then_upgrade_to_dry_run(tmp_path: Path) -> None:
+    orchestration = HarnessOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    orchestration.state = OrchestrationState.ROBOT_READY
+    orchestration.mode = "observe"
+    orchestration.components["ros"]["active"] = True
+    orchestration.components["client"]["active"] = True
+
+    orchestration.prepare_model()
+    operation = orchestration._operation_thread
+    if operation is not None:
+        operation.join(timeout=2)
+    orchestration.components["model"]["active"] = True
+
+    assert orchestration.state == OrchestrationState.ROBOT_READY
+    assert orchestration.calls == ["precheck", "model", "model_health"]
+
+    orchestration.start(task_prompt="pick the object")
+    orchestration._thread.join(timeout=2)
+
+    assert orchestration.state == OrchestrationState.DRY_RUN
+    assert orchestration.mode == "dry_run"
+    assert orchestration.recipe.robot.client.config["task_prompt"] == "pick the object"
+    assert orchestration.calls == [
+        "precheck", "model", "model_health", "observation_client_stop",
+        "tunnel_credentials", "tunnel", "tunnel_health", "client", "client_health", "monitor",
     ]
 
 
@@ -1141,24 +1337,75 @@ def test_prompt_can_change_while_model_stays_ready(tmp_path: Path) -> None:
     assert orchestration.events[-1]["clientRestarted"] is False
 
 
-def test_pose_record_captures_only_model_state_vector(tmp_path: Path) -> None:
+def test_python_adapter_prompt_hot_reload_does_not_restart_client(tmp_path: Path) -> None:
     orchestration = DeploymentOrchestration(
         parse_recipe(python_adapter_recipe()),
         tmp_path,
         runner_factory=lambda _name, _host: FakeRunner(),
     )
-    orchestration.model_io = {
-        "input": {
-            "state": {
-                "values": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-                "names": [f"joint_{index}" for index in range(6)],
-                "units": ["rad"] * 6,
-            },
-            "cameras": [{"key": "camera", "dataUrl": "ignored"}],
+    manager = CapturingManager()
+    orchestration._managers[orchestration.robot_host_name] = manager
+    orchestration.state = OrchestrationState.DRY_RUN
+    orchestration.components["model"]["active"] = True
+    orchestration.components["client"]["active"] = True
+
+    snapshot = orchestration.update_task_prompt("place the red cube in the tray")
+
+    assert snapshot["state"] == "dry_run"
+    assert snapshot["components"]["client"]["active"] is True
+    control_payload = next(
+        payload for path, (payload, _mode) in manager.files.items()
+        if path.endswith("python_robot_client.control.json")
+    )
+    assert json.loads(control_payload)["task_prompt"] == "place the red cube in the tray"
+    assert orchestration.events[-1]["clientRestarted"] is False
+    assert orchestration.events[-1]["hotReloaded"] is True
+
+
+def test_dry_run_scheduler_change_is_deferred_without_client_restart(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    orchestration.state = OrchestrationState.DRY_RUN
+    orchestration.components["model"]["active"] = True
+    orchestration.components["client"]["active"] = True
+
+    snapshot = orchestration.update_action_scheduler(
+        mode="asynchronous",
+        action_steps=2,
+        request_after_steps=1,
+    )
+
+    assert snapshot["state"] == "dry_run"
+    assert snapshot["components"]["client"]["active"] is True
+    assert snapshot["scheduler"]["mode"] == "asynchronous"
+    assert orchestration.events[-1]["clientRestarted"] is False
+    assert orchestration.events[-1]["effectiveOnNextLive"] is True
+
+
+def test_pose_record_captures_robot_state_without_model(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    orchestration.components["client"]["active"] = True
+    orchestration.live_preview = {
+        "capturedMonotonicNs": 123,
+        "state": {
+            "values": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            "names": [f"joint_{index}" for index in range(6)],
+            "units": ["rad"] * 6,
         },
-        "output": {"action": {"chunk": [[0.0] * 6]}},
+        "cameras": [{"key": "camera", "dataUrl": "ignored"}],
     }
+    orchestration.model_io = None
+    orchestration._refresh_python_adapter_live_preview = lambda: None
+
     snapshot = orchestration.record_pose("实验起点")
+    assert snapshot["robotState"] == orchestration.live_preview["state"]
     assert snapshot["recordedPoses"] == [
         {
             "poseId": snapshot["recordedPoses"][0]["poseId"],
@@ -1170,10 +1417,194 @@ def test_pose_record_captures_only_model_state_vector(tmp_path: Path) -> None:
         }
     ]
     assert "cameras" not in snapshot["recordedPoses"][0]
+    assert orchestration.events[-1]["stateSource"] == "livePreview"
+    assert snapshot["poseStorage"] == {
+        "persistent": True,
+        "path": str((tmp_path / "poses.json").resolve()),
+        "count": 1,
+    }
+    stored = json.loads((tmp_path / "poses.json").read_text(encoding="utf-8"))
+    assert stored["version"] == 1
+    assert stored["poses"] == snapshot["recordedPoses"]
+
+    reloaded = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    assert reloaded.snapshot()["recordedPoses"] == snapshot["recordedPoses"]
 
     pose_id = snapshot["recordedPoses"][0]["poseId"]
     deleted = orchestration.delete_pose(pose_id)
     assert deleted["recordedPoses"] == []
+    assert json.loads((tmp_path / "poses.json").read_text(encoding="utf-8"))["poses"] == []
+
+
+def test_hardware_replay_restores_observation_client_after_completion(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    orchestration.state = OrchestrationState.ROBOT_READY
+    orchestration.mode = "observe"
+    orchestration.components["client"]["active"] = True
+    replay_payloads = []
+
+    def fake_start_client(*, replay_payload=None):
+        if replay_payload is not None:
+            replay_payloads.append(replay_payload)
+        orchestration.components["client"]["active"] = True
+
+    def fake_refresh():
+        orchestration.hardware_replay["status"] = "finished"
+        orchestration.hardware_replay["framesApplied"] = 2
+
+    orchestration._start_client = fake_start_client
+    orchestration._wait_client_health = lambda: None
+    orchestration._refresh_python_adapter_model_io = fake_refresh
+    replay = {
+        "dataset": "/data/demo.hdf5",
+        "episodeIndex": 3,
+        "startFrame": 1,
+        "endFrame": 3,
+        "fps": 10,
+        "action": {
+            "names": [f"joint_{index}" for index in range(6)],
+            "values": [[0.0] * 6, [0.1] * 6],
+        },
+    }
+
+    orchestration.request_hardware_replay(replay, move_to_start_duration_s=0.1)
+    thread = orchestration._operation_thread
+    assert thread is not None
+    thread.join(timeout=2)
+
+    snapshot = orchestration.snapshot()
+    assert thread.is_alive() is False
+    assert snapshot["state"] == "robot_ready"
+    assert snapshot["mode"] == "observe"
+    assert snapshot["components"]["client"]["active"] is True
+    assert snapshot["hardwareReplay"]["status"] == "finished"
+    assert snapshot["hardwareReplay"]["framesApplied"] == 2
+    assert len(replay_payloads) == 1
+    assert replay_payloads[0]["actions"] == replay["action"]["values"]
+
+
+def test_python_adapter_replay_readiness_accepts_action_phase(tmp_path: Path) -> None:
+    class ReplayReadyRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, args, **_kwargs):
+            self.calls.append(args)
+            if len(args) >= 3 and "Path.home" in args[2]:
+                return RemoteResult(0, "/home/robot\n")
+            return RemoteResult(
+                0,
+                json.dumps({"status": "moving_to_start", "mode": "replay"}),
+            )
+
+    runner = ReplayReadyRunner()
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: runner,
+    )
+    orchestration.mode = "replay"
+
+    orchestration._wait_python_adapter_client_ready()
+
+    readiness_call = runner.calls[-1]
+    assert readiness_call[-1] == "replay"
+    assert orchestration.client_runtime["status"] == "moving_to_start"
+
+
+def test_registry_scopes_persisted_poses_by_robot_config(tmp_path: Path) -> None:
+    registry = OrchestrationRegistry(
+        tmp_path / "orchestrations",
+        pose_root=tmp_path / "outputs" / "deployment-poses",
+    )
+    orchestration = registry.create(python_adapter_recipe(), robot_config_id="robot-a")
+
+    assert orchestration.pose_path == (tmp_path / "outputs" / "deployment-poses" / "robot-a.json").resolve()
+
+
+def test_pose_record_requires_robot_observation_link_not_model_io(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    orchestration.model_io = {
+        "input": {
+            "state": {
+                "values": [0.1] * 6,
+                "names": [f"joint_{index}" for index in range(6)],
+                "units": ["rad"] * 6,
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="本体观测链路尚未连接"):
+        orchestration.record_pose("不应记录")
+
+
+def test_pose_move_rejects_concurrent_deployment_transition(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    orchestration.state = OrchestrationState.ROBOT_READY
+    orchestration.components["client"]["active"] = True
+    orchestration.recorded_poses = [
+        {"poseId": "pose-a", "name": "起点", "values": [0.0] * 6, "names": [], "units": [], "createdNs": 1}
+    ]
+    orchestration._maintenance.set()
+
+    with pytest.raises(ValueError, match="部署切换正在进行"):
+        orchestration.move_to_recorded_pose("pose-a")
+
+
+def test_failed_pose_move_is_recorded_for_execution_log(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    orchestration.state = OrchestrationState.ROBOT_READY
+    orchestration.components["client"]["active"] = True
+    orchestration.recorded_poses = [
+        {
+            "poseId": "pose-a",
+            "name": "起点",
+            "values": [0.0] * 6,
+            "names": [],
+            "units": [],
+            "createdNs": 1,
+        }
+    ]
+
+    class PoseManager(CapturingManager):
+        def stop(self, _component):
+            pass
+
+    orchestration._managers[orchestration.robot_host_name] = PoseManager()
+    orchestration._run_robot_environment = lambda *_args, **_kwargs: RemoteResult(
+        1, "", "simulated pose failure"
+    )
+    orchestration._start_client = lambda: orchestration.components["client"].update(active=True)
+    orchestration._wait_client_health = lambda: None
+
+    with pytest.raises(RuntimeError, match="simulated pose failure"):
+        orchestration.move_to_recorded_pose("pose-a")
+
+    event = orchestration.events[-1]
+    assert event["event"] == "pose_move_failed"
+    assert event["name"] == "起点"
+    assert "simulated pose failure" in event["reason"]
+    assert "simulated pose failure" in orchestration.last_error
 
 
 def test_failed_dry_run_returns_to_model_ready_without_stopping_model(tmp_path: Path) -> None:
@@ -1238,6 +1669,52 @@ def test_stop_evaluation_returns_to_dry_run_without_stopping_model_stack(tmp_pat
     assert all(orchestration.components[name]["active"] for name in ("model", "tunnel", "ros", "client"))
 
 
+def test_stop_evaluation_request_returns_while_dry_run_recovery_continues(tmp_path: Path) -> None:
+    class BlockingManager:
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.stopped = []
+
+        def stop(self, component):
+            self.stopped.append(component)
+            self.started.set()
+            assert self.release.wait(timeout=2)
+
+    orchestration = HarnessOrchestration(
+        parse_recipe(raw_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    manager = BlockingManager()
+    orchestration._managers[orchestration.robot_host_name] = manager
+    orchestration.state = OrchestrationState.RUNNING
+    orchestration.mode = "live"
+    for component in ("model", "tunnel", "ros", "client"):
+        orchestration.components[component]["active"] = True
+
+    def start_client():
+        orchestration._called("client")
+        orchestration.components["client"]["active"] = True
+
+    orchestration._start_client = start_client
+    snapshot = orchestration.request_stop_evaluation()
+
+    assert snapshot["state"] == "stopping"
+    assert snapshot["currentStep"] in {"evaluation_hold", "evaluation_client_stop"}
+    assert manager.started.wait(timeout=1)
+    assert snapshot["components"]["model"]["active"] is True
+    manager.release.set()
+    operation = orchestration._operation_thread
+    assert operation is not None
+    operation.join(timeout=2)
+    snapshot = orchestration.snapshot()
+    assert snapshot["state"] == "dry_run"
+    assert snapshot["currentStep"] is None
+    assert manager.stopped == ["client"]
+    assert snapshot["components"]["model"]["active"] is True
+
+
 def test_orchestration_failure_is_reported_as_fault(tmp_path: Path) -> None:
     orchestration = HarnessOrchestration(
         parse_recipe(raw_recipe()),
@@ -1298,6 +1775,115 @@ def test_registry_stop_all_cleans_fault_with_active_components(tmp_path: Path) -
     assert item.components["client"]["active"] is False
 
 
+def test_disconnect_request_returns_progress_before_remote_stop_finishes(tmp_path: Path) -> None:
+    class BlockingManager:
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.stopped = []
+
+        def stop_many(self, components):
+            self.stopped.append(list(components))
+            self.started.set()
+            assert self.release.wait(timeout=2)
+
+    orchestration = DeploymentOrchestration(
+        parse_recipe(raw_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    manager = BlockingManager()
+    orchestration._managers[orchestration.robot_host_name] = manager
+    orchestration.state = OrchestrationState.DRY_RUN
+    for component in ("model", "tunnel", "ros", "client"):
+        orchestration.components[component]["active"] = True
+
+    snapshot = orchestration.request_disconnect_robot()
+
+    assert snapshot["state"] == "stopping"
+    assert snapshot["currentStep"] == "robot_disconnect"
+    assert manager.started.wait(timeout=1)
+    assert orchestration.components["model"]["active"] is True
+    manager.release.set()
+    operation = orchestration._operation_thread
+    assert operation is not None
+    operation.join(timeout=2)
+    snapshot = orchestration.snapshot()
+    assert snapshot["state"] == "model_ready"
+    assert snapshot["currentStep"] is None
+    assert manager.stopped == [["client", "ros", "tunnel"]]
+    assert snapshot["components"]["model"]["active"] is True
+
+
+def test_lightweight_snapshot_omits_model_camera_payload(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(raw_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    orchestration.model_io = {
+        "input": {
+            "cameras": [{"key": "head", "label": "Head", "dataUrl": "data:image/jpeg;base64,AAAA"}],
+            "state": {"values": [0.0]},
+        },
+        "output": {"action": {"chunk": [[0.0]]}},
+    }
+
+    full = orchestration.snapshot()
+    light = orchestration.snapshot(include_model_images=False)
+
+    assert full["modelIo"]["input"]["cameras"][0]["dataUrl"].startswith("data:image")
+    assert "dataUrl" not in light["modelIo"]["input"]["cameras"][0]
+    assert light["modelIo"]["input"]["state"] == {"values": [0.0]}
+
+
+def test_snapshot_downsamples_trajectory_history_for_ui(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(raw_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    planned = [{"tNs": index, "values": [float(index)]} for index in range(2000)]
+    state = [{"tNs": index, "values": [float(index)]} for index in range(100)]
+    orchestration.trajectory_history = {
+        "windowSeconds": 60.0,
+        "names": ["joint_1"],
+        "planned": planned,
+        "state": state,
+        "executed": [],
+    }
+
+    compact = orchestration.snapshot()
+    full = orchestration.snapshot(trajectory_max_points=None)
+
+    compact_planned = compact["trajectoryHistory"]["planned"]
+    assert len(compact_planned) == 360
+    assert compact_planned[0] == planned[0]
+    assert compact_planned[-1] == planned[-1]
+    assert compact["trajectoryHistory"]["state"] == state
+    assert len(full["trajectoryHistory"]["planned"]) == 2000
+
+
+def test_recording_uses_primary_camera_or_first_configured_camera(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    telemetry = {
+        "cameras": [
+            {"key": "left_wrist", "label": "Left wrist"},
+            {"key": "head", "label": "Head camera", "role": "primary"},
+        ]
+    }
+
+    assert orchestration._recording_camera_spec(telemetry) == ("head", "Head camera")
+    assert orchestration._recording_camera_spec({"cameras": telemetry["cameras"][:1]}) == (
+        "left_wrist",
+        "Left wrist",
+    )
+
+
 def test_builtin_ros2_client_is_materialized_on_robot(tmp_path: Path) -> None:
     orchestration = DeploymentOrchestration(
         parse_recipe(raw_recipe()),
@@ -1335,15 +1921,27 @@ def test_python_adapter_runtime_is_materialized_on_robot(tmp_path: Path) -> None
     status_payload, status_mode = next(
         value for path, value in manager.files.items() if path.endswith("python_robot_client.status.json")
     )
+    preview_payload, preview_mode = next(
+        value for path, value in manager.files.items() if path.endswith("python_robot_client.preview.json")
+    )
+    control_payload, control_mode = next(
+        value for path, value in manager.files.items() if path.endswith("python_robot_client.control.json")
+    )
     config_payload, config_mode = next(
         value for path, value in manager.files.items() if path.endswith("python_robot_client.json")
     )
     generated = json.loads(config_payload)
     assert status_payload == b'{"status":"pending"}\n'
     assert status_mode == 0o600
+    assert preview_payload == b'{"status":"pending"}\n'
+    assert preview_mode == 0o600
+    assert json.loads(control_payload)["task_prompt"] == "move the object"
+    assert control_mode == 0o600
     assert config_mode == 0o600
     assert generated["task_prompt"] == "move the object"
     assert generated["model"]["endpoint"] == "http://127.0.0.1:8000"
+    assert generated["preview_status_path"].endswith("/python_robot_client.preview.json")
+    assert generated["runtime_control_path"].endswith("/python_robot_client.control.json")
     assert generated["adapter"]["source_path"].endswith("/python_adapter")
     assert "source_file" not in generated["adapter"]
     component, spec, environment = manager.started
@@ -1676,12 +2274,18 @@ def test_api_exposes_orchestration_control_routes(tmp_path: Path) -> None:
     assert "/api/deploy/orchestrations" in paths
     assert "/api/deploy/robot-connection" in paths
     assert "/api/deploy/orchestrations/prepare-model" in paths
+    assert "/api/deploy/orchestrations/connect-robot" in paths
+    assert "/api/deploy/orchestrations/{orchestration_id}/connect-robot" in paths
+    assert "/api/deploy/orchestrations/{orchestration_id}/prepare-model" in paths
+    assert "/api/deploy/orchestrations/{orchestration_id}/live-preview" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/start-dry-run" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/start-evaluation" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/offline-evaluation" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/prompt" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/poses" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/poses/{pose_id}/move" in paths
+    assert "/api/deploy/orchestrations/{orchestration_id}/hardware-replay" in paths
+    assert "/api/deploy/orchestrations/{orchestration_id}/hardware-replay/stop" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/poses/{pose_id}" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/start-live" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/stop-evaluation" in paths
@@ -1698,6 +2302,8 @@ def test_api_exposes_orchestration_control_routes(tmp_path: Path) -> None:
     assert capabilities["features"]["localModelHost"] is True
     assert capabilities["features"]["localRobotHost"] is True
     assert capabilities["features"]["offlineSingleFrameEvaluation"] is True
+    assert capabilities["features"]["hardwareDatasetReplay"] is True
+    assert capabilities["features"]["observationOnlyRobotConnection"] is True
     assert capabilities["checkpointModelProviders"] == ["openpi", "lerobot", "starvla"]
     assert capabilities["robotClients"] == ["ros2_standard", "python_adapter", "custom"]
     assert {item["id"] for item in catalog["models"]} == {"openpi", "lerobot", "starvla"}
@@ -1707,11 +2313,18 @@ def test_api_exposes_orchestration_control_routes(tmp_path: Path) -> None:
 def test_web_workspace_keeps_deployment_config_read_only() -> None:
     html = (PROJECT_ROOT / "web" / "index.html").read_text(encoding="utf-8")
     javascript = (PROJECT_ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    backend = (PROJECT_ROOT / "backend" / "app.py").read_text(encoding="utf-8")
+    settings_source = (PROJECT_ROOT / "backend" / "settings.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("EMBODIT_OUTPUT_DIR"' in settings_source
+    assert 'recording_root=settings.OUTPUT_DIR / "deployment-recordings"' in backend
+    assert 'pose_root=settings.OUTPUT_DIR / "deployment-poses"' in backend
     assert 'id="deploymentComponents"' not in html
     assert 'id="deploymentModelIo"' in html
     assert 'id="deploymentCameraGrid"' in html
-    assert 'id="deploymentStateGrid"' in html
-    assert 'id="deploymentActionGrid"' in html
+    assert 'id="deploymentStateGrid"' not in html
+    assert 'id="deploymentActionGrid"' not in html
+    assert 'id="deploymentActionTrajectory"' in html
+    assert 'class="deployment-trajectory-line-keys"' in html
     assert 'id="deployMetricSteps"' not in html
     assert 'id="splitDeploymentSidebar"' in html
     assert 'id="deploymentRobotConfig" readonly' in html
@@ -1751,6 +2364,8 @@ def test_web_workspace_keeps_deployment_config_read_only() -> None:
     assert "deleteSavedDeploymentConfig" not in javascript
     assert "importDeploymentFile" not in javascript
     assert "/api/deploy/orchestrations/prepare-model" in javascript
+    assert "/api/deploy/orchestrations/connect-robot" in javascript
+    assert "/connect-robot" in javascript
     assert "/start-dry-run" in javascript
     assert 'id="disconnectDeploymentRobot"' in html
     assert 'id="closeDeploymentModel"' in html

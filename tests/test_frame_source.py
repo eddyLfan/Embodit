@@ -2,14 +2,30 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
 from pathlib import Path
 
+import av
 import numpy as np
 
-from augment.video_io import encode_video_mp4
-from augment.pipeline import _resize_frame
 from datasets.frames import Mp4FrameSource, TopicFrameSource, episode_frame_source
 from datasets.view import CameraRef, DatasetView, EpisodeView
+
+
+def encode_video_mp4(frames: np.ndarray, path: Path, fps: float) -> None:
+    """Write a tiny test fixture without depending on a product feature module."""
+    height, width = frames.shape[1:3]
+    with av.open(str(path), mode="w") as container:
+        stream = container.add_stream("libx264", rate=Fraction(str(fps)))
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "yuv420p"
+        for pixels in frames:
+            frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
 
 
 def test_mp4_frame_source_slices_shared_shard(tmp_path: Path):
@@ -74,10 +90,3 @@ def test_mcap_topic_uses_direct_stream_instead_of_materialized_mp4(tmp_path: Pat
     source = episode_frame_source(Adapter(), view, episode, "camera")
     assert isinstance(source, TopicFrameSource)
     assert source.load_rgb().shape == (1, 8, 8, 3)
-
-
-def test_preview_resize_preserves_aspect_ratio_and_small_frames():
-    large = np.zeros((1300, 1600, 3), dtype=np.uint8)
-    assert _resize_frame(large, 640).shape == (520, 640, 3)
-    small = np.zeros((120, 160, 3), dtype=np.uint8)
-    assert _resize_frame(small, 640) is small

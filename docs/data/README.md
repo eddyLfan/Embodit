@@ -3,7 +3,7 @@
 **English** · [中文](README.zh-CN.md)
 
 Embodit provides a local workspace for inspecting, reviewing, labeling,
-quality-checking, converting, merging, and augmenting robot datasets. Source
+quality-checking, converting, and merging robot datasets. Source
 datasets are treated as read-only; derived datasets are written to a new path.
 
 ## 1. Start and path scope
@@ -18,7 +18,7 @@ available to the service account. A non-loopback listener automatically enables
 `EMBODIT_SANDBOX=1`, which confines client-supplied data paths to this root.
 Internal state and cache directories remain separate.
 
-The first start synchronizes the locked **core** environment. CUDA, SAM3,
+The first start synchronizes the locked **core** environment. CUDA,
 provider-specific environments, checkpoints, and system tools are not installed
 by this step.
 
@@ -125,7 +125,7 @@ rule changes do not silently reuse incompatible results.
 ## 5. Subset export and fidelity
 
 All subset writers require a new output path. Keep the source until the output
-has been validated. LeRobot, HDF5, MCAP, and augmentation writers use staging
+has been validated. LeRobot, HDF5, and MCAP writers use staging
 and no-overwrite publication in their supported write paths, so a failed or
 cancelled write does not publish its partial staging product as the target.
 
@@ -184,32 +184,9 @@ Labels are remapped when requested. Directory datasets store manifests/labels
 inside the output; single-file formats use adjacent sidecars. `hardlink` versus
 `copy` mainly affects LeRobot video media.
 
-## 8. Visual augmentation
+## 8. Jobs, cache, and cleanup
 
-Batch augmentation requires a successful matching preview. Brightness works in
-the core environment and does not require CUDA. Object recoloring and background
-replacement need a separate compatible CUDA/SAM3 environment and checkpoint:
-
-```bash
-export AUGMENT_PYTHON=/path/to/augment-env/bin/python
-export AUGMENT_SAM3_CHECKPOINT=/path/to/sam3.pt
-bash embodit.sh start /path/to/datasets
-```
-
-All four supported formats may be used as input when at least one camera can be
-decoded. Batch output is rebuilt as LeRobot v2.1 or v3 and contains augmented
-cameras, task text, and recognized standard `observation.state`/`action` data.
-Custom columns, calibration, source statistics, container metadata, and original
-timestamps are not carried through; timestamps are rebuilt from FPS, and
-length mismatches may be nearest-neighbor aligned. Failed episodes may be
-skipped and are recorded in the augmentation manifest.
-
-See [`../../third_party/README.md`](../../third_party/README.md) for SAM3 setup,
-trust, and licensing boundaries.
-
-## 9. Jobs, cache, and cleanup
-
-QC, conversion, merge, and augmentation use detached workers; closing the
+QC, conversion, and merge use detached workers; closing the
 browser does not stop them.
 
 ```bash
@@ -219,7 +196,7 @@ bash embodit.sh clean --cache
 bash embodit.sh clean --all
 ```
 
-`--cache` removes reproducible preview/media caches. `--all` also removes job
+`--cache` removes reproducible media caches. `--all` also removes job
 history and QC reports under the cache root. It does not remove datasets,
 derived outputs, labels, review files, deployment state, the Python environment,
 or the service token/log. Archive important reports before cleanup.
@@ -229,18 +206,16 @@ service is running. Configure it before starting Embodit:
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `EMBODIT_PREVIEW_TTL_DAYS` | `7` | Preview job records and resources |
 | `EMBODIT_MEDIA_TTL_DAYS` | `7` | Reproducible playback-media cache files |
-| `EMBODIT_SAM_CACHE_TTL_DAYS` | `30` | SAM3 segmentation cache files |
-| `EMBODIT_JOB_TTL_DAYS` | `30` | Terminal export, conversion, merge, QC, and augmentation job records/logs |
-| `EMBODIT_TEMP_TTL_DAYS` | `1` | Orphaned previews and temporary/staging artifacts |
+| `EMBODIT_JOB_TTL_DAYS` | `30` | Terminal export, conversion, merge, and QC job records/logs |
+| `EMBODIT_TEMP_TTL_DAYS` | `1` | Temporary/staging artifacts |
 | `EMBODIT_QC_REPORTS_PER_DATASET` | `5` | Latest reports retained per dataset; older reports remain while referenced by a job |
 | `EMBODIT_MAINTENANCE_INTERVAL_HOURS` | `24` | Periodic cleanup interval; positive values are clamped to at least one hour, and `0` disables only periodic cleanup |
 
 A zero TTL or report count makes matching unprotected items immediately eligible
 for cleanup. Startup maintenance still runs when the periodic interval is `0`.
 
-## 10. Troubleshooting and extension
+## 9. Troubleshooting and extension
 
 | Problem | Check |
 |---|---|
@@ -252,6 +227,5 @@ for cleanup. Startup maintenance still runs when the periodic interval is `0`.
 | Path rejected | Start with an appropriate data root; keep sandboxing enabled on LAN |
 
 Extension boundaries: dataset adapters live in `backend/datasets/`, QC detectors
-in `backend/qc/detectors/`, conversion in `backend/convert/`, and augmentation
-in `backend/augment/`. Contribution boundaries are summarized in
+in `backend/qc/detectors/`, conversion in `backend/convert/`. Contribution boundaries are summarized in
 [CONTRIBUTING.md](../../CONTRIBUTING.md).

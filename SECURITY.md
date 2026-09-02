@@ -127,8 +127,8 @@ commands, and custom adapters. Only load configurations from trusted authors and
 review every command, host, path, environment variable, observation mapping,
 action mapping, and limit before use.
 
-Model repositories, Python providers, custom robot adapters, SAM3 installations,
-and checkpoints execute or influence trusted computation. A malicious or
+Model repositories, Python providers, custom robot adapters, and checkpoints
+execute or influence trusted computation. A malicious or
 incompatible artifact can execute code, exhaust resources, return unsafe
 actions, or corrupt derived datasets. Pin reviewed revisions, verify provenance
 and hashes where available, isolate provider environments, and avoid loaders
