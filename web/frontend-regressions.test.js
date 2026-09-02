@@ -223,6 +223,12 @@ assert.ok(
     < appSource.indexOf("['hardware_replay_prepare', 'hardware_replay_client_stop'"),
 );
 assert.ok(appSource.includes("robotConfigId: $('#deploymentRobotSelect')?.value || null"));
+assert.ok(appSource.includes("modelConfigId: $('#deploymentModelSelect')?.value || null"));
+assert.ok(appSource.includes('/switch-model'));
+assert.ok(appSource.includes('startFrame: 0'));
+assert.ok(appSource.includes("t(modelChanged ? 'deploySwitchModel'"));
+assert.ok(appSource.includes("['model_ready', 'robot_ready', 'stopped', 'fault'].includes(snapshot?.state)"));
+assert.ok(appSource.includes("model_switch_precheck: t('deployCheckingEnvironment')"));
 const poseButtonSyncFunction = appSource.slice(
   appSource.indexOf('function syncDeploymentPoseButtons'),
   appSource.indexOf('function orchestrationLogRows'),

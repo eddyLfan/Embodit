@@ -319,7 +319,7 @@ def test_hardware_replay_uses_generic_adapter_and_recorded_fps(tmp_path) -> None
     assert status["framesApplied"] == 2
 
 
-def test_hardware_replay_keeps_dataset_clock_when_adapter_is_slower(tmp_path) -> None:
+def test_hardware_replay_delivers_every_frame_when_adapter_is_slower(tmp_path) -> None:
     module_path = tmp_path / "slow_replay_adapter.py"
     module_path.write_text(
         "import time\n"
@@ -357,11 +357,11 @@ def test_hardware_replay_keeps_dataset_clock_when_adapter_is_slower(tmp_path) ->
     module = sys.modules["slow_replay_adapter"]
     assert result["status"] == "finished"
     assert result["framesApplied"] == len(actions)
-    assert result["commandsSent"] < len(actions)
-    assert result["framesSkipped"] > 0
+    assert result["commandsSent"] == len(actions)
+    assert result["framesSkipped"] == 0
     assert result["timingDegraded"] is True
-    assert result["replayDurationS"] < 0.65
-    assert module.APPLIED[-1] == actions[-1]
+    assert result["replayDurationS"] >= 0.75
+    assert module.APPLIED[-len(actions):] == actions
 
 def test_recorded_pose_holds_final_target_until_feedback_is_within_robot_tolerance(tmp_path) -> None:
     module_path = tmp_path / "feedback_pose_adapter.py"

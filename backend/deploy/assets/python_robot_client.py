@@ -1389,7 +1389,7 @@ def replay_actions(config: dict[str, Any], replay: dict[str, Any]) -> dict[str, 
         transition_rows = validate_action(
             transition_rows, transition_check, current
         )
-        transition_started = time.monotonic()
+        transition_next_at = time.monotonic()
         transition_index = 0
         status.write(
             "moving_to_start",
@@ -1400,29 +1400,26 @@ def replay_actions(config: dict[str, Any], replay: dict[str, Any]) -> dict[str, 
             actionConstraints=constraints,
         )
         while transition_index < transition_steps and not stopping["value"]:
-            scheduled_at = transition_started + transition_index / rate_hz
-            remaining = scheduled_at - time.monotonic()
+            remaining = transition_next_at - time.monotonic()
             if remaining > 0:
                 time.sleep(remaining)
             if stopping["value"]:
                 break
-            due_index = min(
-                transition_steps - 1,
-                max(
-                    transition_index,
-                    int((time.monotonic() - transition_started) * rate_hz),
-                ),
-            )
             call_with_timeout(
                 adapter.apply_action,
                 watchdog_timeout_s,
                 "apply_action()",
-                transition_rows[due_index],
+                transition_rows[transition_index],
             )
-            transition_index = due_index + 1
-        transition_remaining = (
-            transition_started + transition_steps / rate_hz - time.monotonic()
-        )
+            transition_index += 1
+            # Keep the requested clock while the adapter can follow it.  If an
+            # apply call is late, continue from the current time instead of
+            # skipping intermediate transition commands or bursting to catch up.
+            transition_next_at = max(
+                transition_next_at + 1.0 / rate_hz,
+                time.monotonic(),
+            )
+        transition_remaining = transition_next_at - time.monotonic()
         if transition_remaining > 0 and not stopping["value"]:
 
             time.sleep(transition_remaining)
@@ -1439,32 +1436,32 @@ def replay_actions(config: dict[str, Any], replay: dict[str, Any]) -> dict[str, 
             )
             replay_started = time.monotonic()
             replay_index = 0
+            replay_next_at = replay_started
             last_reported = 0
             report_every = max(1, round(fps / 5))
             while replay_index < len(actions) and not stopping["value"]:
-                scheduled_at = replay_started + replay_index / fps
-                remaining = scheduled_at - time.monotonic()
+                remaining = replay_next_at - time.monotonic()
                 if remaining > 0:
                     time.sleep(remaining)
                 if stopping["value"]:
                     break
-                due_index = min(
-                    len(actions) - 1,
-                    max(
-                        replay_index,
-                        int((time.monotonic() - replay_started) * fps),
-                    ),
-                )
-                frames_skipped += due_index - replay_index
                 call_with_timeout(
                     adapter.apply_action,
                     watchdog_timeout_s,
                     "apply_action()",
-                    actions[due_index],
+                    actions[replay_index],
                 )
                 commands_sent += 1
-                frames_applied = due_index + 1
-                replay_index = due_index + 1
+                replay_index += 1
+                frames_applied = replay_index
+                # Every recorded frame is delivered exactly once.  When robot
+                # communication is slower than the dataset rate, stretch the
+                # replay clock rather than dropping stale frames or catching up
+                # with a command burst.
+                replay_next_at = max(
+                    replay_next_at + 1.0 / fps,
+                    time.monotonic(),
+                )
                 if (
                     frames_applied == 1
                     or frames_applied - last_reported >= report_every
@@ -1482,13 +1479,16 @@ def replay_actions(config: dict[str, Any], replay: dict[str, Any]) -> dict[str, 
                         fps=fps,
                         startFrame=int(replay.get("start_frame", 0)),
                     )
-            replay_remaining = (
-                replay_started + len(actions) / fps - time.monotonic()
-            )
+            replay_remaining = replay_next_at - time.monotonic()
             if replay_remaining > 0 and not stopping["value"]:
                 time.sleep(replay_remaining)
             replay_elapsed_s = time.monotonic() - replay_started
         final_status = "stopped" if stopping["value"] else "finished"
+        effective_command_hz = (
+            commands_sent / replay_elapsed_s
+            if replay_elapsed_s > 0
+            else 0
+        )
         result = {
             "status": final_status,
             "framesApplied": frames_applied,
@@ -1497,12 +1497,8 @@ def replay_actions(config: dict[str, Any], replay: dict[str, Any]) -> dict[str, 
             "durationS": time.monotonic() - started,
             "commandsSent": commands_sent,
             "framesSkipped": frames_skipped,
-            "timingDegraded": frames_skipped > 0,
-            "effectiveCommandHz": (
-                commands_sent / replay_elapsed_s
-                if replay_elapsed_s > 0
-                else 0
-            ),
+            "timingDegraded": effective_command_hz < fps * 0.98,
+            "effectiveCommandHz": effective_command_hz,
             "replayDurationS": replay_elapsed_s,
         }
         status.write(final_status, mode="replay", hardwareActive=False, **{key: value for key, value in result.items() if key != "status"})

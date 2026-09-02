@@ -144,7 +144,9 @@ class HarnessOrchestration(DeploymentOrchestration):
             raise RuntimeError(f"failed at {name}")
 
     def _precheck(self): self._called("precheck")
-    def _precheck_model_only(self): self._called("precheck")
+    def _precheck_model_only(self):
+        self._called("precheck")
+        self._model_home = "/home/model"
     def _precheck_robot_only(self):
         self._called("robot_precheck")
         self._robot_home = "/home/robot"
@@ -609,6 +611,38 @@ def test_stop_many_uses_one_systemd_round_trip() -> None:
         manager.unit_name("ros"),
         manager.unit_name("tunnel"),
     ]
+
+
+def test_remote_manager_cleans_only_other_embodit_component_units() -> None:
+    class UnitRunner:
+        def __init__(self):
+            self.commands = []
+
+        def run(self, args, **_kwargs):
+            self.commands.append(args)
+            if "list-units" in args:
+                return RemoteResult(
+                    0,
+                    "\n".join(
+                        [
+                            "embodit-model-robot-a--model-a.service loaded active running own",
+                            "embodit-model-robot-a--model-b.service loaded active running stale",
+                            "unrelated.service loaded active running unrelated",
+                        ]
+                    ),
+                )
+            return RemoteResult(0, "")
+
+    recipe = parse_recipe(raw_recipe())
+    recipe.deployment_id = "robot-a--model-a"
+    runner = UnitRunner()
+    manager = RemoteServiceManager(runner, recipe.hosts[recipe.model.host], recipe.deployment_id)
+
+    stopped = manager.stop_other_units("model")
+
+    assert stopped == ["embodit-model-robot-a--model-b.service"]
+    stop_command = next(command for command in runner.commands if "stop" in command)
+    assert stop_command[-1] == "embodit-model-robot-a--model-b.service"
 
 
 def test_python_robot_adapter_rejects_wrong_action_telemetry_width() -> None:
@@ -1094,6 +1128,93 @@ def test_robot_observation_can_prepare_model_then_upgrade_to_dry_run(tmp_path: P
         "precheck", "model", "model_health", "observation_client_stop",
         "tunnel_credentials", "tunnel", "tunnel_health", "client", "client_health", "monitor",
     ]
+
+
+def test_robot_observation_can_switch_model_without_dropping_robot(tmp_path: Path) -> None:
+    class StoppingManager:
+        def __init__(self):
+            self.stopped = []
+
+        def stop(self, component):
+            self.stopped.append(component)
+
+    orchestration = HarnessOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        model_config_id="model-a",
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    previous_manager = StoppingManager()
+    orchestration._managers[orchestration.model_host_name] = previous_manager
+    orchestration.state = OrchestrationState.ROBOT_READY
+    orchestration.mode = "observe"
+    orchestration.components["client"]["active"] = True
+    orchestration.components["ros"]["active"] = True
+    orchestration.components["model"]["active"] = True
+    replacement = python_adapter_recipe()
+    replacement["deployment_id"] = "robot-a--model-b"
+    replacement["name"] = "Robot A + Model B"
+    replacement["model"]["checkpoint"] = "/root/checkpoints/model-b"
+
+    snapshot = orchestration.switch_model(replacement, model_config_id="model-b")
+    assert snapshot["state"] == "starting"
+    operation = orchestration._operation_thread
+    assert operation is not None
+    operation.join(timeout=2)
+
+    snapshot = orchestration.snapshot()
+    assert snapshot["state"] == "robot_ready"
+    assert snapshot["modelConfigId"] == "model-b"
+    assert snapshot["components"]["client"]["active"] is True
+    assert snapshot["components"]["ros"]["active"] is True
+    assert previous_manager.stopped == ["model"]
+    assert orchestration.recipe.model.checkpoint == "/root/checkpoints/model-b"
+    assert orchestration.calls == ["precheck", "model", "model_health"]
+
+
+def test_tunnel_credentials_lazily_resolve_missing_host_homes(tmp_path: Path) -> None:
+    orchestration = DeploymentOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    homes = []
+
+    class HomeManager:
+        def __init__(self, home):
+            self._home = home
+
+        def home(self):
+            homes.append(self._home)
+            return self._home
+
+    orchestration._managers[orchestration.robot_host_name] = HomeManager("/home/robot")
+    orchestration._managers[orchestration.model_host_name] = HomeManager("/home/model")
+
+    with pytest.raises(RuntimeError):
+        orchestration._ensure_tunnel_credentials()
+
+    assert orchestration._robot_home == "/home/robot"
+    assert orchestration._model_home == "/home/model"
+    assert homes == ["/home/robot", "/home/model"]
+
+
+def test_switching_to_same_active_model_reuses_service(tmp_path: Path) -> None:
+    orchestration = HarnessOrchestration(
+        parse_recipe(python_adapter_recipe()),
+        tmp_path,
+        model_config_id="model-a",
+        runner_factory=lambda _name, _host: FakeRunner(),
+    )
+    orchestration.state = OrchestrationState.ROBOT_READY
+    orchestration.components["client"]["active"] = True
+    orchestration.components["model"]["active"] = True
+
+    snapshot = orchestration.switch_model(python_adapter_recipe(), model_config_id="model-a")
+
+    assert snapshot["state"] == "robot_ready"
+    assert orchestration._operation_thread is None
+    assert orchestration.events[-1]["event"] == "model_reused"
 
 
 def test_legacy_start_evaluation_from_model_ready_only_starts_dry_run(tmp_path: Path) -> None:
@@ -1754,6 +1875,18 @@ def test_registry_treats_fault_with_active_components_as_active(tmp_path: Path) 
         registry.create(raw_recipe())
 
 
+def test_registry_rejects_parallel_active_deployment_ids(tmp_path: Path) -> None:
+    registry = OrchestrationRegistry(tmp_path)
+    existing = registry.create(raw_recipe())
+    existing.state = OrchestrationState.MODEL_READY
+    existing.components["model"]["active"] = True
+    replacement = raw_recipe()
+    replacement["deployment_id"] = "robot-a--another-model"
+
+    with pytest.raises(ValueError, match="复用当前本体/模型会话"):
+        registry.create(replacement)
+
+
 def test_registry_stop_all_cleans_fault_with_active_components(tmp_path: Path) -> None:
     class RecordingManager:
         def __init__(self):
@@ -1970,6 +2103,7 @@ def test_python_model_runner_is_materialized_on_model_host(tmp_path: Path) -> No
     assert generated["checkpoint"] == "/root/checkpoints/my-vla"
     component, spec, _environment = manager.started
     assert component == "model"
+    assert spec.restart == "no"
     assert spec.command[0] == "/root/miniconda3/envs/vla/bin/python"
     assert spec.command[-2:] == ["--port", "8000"]
 
@@ -2277,6 +2411,7 @@ def test_api_exposes_orchestration_control_routes(tmp_path: Path) -> None:
     assert "/api/deploy/orchestrations/connect-robot" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/connect-robot" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/prepare-model" in paths
+    assert "/api/deploy/orchestrations/{orchestration_id}/switch-model" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/live-preview" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/start-dry-run" in paths
     assert "/api/deploy/orchestrations/{orchestration_id}/start-evaluation" in paths

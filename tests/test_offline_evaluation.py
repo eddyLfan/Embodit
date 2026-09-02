@@ -93,6 +93,24 @@ def test_load_dataset_action_replay_keeps_raw_frames_and_names() -> None:
     ]
 
 
+def test_load_dataset_action_replay_defaults_to_complete_episode() -> None:
+    result = load_dataset_action_replay(
+        FakeAdapter(),
+        episode_index=3,
+        action_names=["joint_a", "joint_b"],
+    )
+
+    assert result["startFrame"] == 0
+    assert result["endFrame"] == 5
+    assert result["action"]["values"] == [
+        [0.0, 0.0],
+        [1.0, 2.0],
+        [2.0, 4.0],
+        [3.0, 6.0],
+        [4.0, 8.0],
+    ]
+
+
 
 def test_offline_evaluation_compares_every_action_dimension() -> None:
     captured = {}

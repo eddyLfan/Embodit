@@ -221,18 +221,22 @@ def main() -> int:
     if config.get("module_search_path"):
         sys.path.insert(0, config["module_search_path"])
     provider = ModelProvider(config)
-    try:
-        provider.load()
-    except Exception as error:  # noqa: BLE001
-        provider.error = str(error)
-        traceback.print_exc()
-        raise
-
+    # Reserve the endpoint before allocating checkpoint tensors.  If a stale
+    # Embodit model still owns the configured port, fail immediately instead of
+    # loading a second large model into GPU memory and only discovering the
+    # collision after the load completes.
     server = ModelHttpServer(
         (args.host, args.port),
         provider,
         int(config.get("maximum_request_bytes", 50_000_000)),
     )
+    try:
+        provider.load()
+    except Exception as error:  # noqa: BLE001
+        provider.error = str(error)
+        server.server_close()
+        traceback.print_exc()
+        raise
     signal.signal(signal.SIGTERM, lambda *_args: threading.Thread(target=server.shutdown, daemon=True).start())
     signal.signal(signal.SIGINT, lambda *_args: threading.Thread(target=server.shutdown, daemon=True).start())
     print(f"Embodit model runner ready on http://{args.host}:{args.port}", flush=True)

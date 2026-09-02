@@ -103,6 +103,47 @@ class RemoteServiceManager:
         safe = re.sub(r"[^A-Za-z0-9_.@-]", "-", self.deployment_id)
         return f"embodit-{component}-{safe}.service"
 
+    def stop_other_units(self, component: str) -> list[str]:
+        """Stop stale Embodit units that would compete for one component role.
+
+        The deployment workbench intentionally owns one active robot/model stack
+        at a time.  Transient systemd units can survive an ungraceful backend
+        restart, so only checking the in-memory orchestration registry is not
+        sufficient.  Limit cleanup to Embodit's own component namespace and
+        never touch unrelated host services.
+        """
+        if not re.fullmatch(r"[A-Za-z0-9_.@-]+", component):
+            raise ValueError("组件名称非法")
+        current = self.unit_name(component)
+        result = self.runner.run(
+            [
+                *self.systemctl,
+                "list-units",
+                "--all",
+                "--state=active,activating,reloading",
+                "--plain",
+                "--no-legend",
+                f"embodit-{component}-*.service",
+            ],
+            timeout=15,
+        )
+        require_remote_ok(result, f"枚举残留 {component} 服务")
+        units: list[str] = []
+        for line in result.stdout.splitlines():
+            unit = line.strip().split(maxsplit=1)[0] if line.strip() else ""
+            if (
+                unit != current
+                and re.fullmatch(rf"embodit-{re.escape(component)}-[A-Za-z0-9_.@-]+\.service", unit)
+            ):
+                units.append(unit)
+        units = list(dict.fromkeys(units))
+        if not units:
+            return []
+        stopped = self.runner.run([*self.systemctl, "stop", *units], timeout=90)
+        require_remote_ok(stopped, f"清理残留 {component} 服务")
+        self.runner.run([*self.systemctl, "reset-failed", *units], timeout=15)
+        return units
+
     def start(self, component: str, spec: CommandSpec, *, environment: dict[str, str] | None = None) -> str:
         unit = self.unit_name(component)
         wrapper = f"{self.deployment_dir}/{component}.sh"
@@ -231,6 +272,7 @@ class DeploymentOrchestration:
         runner_factory: Callable[[str, RecipeHost], CommandRunner] | None = None,
         recording_root: Path | None = None,
         pose_path: Path | None = None,
+        model_config_id: str | None = None,
     ):
         self.id = uuid.uuid4().hex
         self.recipe = recipe
@@ -247,6 +289,7 @@ class DeploymentOrchestration:
         self.last_error: str | None = None
         self.created_ns = time.time_ns()
         self.updated_ns = self.created_ns
+        self.model_config_id = model_config_id
         self.events: list[dict[str, Any]] = []
         self.steps: list[dict[str, Any]] = []
         self.components = {name: {"active": False, "unit": None, "host": None} for name in self.COMPONENTS}
@@ -317,6 +360,7 @@ class DeploymentOrchestration:
             }
         )
         factory = runner_factory or self._default_runner
+        self._runner_factory = factory
         for name, host in recipe.hosts.items():
             runner = factory(name, host)
             self._runners[name] = runner
@@ -358,6 +402,18 @@ class DeploymentOrchestration:
     @property
     def robot_manager(self) -> RemoteServiceManager:
         return self._managers[self.robot_host_name]
+
+    def _clear_stale_component_units(
+        self,
+        manager: RemoteServiceManager,
+        component: str,
+    ) -> None:
+        cleanup = getattr(manager, "stop_other_units", None)
+        if not callable(cleanup):
+            return
+        stopped = cleanup(component)
+        if stopped:
+            self._record("stale_component_units_stopped", component=component, units=stopped)
 
     def start(self, *, task_prompt: str | None = None) -> dict[str, Any]:
         monitor_thread: threading.Thread | None = None
@@ -776,6 +832,171 @@ class DeploymentOrchestration:
             with self._lock:
                 self._operation_thread = None
 
+    @staticmethod
+    def _robot_switch_signature(recipe: DeploymentRecipe) -> dict[str, Any]:
+        """Return the robot-owned part of a Recipe, excluding model-derived chunk fields."""
+        robot = recipe.robot.model_dump(mode="json")
+        client = robot.get("client") if isinstance(robot, dict) else None
+        client_config = client.get("config") if isinstance(client, dict) else None
+        if isinstance(client_config, dict):
+            client_config.pop("task_prompt", None)
+            action = client_config.get("action")
+            if isinstance(action, dict):
+                action.pop("horizon", None)
+            control = client_config.get("control")
+            if isinstance(control, dict):
+                control.pop("action_steps", None)
+        tunnel = recipe.tunnel.model_dump(
+            mode="json",
+            exclude={"destination_host", "remote_bind", "remote_port"},
+        )
+        return {
+            "host": recipe.hosts[recipe.robot.host].model_dump(mode="json"),
+            "robot": robot,
+            "tunnel": tunnel,
+        }
+
+    def switch_model(
+        self,
+        raw_recipe: dict[str, Any],
+        *,
+        model_config_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Replace the resident model without dropping robot observation.
+
+        Model switches are deliberately serialized: the old service must stop
+        before the replacement begins loading, otherwise two large checkpoints
+        can occupy the same GPU and endpoint concurrently.
+        """
+        replacement = parse_recipe(raw_recipe)
+        with self._lock:
+            if self._offline_inference_active:
+                raise ValueError("离线评测正在进行，不能切换模型")
+            if self._operation_thread is not None and self._operation_thread.is_alive():
+                raise ValueError("已有部署控制操作正在进行")
+            if self.state not in {
+                OrchestrationState.MODEL_READY,
+                OrchestrationState.ROBOT_READY,
+                OrchestrationState.STOPPED,
+                OrchestrationState.FAULT,
+            }:
+                raise ValueError("请先暂停评测，再切换模型")
+            if self._robot_switch_signature(replacement) != self._robot_switch_signature(self.recipe):
+                raise ValueError("切换模型时本体配置必须保持不变")
+            same_model = (
+                replacement.model == self.recipe.model
+                and replacement.hosts[replacement.model.host or ""]
+                == self.recipe.hosts[self.recipe.model.host or ""]
+                and replacement.tunnel.remote_bind == self.recipe.tunnel.remote_bind
+                and replacement.tunnel.remote_port == self.recipe.tunnel.remote_port
+                and (model_config_id is None or model_config_id == self.model_config_id)
+            )
+            if same_model and self.components.get("model", {}).get("active"):
+                self._record("model_reused", modelConfigId=self.model_config_id)
+                return self.snapshot()
+            robot_linked = bool(self.components.get("client", {}).get("active"))
+            if self.state == OrchestrationState.FAULT and self._has_active_components_unlocked() and not robot_linked:
+                raise ValueError("故障部署仍有活动组件，请先停止并清理后再切换模型")
+            previous_model_config_id = self.model_config_id
+            previous_prompt = str(
+                (self.recipe.robot.client.config or {}).get("task_prompt") or ""
+            ).strip()
+            if previous_prompt:
+                next_client_config = dict(replacement.robot.client.config or {})
+                next_client_config["task_prompt"] = previous_prompt
+                replacement.robot.client.config = next_client_config
+            self._maintenance.set()
+            self.last_error = None
+            self.state = OrchestrationState.STARTING
+            self.current_step = "model_switch_stop"
+            thread = threading.Thread(
+                target=self._switch_model_worker,
+                args=(replacement, model_config_id, robot_linked),
+                daemon=True,
+                name=f"model-switch-{self.id[:8]}",
+            )
+            self._operation_thread = thread
+            thread.start()
+            self._record(
+                "model_switch_requested",
+                fromModelConfigId=previous_model_config_id,
+                toModelConfigId=model_config_id,
+                robotPreserved=robot_linked,
+            )
+            return self.snapshot()
+
+    def _switch_model_worker(
+        self,
+        replacement: DeploymentRecipe,
+        model_config_id: str | None,
+        robot_linked: bool,
+    ) -> None:
+        try:
+            old_manager = self.model_manager
+
+            def stop_previous_model() -> None:
+                if self.components.get("model", {}).get("active"):
+                    old_manager.stop("model")
+                    self.components["model"]["active"] = False
+
+            self._step("model_switch_stop", stop_previous_model)
+            with self._lock:
+                self.recipe = replacement
+                self.model_config_id = model_config_id
+                model_host = replacement.model.host or ""
+                runner = self._runner_factory(model_host, replacement.hosts[model_host])
+                self._runners[model_host] = runner
+                self._managers[model_host] = RemoteServiceManager(
+                    runner,
+                    replacement.hosts[model_host],
+                    replacement.deployment_id,
+                )
+                self._model_home = None
+                self._tunnel_key = None
+                self._tunnel_known_hosts = None
+                self.model_io = None
+                self.runtime_timing = None
+                self.scheduler_status = None
+            self._step("model_switch_precheck", self._precheck_model_only)
+            self._step("model_switch_start", self._start_model)
+            self._step("model_switch_health", self._wait_model_health)
+            with self._lock:
+                self.state = (
+                    OrchestrationState.ROBOT_READY
+                    if robot_linked and self.components.get("client", {}).get("active")
+                    else OrchestrationState.MODEL_READY
+                )
+                self.current_step = None
+                self._record(
+                    "model_switched",
+                    modelConfigId=self.model_config_id,
+                    robotPreserved=robot_linked,
+                )
+        except Exception as error:  # noqa: BLE001
+            if self.components.get("model", {}).get("active"):
+                try:
+                    self.model_manager.stop("model")
+                except Exception:  # noqa: BLE001
+                    pass
+                self.components["model"]["active"] = False
+            with self._lock:
+                self.last_error = f"切换模型失败：{error}"
+                self.state = (
+                    OrchestrationState.ROBOT_READY
+                    if robot_linked and self.components.get("client", {}).get("active")
+                    else OrchestrationState.FAULT
+                )
+                self.current_step = None
+                self._record(
+                    "model_switch_failed",
+                    reason=str(error),
+                    robotPreserved=robot_linked,
+                )
+        finally:
+            self._maintenance.clear()
+            with self._lock:
+                self._operation_thread = None
+
     def _run(self) -> None:
         model_prepared = False
         try:
@@ -1107,7 +1328,14 @@ class DeploymentOrchestration:
         }
 
     def _ensure_tunnel_credentials(self) -> None:
-        assert self._robot_home and self._model_home
+        # Host homes are cached by preflight, but a model switch deliberately
+        # replaces the model runner and invalidates its cache.  Resolve either
+        # missing value lazily as well so reconnect/evaluation paths never fail
+        # with an opaque AssertionError after a successful switch.
+        if not self._robot_home:
+            self._robot_home = self.robot_manager.home()
+        if not self._model_home:
+            self._model_home = self.model_manager.home()
         base = f"{self._robot_home}/.embodit/deployments/{self.recipe.deployment_id}"
         key_path = f"{base}/keys/model_tunnel"
         known_hosts = f"{base}/known_hosts"
@@ -1238,8 +1466,12 @@ open(path,'w').write('\n'.join(lines) + '\n'); os.chmod(path,0o600)
                         "--port",
                         str(self.recipe.tunnel.remote_port),
                     ],
+                    # A failed multi-gigabyte checkpoint load must report once,
+                    # not enter an unbounded systemd/OOM restart loop.
+                    "restart": "no",
                 }
             )
+        self._clear_stale_component_units(self.model_manager, "model")
         unit = self.model_manager.start("model", service)
         self.components["model"] = {"active": True, "unit": unit, "host": self.model_host_name}
 
@@ -1296,6 +1528,7 @@ open(path,'w').write('\n'.join(lines) + '\n'); os.chmod(path,0o600)
             f"ServerAliveCountMax={tunnel.server_alive_count_max}",
             f"{destination.user}@{destination.address}",
         ]
+        self._clear_stale_component_units(self.robot_manager, "tunnel")
         unit = self.robot_manager.start_argv("tunnel", command, restart=tunnel.restart)
         self.components["tunnel"] = {"active": True, "unit": unit, "host": self.robot_host_name}
 
@@ -1319,6 +1552,7 @@ open(path,'w').write('\n'.join(lines) + '\n'); os.chmod(path,0o600)
                 },
             }
         )
+        self._clear_stale_component_units(self.robot_manager, "ros")
         unit = self.robot_manager.start("ros", bringup)
         self.components["ros"] = {"active": True, "unit": unit, "host": self.robot_host_name}
 
@@ -1667,6 +1901,7 @@ if max(errors, default=0) > tolerance: raise SystemExit('initial pose tolerance 
                 },
             }
         )
+        self._clear_stale_component_units(self.robot_manager, "client")
         unit = self.robot_manager.start(
             "client",
             client,
@@ -2696,32 +2931,37 @@ else: raise SystemExit('Python Robot Adapter readiness timeout: ' + last)
                 self.current_step = None
                 self.hardware_replay["status"] = "starting"
                 self._record("hardware_replay_started")
-            deadline = (
-                time.monotonic()
-                + float(payload["move_to_start_duration_s"])
-                + len(payload["actions"]) / float(payload["fps"])
-                + 60.0
+            # A hardware adapter may be slower than the recorded frequency.  A
+            # replay that is still making progress is allowed to stretch in
+            # time; only a prolonged lack of status/progress is considered hung.
+            stall_timeout_s = max(
+                120.0,
+                float(payload["move_to_start_duration_s"]) + 60.0,
             )
+            progress_deadline = time.monotonic() + stall_timeout_s
+            last_progress: tuple[str, int] | None = None
             while (
                 not self._hardware_replay_stop.is_set()
                 and not self._stop_requested.is_set()
-                and time.monotonic() < deadline
             ):
                 self._refresh_python_adapter_model_io()
                 with self._lock:
                     status = str(self.hardware_replay.get("status") or "")
+                    frames_applied = int(self.hardware_replay.get("framesApplied") or 0)
                     replay_fault = self.hardware_replay.get("error")
+                progress = (status, frames_applied)
+                if progress != last_progress:
+                    last_progress = progress
+                    progress_deadline = time.monotonic() + stall_timeout_s
                 if status in {"finished", "stopped"}:
                     break
                 if status == "fault":
                     raise RuntimeError(str(replay_fault or "真机 Replay Client 故障"))
+                if time.monotonic() >= progress_deadline:
+                    raise TimeoutError(
+                        f"真机 Replay 连续 {stall_timeout_s:g} 秒没有进度"
+                    )
                 time.sleep(0.2)
-            else:
-                if (
-                    not self._hardware_replay_stop.is_set()
-                    and not self._stop_requested.is_set()
-                ):
-                    raise TimeoutError("真机 Replay 超过预计时长")
         except StopRequested:
             pass
         except Exception as error:
@@ -3312,6 +3552,7 @@ else: raise SystemExit('Python Robot Adapter readiness timeout: ' + last)
             return {
                 "orchestrationId": self.id,
                 "deploymentId": self.recipe.deployment_id,
+                "modelConfigId": self.model_config_id,
                 "name": self.recipe.name,
                 "recipeVersion": 2,
                 "state": self.state.value,
@@ -3476,6 +3717,7 @@ class OrchestrationRegistry:
         *,
         mode: str | None = None,
         robot_config_id: str | None = None,
+        model_config_id: str | None = None,
     ) -> DeploymentOrchestration:
         recipe = parse_recipe(raw)
         if mode is not None:
@@ -3490,19 +3732,22 @@ class OrchestrationRegistry:
             self.root / recipe.deployment_id,
             recording_root=self.recording_root,
             pose_path=self.pose_root / f"{pose_key}.json",
+            model_config_id=model_config_id,
         )
         with self._lock:
             active = [
                 existing
                 for existing in self._items.values()
-                if existing.recipe.deployment_id == recipe.deployment_id
-                and (
+                if (
                     existing.state not in {OrchestrationState.STOPPED, OrchestrationState.FAULT}
                     or existing.has_active_components()
                 )
             ]
             if active:
-                raise ValueError(f"Deployment 已有活动编排：{active[0].id}")
+                raise ValueError(
+                    f"Deployment 已有活动编排：{active[0].id}；"
+                    "请复用当前本体/模型会话，不要并行创建受管组件"
+                )
             self._items[item.id] = item
         return item
 

@@ -257,6 +257,7 @@ class DeploymentOrchestrationStartRequest(BaseModel):
     recipe: dict[str, Any]
     mode: str | None = None
     robotConfigId: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    modelConfigId: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
 
 
 class DeploymentDryRunRequest(BaseModel):
@@ -1321,6 +1322,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
                 request.recipe,
                 mode=request.mode,
                 robot_config_id=request.robotConfigId,
+                model_config_id=request.modelConfigId,
             )
             return item.start()
         except Exception as error:  # noqa: BLE001
@@ -1333,6 +1335,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
                 request.recipe,
                 mode="dry_run",
                 robot_config_id=request.robotConfigId,
+                model_config_id=request.modelConfigId,
             )
             return item.prepare_model()
         except Exception as error:  # noqa: BLE001
@@ -1345,6 +1348,7 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
                 request.recipe,
                 mode="dry_run",
                 robot_config_id=request.robotConfigId,
+                model_config_id=request.modelConfigId,
             )
             return item.connect_robot()
         except Exception as error:  # noqa: BLE001
@@ -1371,6 +1375,26 @@ def build_app(token: str, browse_root: Path, web_root: Path) -> FastAPI:
     def prepare_deployment_model_existing(orchestration_id: str) -> dict[str, Any]:
         try:
             return deployment_orchestrations.get(orchestration_id).prepare_model()
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/api/deploy/orchestrations/{orchestration_id}/switch-model",
+        dependencies=[Depends(authorize)],
+    )
+    def switch_deployment_model(
+        orchestration_id: str,
+        request: DeploymentOrchestrationStartRequest,
+    ) -> dict[str, Any]:
+        try:
+            return deployment_orchestrations.get(orchestration_id).switch_model(
+                request.recipe,
+                model_config_id=request.modelConfigId,
+            )
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ValueError as error:

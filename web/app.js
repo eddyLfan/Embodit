@@ -183,7 +183,7 @@
     $('#openDataWorkspace')?.addEventListener('click', openDataWorkspace);
     $('#openDeployment')?.addEventListener('click', openDeploymentWorkspace);
     $('#deploymentRobotSelect')?.addEventListener('change', () => loadSelectedDeploymentConfigs().catch((error) => setDeploymentResult({ error: error.message }, t('deployFailed'), true)));
-    $('#deploymentModelSelect')?.addEventListener('change', () => loadSelectedDeploymentConfigs().catch((error) => setDeploymentResult({ error: error.message }, t('deployFailed'), true)));
+    $('#deploymentModelSelect')?.addEventListener('change', () => loadSelectedDeploymentModel().catch((error) => setDeploymentResult({ error: error.message }, t('deployFailed'), true)));
     $('#deploymentTaskPrompt')?.addEventListener('input', onDeploymentPromptInput);
     $('#checkDeploymentRobot')?.addEventListener('click', checkDeploymentRobotConnection);
     $('#prepareDeploymentModel')?.addEventListener('click', prepareDeploymentModel);
@@ -324,6 +324,12 @@
       const orchestrations = await api('/api/deploy/orchestrations');
       const activeRecipe = (orchestrations.orchestrations || []).find((item) => !['stopped', 'fault'].includes(item.state));
       if (activeRecipe) {
+        const modelSelect = $('#deploymentModelSelect');
+        if (activeRecipe.modelConfigId && modelSelect
+          && [...modelSelect.options].some((option) => option.value === activeRecipe.modelConfigId)) {
+          modelSelect.value = activeRecipe.modelConfigId;
+          await loadSelectedDeploymentConfigs();
+        }
         state.deploymentSessionId = activeRecipe.orchestrationId;
         state.deploymentRuntimeKind = 'recipe';
         renderDeploymentSnapshot(activeRecipe);
@@ -480,6 +486,24 @@
     setDeploymentComponentStatus('#deploymentModelStatus', 'idle', t('deployNotStarted'));
     state.deploymentRobotConnected = false;
     syncDeploymentButtons(false);
+  }
+
+  async function loadSelectedDeploymentModel() {
+    if (!state.deploymentSessionId) {
+      await loadSelectedDeploymentConfigs();
+      return;
+    }
+    if (!$('#deploymentModelSelect')?.value) return;
+    state.deploymentConfigsReady = false;
+    syncDeploymentButtons(true, state.deploymentSnapshot);
+    const model = await selectedDeploymentConfig('model');
+    const robot = deploymentConfig('robot');
+    writeDeploymentConfig('model', model);
+    configureDeploymentScheduler(robot, model);
+    syncDeploymentCompositionIdentity();
+    await refreshDeploymentComposition(false);
+    state.deploymentConfigsReady = true;
+    syncDeploymentButtons(true, state.deploymentSnapshot);
   }
 
   function configureDeploymentPrompts(robot) {
@@ -949,11 +973,10 @@
     if (!status) return;
     if (running) {
       const commandsSent = Number(hardware.commandsSent || 0);
-      const framesSkipped = Number(hardware.framesSkipped || 0);
       const delivery = commandsSent
         ? ` · ${t('deployOfflineReplayDelivery', {
           sent: commandsSent,
-          skipped: framesSkipped,
+          total: Number(hardware.totalFrames || 0),
         })}`
         : '';
       const applied = Number(hardware.framesApplied || 0);
@@ -975,7 +998,6 @@
         && Number(hardware.effectiveCommandHz) > 0) {
         status.textContent += ` · ${t('deployOfflineReplayEffectiveRate', {
           hz: formatModelIoValue(hardware.effectiveCommandHz),
-          skipped: Number(hardware.framesSkipped || 0),
         })}`;
       }
     } else {
@@ -995,7 +1017,7 @@
         body: JSON.stringify({
           dataset: replay.path,
           episodeIndex: Number(replay.episode.episodeIndex),
-          startFrame: replay.frame,
+          startFrame: 0,
           moveToStartDurationS: 3,
         }),
       });
@@ -1450,13 +1472,19 @@
     const hasRobotConfig = Boolean($('#deploymentRobotSelect')?.value);
     const hasModelConfig = Boolean($('#deploymentModelSelect')?.value);
     const configsReady = state.deploymentConfigsReady || Boolean(state.deploymentSessionId);
-    const modelReady = ['model_ready', 'robot_ready'].includes(snapshot?.state) && snapshot?.components?.model?.active;
+    const selectedModelId = $('#deploymentModelSelect')?.value || null;
+    const activeModelId = snapshot?.modelConfigId || null;
+    const modelChanged = Boolean(state.deploymentSessionId && selectedModelId
+      && (!activeModelId || selectedModelId !== activeModelId));
+    const modelReady = ['model_ready', 'robot_ready'].includes(snapshot?.state)
+      && snapshot?.components?.model?.active && !modelChanged;
     const paused = snapshot?.state === 'dry_run' && snapshot?.components?.model?.active;
     const running = snapshot?.state === 'running';
     const changing = ['starting', 'replaying', 'stopping'].includes(snapshot?.state);
     const robotLinked = Boolean(snapshot?.components?.tunnel?.active || snapshot?.components?.ros?.active || snapshot?.components?.client?.active);
     const modelActive = Boolean(snapshot?.components?.model?.active);
-    $('#prepareDeploymentModel').disabled = changing || modelActive || !configsReady || !hasRobotConfig || !hasModelConfig;
+    $('#prepareDeploymentModel').disabled = changing || (modelActive && !modelChanged)
+      || !configsReady || !hasRobotConfig || !hasModelConfig;
     if ($('#prepareDeploymentModel')) {
       const modelHealthPassed = latestDeploymentStep(snapshot, 'model_health')?.status === 'passed';
       const progressKey = modelHealthPassed || modelReady || paused || running
@@ -1466,7 +1494,7 @@
         model: 'deployStartingService',
         model_health: 'deployWaitingModelHealth',
       }[snapshot?.currentStep] || null);
-      $('#prepareDeploymentModel').textContent = t(progressKey || 'deployStartModel');
+      $('#prepareDeploymentModel').textContent = t(modelChanged ? 'deploySwitchModel' : (progressKey || 'deployStartModel'));
     }
     $('#checkDeploymentRobot').disabled = !configsReady || !hasRobotConfig || changing || robotLinked
       || Boolean(state.deploymentSessionId && snapshot?.state !== 'model_ready');
@@ -1478,7 +1506,8 @@
     $('#startLiveDeployment').textContent = t(paused ? 'deployArmLive' : 'deployStartDryRun');
     $('#stopLiveDeployment').disabled = !active || !running;
     $('#deploymentRobotSelect').disabled = active || !configsReady || !hasRobotConfig;
-    $('#deploymentModelSelect').disabled = active || !configsReady || !hasModelConfig;
+    const canChooseModel = !active || ['model_ready', 'robot_ready', 'stopped', 'fault'].includes(snapshot?.state);
+    $('#deploymentModelSelect').disabled = changing || !canChooseModel || !configsReady || !hasModelConfig;
     $('#deploymentTaskPrompt').disabled = changing;
     $('#applyDeploymentPrompt').disabled = !active || changing || !$('#deploymentTaskPrompt')?.value.trim();
     const scheduler = deploymentSchedulerForm();
@@ -1534,6 +1563,7 @@
             recipe: await composeDeploymentRecipe(),
             mode: 'dry_run',
             robotConfigId: $('#deploymentRobotSelect')?.value || null,
+            modelConfigId: $('#deploymentModelSelect')?.value || null,
           })
         });
       const existing = state.deploymentSessionId;
@@ -1607,13 +1637,28 @@
           recipe: await composeDeploymentRecipe(),
           mode: 'dry_run',
           robotConfigId: $('#deploymentRobotSelect')?.value || null,
+          modelConfigId: $('#deploymentModelSelect')?.value || null,
         })
       });
       const existing = state.deploymentSessionId;
       let snapshot;
       if (existing) {
         try {
-          snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(existing)}/prepare-model`, { method: 'POST' });
+          const selectedModelId = $('#deploymentModelSelect')?.value || null;
+          const activeModelId = state.deploymentSnapshot?.modelConfigId || null;
+          if (selectedModelId && selectedModelId !== activeModelId) {
+            snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(existing)}/switch-model`, {
+              method: 'POST',
+              body: JSON.stringify({
+                recipe: await composeDeploymentRecipe(),
+                mode: 'dry_run',
+                robotConfigId: $('#deploymentRobotSelect')?.value || null,
+                modelConfigId: selectedModelId,
+              }),
+            });
+          } else {
+            snapshot = await api(`/api/deploy/orchestrations/${encodeURIComponent(existing)}/prepare-model`, { method: 'POST' });
+          }
         } catch (error) {
           if (error.status !== 404) throw error;
           stopDeploymentPolling();
@@ -1999,6 +2044,10 @@
       precheck: t('deployCheckingEnvironment'),
       model: t('deployStartingService'),
       model_health: t('deployWaitingModelHealth'),
+      model_switch_stop: t('deployStoppingPreviousModel'),
+      model_switch_precheck: t('deployCheckingEnvironment'),
+      model_switch_start: t('deployStartingService'),
+      model_switch_health: t('deployWaitingModelHealth'),
       robot_precheck: t('deployCheckingRobot'),
       tunnel_credentials: t('deployPreparingTunnelCredentials'),
       tunnel: t('deployStartingTunnel'),
@@ -2066,7 +2115,10 @@
       : ((robotStartingSteps.has(snapshot.currentStep) || robotDisconnecting) ? progress.text : t('deployObservationLinkMissing'));
     const modelHealth = latestDeploymentStep(snapshot, 'model_health');
     const modelClosing = snapshot.currentStep === 'model_close';
-    const modelStarting = ['precheck', 'model', 'model_health'].includes(snapshot.currentStep);
+    const modelStarting = [
+      'precheck', 'model', 'model_health',
+      'model_switch_stop', 'model_switch_precheck', 'model_switch_start', 'model_switch_health',
+    ].includes(snapshot.currentStep);
     const modelReady = Boolean(snapshot.components?.model?.active)
       && (modelHealth?.status === 'passed' || ['model_ready', 'robot_ready', 'dry_run', 'running'].includes(snapshot.state));
     if (modelClosing) setDeploymentComponentStatus('#deploymentModelStatus', 'pending', progress.text || t('deployClosingModel'));
