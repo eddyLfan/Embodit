@@ -210,8 +210,12 @@ class OpenPIAdapter:
         observation_map: dict[str, str] | None = None,
         image_preprocessing: dict[str, Any] | None = None,
         norm_stats_asset_id: str | None = None,
+        clamp_astribot_gripper_min_to_zero: bool = False,
         **policy_kwargs: Any,
     ) -> None:
+        if not isinstance(clamp_astribot_gripper_min_to_zero, bool):
+            raise ValueError("clamp_astribot_gripper_min_to_zero 必须是布尔值")
+        self.clamp_astribot_gripper_min_to_zero = clamp_astribot_gripper_min_to_zero
         _add_source_path(source_path)
         from openpi.policies import policy_config
         from openpi.training import config as training_config
@@ -264,6 +268,7 @@ class OpenPIAdapter:
             "image_preprocessing": self.image_preprocessing or {"mode": "policy"},
             "norm_stats_asset_id": norm_stats_asset_id,
             **(getattr(self.policy, "metadata", None) or {}),
+            "clamp_astribot_gripper_min_to_zero": clamp_astribot_gripper_min_to_zero,
         }
 
     @staticmethod
@@ -309,7 +314,19 @@ class OpenPIAdapter:
         result = self.policy.infer(values)
         if not isinstance(result, dict) or "actions" not in result:
             raise ValueError("OpenPI policy.infer 必须返回包含 actions 的对象")
-        return result["actions"]
+        actions = result["actions"]
+        if getattr(self, "clamp_astribot_gripper_min_to_zero", False):
+            import numpy as np
+
+            actions = np.array(actions, copy=True)
+            if actions.ndim != 2 or actions.shape[0] == 0 or actions.shape[1] != 16:
+                raise ValueError("Astribot 夹爪归零要求非空 H×16 动作，夹爪索引为 7、15")
+            if not np.isfinite(actions).all():
+                raise ValueError("模型动作包含 NaN 或 Inf，拒绝在夹爪归零中隐藏无效值")
+            # Absolute gripper commands only. Negative arm joint angles remain
+            # untouched; upper bounds and step limits stay with robot safety.
+            actions[:, [7, 15]] = np.maximum(actions[:, [7, 15]], 0)
+        return actions
 
 
 class LeRobotAdapter:
