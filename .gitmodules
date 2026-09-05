@@ -7,6 +7,9 @@
 [submodule "third_party/models/starvla"]
 	path = third_party/models/starvla
 	url = https://github.com/starVLA/starVLA.git
+[submodule "third_party/models/lingbot-vla-v2"]
+	path = third_party/models/lingbot-vla-v2
+	url = https://github.com/Robbyant/lingbot-vla-v2.git
 [submodule "third_party/models/openvla-oft"]
 	path = third_party/models/openvla-oft
 	url = https://github.com/moojink/openvla-oft.git
