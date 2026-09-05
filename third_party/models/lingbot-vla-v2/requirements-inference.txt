@@ -1,0 +1,25 @@
+# Pinned to the vla-test Astribot training environment (Python 3.12).
+torch==2.8.0
+torchvision==0.23.0
+transformers==4.57.3
+tokenizers==0.22.2
+huggingface-hub==0.34.0
+safetensors==0.5.3
+numpy==1.26.4
+scipy==1.13.1
+pillow==11.3.0
+einops==0.8.1
+pyyaml==6.0.2
+tqdm==4.67.1
+qwen-vl-utils==0.0.11
+peft==0.15.2
+omegaconf==2.3.0
+msgpack==1.1.1
+websockets==15.0.1
+pydantic==2.13.4
+opencv-python-headless==4.11.0.86
+av==15.0.0
+rich==14.1.0
+blobfile==3.2.0
+packaging==25.0
+# flash_attn==2.8.3 is installed separately: cp312, torch2.8, CUDA12, cxx11abiTRUE.

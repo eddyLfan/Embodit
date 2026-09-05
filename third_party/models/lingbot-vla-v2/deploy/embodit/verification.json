@@ -1,0 +1,233 @@
+{
+  "preprocessing": [
+    {
+      "task": "arrange_blocks_letter_shape",
+      "image_shape": [
+        3,
+        256,
+        1536
+      ],
+      "grid": [
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ]
+      ],
+      "state_shape": [
+        55
+      ],
+      "action_shape": [
+        50,
+        16
+      ],
+      "roundtrip_max_error": 3.7368462955100767e-06
+    },
+    {
+      "task": "build_bridge_with_blocks",
+      "image_shape": [
+        3,
+        256,
+        1536
+      ],
+      "grid": [
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ]
+      ],
+      "state_shape": [
+        55
+      ],
+      "action_shape": [
+        50,
+        16
+      ],
+      "roundtrip_max_error": 3.7368462955100767e-06
+    },
+    {
+      "task": "find_fruit_under_towel",
+      "image_shape": [
+        3,
+        256,
+        1536
+      ],
+      "grid": [
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ]
+      ],
+      "state_shape": [
+        55
+      ],
+      "action_shape": [
+        50,
+        16
+      ],
+      "roundtrip_max_error": 3.7368462955100767e-06
+    },
+    {
+      "task": "pick_block_into_basket_fix",
+      "image_shape": [
+        3,
+        256,
+        1536
+      ],
+      "grid": [
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ]
+      ],
+      "state_shape": [
+        55
+      ],
+      "action_shape": [
+        50,
+        16
+      ],
+      "roundtrip_max_error": 3.7368462955100767e-06
+    },
+    {
+      "task": "pick_cup_rack_drawer3",
+      "image_shape": [
+        3,
+        256,
+        1536
+      ],
+      "grid": [
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ]
+      ],
+      "state_shape": [
+        55
+      ],
+      "action_shape": [
+        50,
+        16
+      ],
+      "roundtrip_max_error": 5.449567524351551e-06
+    },
+    {
+      "task": "stand_stick",
+      "image_shape": [
+        3,
+        256,
+        1536
+      ],
+      "grid": [
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ],
+        [
+          1,
+          16,
+          16
+        ]
+      ],
+      "state_shape": [
+        55
+      ],
+      "action_shape": [
+        50,
+        16
+      ],
+      "roundtrip_max_error": 3.7368462955100767e-06
+    }
+  ],
+  "robot_actions_sent": false,
+  "sharded_loader": {
+    "exact_restore": true,
+    "missing_rejected": true,
+    "duplicate_rejected": true,
+    "fixture": "small randomly initialized torch model, not deployed checkpoint"
+  },
+  "embodit_transport": {
+    "real_runner_entrypoint": true,
+    "base64_image_decode": true,
+    "action_values_shape": [
+      50,
+      16
+    ],
+    "missing_checkpoint_not_ready": 6,
+    "model_forward": "explicit fixture, not real weights"
+  },
+  "gpu": {
+    "gpu": "NVIDIA GeForce RTX 3090",
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8",
+    "flash_attn": "2.8.3",
+    "flash_forward": true,
+    "moe_forward": true,
+    "moe_vs_pytorch_max_error": 0.00390625
+  },
+  "schema": {
+    "tensor_keys_and_shapes_matched": 1708,
+    "checkpoint_source": "/media/vlm/vlm-model/asset_llm_ckpt/vla-representation/project/yifan/lingbot-vla-v2/output/astribot/build_bridge_with_blocks/checkpoints/global_step_2000/hf_ckpt",
+    "weights_loaded": false
+  }
+}

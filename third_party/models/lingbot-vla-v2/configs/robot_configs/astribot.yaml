@@ -1,0 +1,50 @@
+states:
+  - observation.state.arm.position:
+      origin_keys:
+        - state:
+            start: 0
+            end: 7
+        - state:
+            start: 8
+            end: 15
+
+  - observation.state.effector.position:
+      origin_keys:
+        - state:
+            start: 7
+            end: 8
+        - state:
+            start: 15
+            end: 16
+
+actions:
+  - action.arm.position:
+      origin_keys:
+        - actions:
+            start: 0
+            end: 7
+        - actions:
+            start: 8
+            end: 15
+      subtract_state: true
+      relative_type: joint
+
+  - action.effector.position:
+      origin_keys:
+        - actions:
+            start: 7
+            end: 8
+        - actions:
+            start: 15
+            end: 16
+      subtract_state: false
+
+images:
+  - observation.images.camera_top:
+      origin_keys: image
+  - observation.images.camera_wrist_left:
+      origin_keys: wrist_image
+  - observation.images.camera_wrist_right:
+      origin_keys: right_wrist_image
+
+norm_stats: assets/norm_stats/astribot.json

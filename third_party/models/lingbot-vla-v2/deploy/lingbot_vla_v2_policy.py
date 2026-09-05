@@ -196,6 +196,9 @@ class LingbotVLAv2Server:
         use_bf16=True,
         use_fp32=False,
         use_compile=False,
+        training_config_path=None,
+        tokenizer_path=None,
+        robot_config_path=None,
     ) -> None:
         assert not (use_bf16 and use_fp32), 'Bfloat16 or Float32!!!'
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
@@ -203,6 +206,9 @@ class LingbotVLAv2Server:
         self.use_length = use_length
         self.chunk_ret = chunk_ret
         self.robot_norm_path = robot_norm_path
+        self.training_config_path = training_config_path
+        self.tokenizer_path = tokenizer_path
+        self.robot_config_path = robot_config_path
 
         self.task_description = None
 
@@ -225,14 +231,28 @@ class LingbotVLAv2Server:
         self.action_key: str= "action"
 
     def load_model_weights(self, path_to_pi_model, strict=True):
-        all_safetensors = glob(os.path.join(path_to_pi_model, "*.safetensors"))
-        merged_weights = {}
-
+        all_safetensors = sorted(glob(os.path.join(path_to_pi_model, "*.safetensors")))
+        if not all_safetensors:
+            raise FileNotFoundError(f"No safetensors weights in {path_to_pi_model}")
+        # Astribot checkpoints contain ~25.5 GB fp32 tensors. Load one shard
+        # at a time, preserving full strict key/shape checks without holding
+        # a second complete 6B state dict alongside the initialized CPU model.
+        expected_keys = set(self.vla.state_dict())
+        loaded_keys = set()
         for file_path in tqdm(all_safetensors):
             with safe_open(file_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    merged_weights[key] = f.get_tensor(key)
-        self.vla.load_state_dict(merged_weights, strict=strict)
+                keys = set(f.keys())
+                duplicate = keys & loaded_keys
+                unexpected = keys - expected_keys
+                if duplicate or (strict and unexpected):
+                    raise RuntimeError(f"Invalid checkpoint shard {file_path}: duplicate={sorted(duplicate)[:8]}, unexpected={sorted(unexpected)[:8]}")
+                shard = {key: f.get_tensor(key) for key in keys}
+                self.vla.load_state_dict(shard, strict=False)  # checks every tensor shape
+                loaded_keys.update(keys)
+                del shard
+        missing = expected_keys - loaded_keys
+        if strict and missing:
+            raise RuntimeError(f"Incomplete checkpoint, missing {len(missing)} keys: {sorted(missing)[:8]}")
 
     def merge_qwen_config(self, qwen_config):
         if hasattr(qwen_config, 'to_dict'):
@@ -273,7 +293,7 @@ class LingbotVLAv2Server:
         print(f"loading model from: {path_to_pi_model}")
         
         # load training config
-        training_config_path = Path(path_to_pi_model).parent.parent.parent/'lingbotvla_cli.yaml'
+        training_config_path = self.training_config_path or Path(path_to_pi_model).parent.parent.parent/'lingbotvla_cli.yaml'
         with open(training_config_path, 'r') as f:
             training_config = yaml.safe_load(f)
         f.close()
@@ -295,7 +315,7 @@ class LingbotVLAv2Server:
             model_name = 'qwen3vl'
         else: 
             raise ValueError(f"Unsupported base model of {path_to_pi_model}")
-        base_model_path = os.environ.get('QWEN3VL_PATH', training_base_model) or BASE_MODEL_PATH[model_name]
+        base_model_path = self.tokenizer_path or os.environ.get('QWEN3VL_PATH', training_base_model) or BASE_MODEL_PATH[model_name]
         config.tokenizer_path = base_model_path
         self.model_name = model_name
         
@@ -350,7 +370,7 @@ class LingbotVLAv2Server:
         self.last_action_chunk = None
         self.last_normalized_action_chunk = None
 
-        robot_config = f'configs/robot_configs/{robo_name}.yaml'
+        robot_config = self.robot_config_path or str(PROJECT_ROOT / 'configs' / 'robot_configs' / f'{robo_name}.yaml')
         
         with open(robot_config, 'r') as f:
           self.robot_config = yaml.safe_load(f)
@@ -406,8 +426,9 @@ class LingbotVLAv2Server:
             if isinstance(v, np.ndarray):
                 observation[k] = torch.from_numpy(v)
         observation =  self.vla.feature_transform.apply(observation, policy_eval=True)
-        if self.use_bf16:
-            observation['state'] = observation['state'].to(torch.bfloat16)
+        # Keep normalized state in float32 for the delta-to-absolute inverse.
+        # sample_actions_batch casts its GPU copy to bfloat16 separately.
+        observation['state'] = observation['state'].float()
         return observation
 
     @staticmethod

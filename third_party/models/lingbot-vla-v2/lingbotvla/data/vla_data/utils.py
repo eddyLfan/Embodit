@@ -84,10 +84,10 @@ class FeatureTransform:
             robot_config = yaml.safe_load(f)
         f.close()
 
+        robot_norm = robot_config.pop('norm_stats', None)
         if norm_stats_path is None:
-            norm_stats_path = robot_config.pop('norm_stats')
-        else:
-            robot_config.pop('norm_stats')
+            # Prefer per-run CLI/yaml override over the robot config default.
+            norm_stats_path = getattr(data_config, 'norm_stats_file', None) or robot_norm
 
         
         self.feature_config = FeatureInfo()

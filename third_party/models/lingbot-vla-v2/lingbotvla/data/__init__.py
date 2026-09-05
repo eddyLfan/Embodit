@@ -13,22 +13,26 @@
 # limitations under the License.
 
 
-from .chat_template import build_chat_template
-from .data_collator import (
-    CollatePipeline,
-    DataCollatorWithPacking,
-    DataCollatorWithPadding,
-    DataCollatorWithPositionIDs,
-    MakeMicroBatchCollator,
-    TextSequenceShardCollator,
-    UnpackDataCollator,
-)
-from .data_loader import build_dataloader
-from .dataset import build_iterative_dataset, build_mapping_dataset, build_vla_dataset
-from .multimodal.data_collator import (
-    OmniDataCollatorWithPacking,
-    OmniDataCollatorWithPadding,
-    OmniSequenceShardCollator,
-    VLADataCollatorWithPacking,
-)
-from .multimodal.multimodal_chat_template import build_multimodal_chat_template
+from importlib import import_module
+
+# Standalone inference imports FeatureTransform, not training dataloaders.
+# Preserve the public training API without eagerly requiring LeRobot/datasets.
+_EXPORTS = {
+    "build_chat_template": ".chat_template",
+    **dict.fromkeys(("CollatePipeline", "DataCollatorWithPacking", "DataCollatorWithPadding",
+                     "DataCollatorWithPositionIDs", "MakeMicroBatchCollator",
+                     "TextSequenceShardCollator", "UnpackDataCollator"), ".data_collator"),
+    "build_dataloader": ".data_loader",
+    **dict.fromkeys(("build_iterative_dataset", "build_mapping_dataset", "build_vla_dataset"), ".dataset"),
+    **dict.fromkeys(("OmniDataCollatorWithPacking", "OmniDataCollatorWithPadding",
+                     "OmniSequenceShardCollator", "VLADataCollatorWithPacking"), ".multimodal.data_collator"),
+    "build_multimodal_chat_template": ".multimodal.multimodal_chat_template",
+}
+__all__ = list(_EXPORTS)
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    value = getattr(import_module(_EXPORTS[name], __name__), name)
+    globals()[name] = value
+    return value
